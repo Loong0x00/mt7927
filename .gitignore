@@ -146,6 +146,9 @@ debian/stamp-*
 /private_notes.md
 /TODO.private
 
+# Large reference directories (not our code)
+/ghidra_12.0.3_PUBLIC/
+
 # Keep important configuration files
 !.gitignore
 !.gitattributes

@@ -1,0 +1,453 @@
+# mtkwecx.sys firmware/DMA reverse notes (auto extract)
+
+Program: mtkwecx.sys
+
+## String Xrefs
+
+### 140214a20 `AsicConnac3xWpdmaInitRing`
+
+- from `1401ccffc` fn `FUN_1401ccfe0` (1401ccfe0) ref=DATA ins=`LEA R14,[0x140214a20]`
+- from `1401cd179` fn `FUN_1401ccfe0` (1401ccfe0) ref=PARAM ins=`MOV R9,R14`
+- from `1401cd145` fn `FUN_1401ccfe0` (1401ccfe0) ref=PARAM ins=`MOV R9,R14`
+- from `1401cd0ef` fn `FUN_1401ccfe0` (1401ccfe0) ref=PARAM ins=`MOV R9,R14`
+- from `1401cd0a6` fn `FUN_1401ccfe0` (1401ccfe0) ref=PARAM ins=`MOV R9,R14`
+- from `1401cd057` fn `FUN_1401ccfe0` (1401ccfe0) ref=PARAM ins=`MOV R9,R14`
+
+### 140214a40 `AsicConnac3xWfdmaWaitIdle`
+
+- from `1401ccebb` fn `FUN_1401ccdf0` (1401ccdf0) ref=DATA ins=`LEA R9,[0x140214a40]`
+- from `1401ccf09` fn `FUN_1401ccdf0` (1401ccdf0) ref=DATA ins=`LEA R9,[0x140214a40]`
+- from `1401ccf56` fn `FUN_1401ccdf0` (1401ccdf0) ref=DATA ins=`LEA R9,[0x140214a40]`
+- from `1401ccf9d` fn `FUN_1401ccdf0` (1401ccdf0) ref=DATA ins=`LEA R9,[0x140214a40]`
+
+### 140214e90 `AsicConnac3xLoadFirmware`
+
+- from `1401c50f5` fn `FUN_1401c5020` (1401c5020) ref=DATA ins=`LEA RBX,[0x140214e90]`
+- from `1401c51f8` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5283` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5600` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5c60` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5d47` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5dbd` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6042` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5ef2` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5f70` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5e0a` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c55a0` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5cb1` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5531` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5329` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c52cb` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c51ab` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5629` fn `FUN_1401c5020` (1401c5020) ref=DATA ins=`LEA R9,[0x140214e90]`
+- from `1401c5854` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5b6e` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5749` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c59b8` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5a63` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5b07` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5a2b` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5bab` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c5979` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c591b` fn `FUN_1401c5020` (1401c5020) ref=PARAM ins=`MOV R9,RBX`
+
+### 140215000 `AsicConnac3xLoadRomPatch`
+
+- from `1401c62db` fn `FUN_1401c6210` (1401c6210) ref=DATA ins=`LEA R9,[0x140215000]`
+- from `1401c63db` fn `FUN_1401c6210` (1401c6210) ref=DATA ins=`LEA RBX,[0x140215000]`
+- from `1401c64d5` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6560` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6ca0` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6ce6` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6ba3` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6b0e` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6b53` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c69a3` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c648b` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c65d6` fn `FUN_1401c6210` (1401c6210) ref=DATA ins=`LEA R9,[0x140215000]`
+- from `1401c6671` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c683d` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c68ba` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c694d` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c6883` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+- from `1401c67c5` fn `FUN_1401c6210` (1401c6210) ref=PARAM ins=`MOV R9,RBX`
+
+### 140215e40 `MT6639PreFirmwareDownloadInit`
+
+- from `1401d7b46` fn `FUN_1401d7ae0` (1401d7ae0) ref=DATA ins=`LEA R13,[0x140215e40]`
+- from `1401d7c74` fn `FUN_1401d7ae0` (1401d7ae0) ref=PARAM ins=`MOV R9,R13`
+- from `1401d7ce2` fn `FUN_1401d7ae0` (1401d7ae0) ref=PARAM ins=`MOV R9,R13`
+- from `1401d7c25` fn `FUN_1401d7ae0` (1401d7ae0) ref=PARAM ins=`MOV R9,R13`
+- from `1401d7d2d` fn `FUN_1401d7ae0` (1401d7ae0) ref=PARAM ins=`MOV R9,R13`
+- from `1401d7bdc` fn `FUN_1401d7ae0` (1401d7ae0) ref=PARAM ins=`MOV R9,R13`
+- from `1401d7b99` fn `FUN_1401d7ae0` (1401d7ae0) ref=PARAM ins=`MOV R9,R13`
+
+### 140215e60 `MT6639ConfigIntMask`
+
+- from `1401d6c6d` fn `FUN_1401d6b90` (1401d6b90) ref=DATA ins=`LEA R9,[0x140215e60]`
+
+### 140215ea0 `MT6639InitTxRxRing`
+
+- from `1401d710e` fn `FUN_1401d6d30` (1401d6d30) ref=DATA ins=`LEA R9,[0x140215ea0]`
+- from `1401d7173` fn `FUN_1401d6d30` (1401d6d30) ref=DATA ins=`LEA R9,[0x140215ea0]`
+
+### 140215ec0 `MT6639WpdmaConfig`
+
+- from `1401d82e4` fn `FUN_1401d8290` (1401d8290) ref=DATA ins=`LEA R9,[0x140215ec0]`
+
+### 140215fe0 `WFDMA_HIF_BUSY(0x%08x): 0x%08x\n`
+
+- from `1401e18be` fn `FUN_1401e183c` (1401e183c) ref=DATA ins=`LEA RDX,[0x140215fe0]`
+- from `1401ee998` fn `FUN_1401ee90c` (1401ee90c) ref=DATA ins=`LEA RDX,[0x140215fe0]`
+
+### 140216000 `WFDMA_AXI_SLPPROT_CTRL(0x%08x): 0x%08x\n`
+
+- from `1401e192e` fn `FUN_1401e183c` (1401e183c) ref=DATA ins=`LEA RDX,[0x140216000]`
+- from `1401eea03` fn `FUN_1401ee90c` (1401ee90c) ref=DATA ins=`LEA RDX,[0x140216000]`
+
+### 140216100 `	 WFDMA DMA %d INT STA(0x%08x): 0x%08x\n`
+
+- from `1401dcc6e` fn `FUN_1401dcadc` (1401dcadc) ref=DATA ins=`LEA RDX,[0x140216100]`
+- from `1401ec412` fn `FUN_1401ec280` (1401ec280) ref=DATA ins=`LEA RDX,[0x140216100]`
+
+### 140216240 `	 WFDMA DMA %d INT ENA(0x%08x): 0x%08x\n`
+
+- from `1401dd158` fn `FUN_1401dcadc` (1401dcadc) ref=DATA ins=`LEA RDX,[0x140216240]`
+- from `1401ec8fc` fn `FUN_1401ec280` (1401ec280) ref=DATA ins=`LEA RDX,[0x140216240]`
+
+### 1402162a0 `WFDMA DMA (%d) GLO Config Info:\n`
+
+- from `1401ebd99` fn `FUN_1401ebcdc` (1401ebcdc) ref=DATA ins=`LEA RDX,[0x1402162a0]`
+- from `1401dc5f5` fn `FUN_1401dc538` (1401dc538) ref=DATA ins=`LEA RDX,[0x1402162a0]`
+
+### 140218890 `WFDMA_AXI_SLPPROT0_CTRL(0x%08x): 0x%08x\n`
+
+- from `1401eea6e` fn `FUN_1401ee90c` (1401ee90c) ref=DATA ins=`LEA RDX,[0x140218890]`
+
+### 1402188c0 `WFDMA_AXI_SLPPROT1_CTRL(0x%08x): 0x%08x\n`
+
+- from `1401eead9` fn `FUN_1401ee90c` (1401ee90c) ref=DATA ins=`LEA RDX,[0x1402188c0]`
+
+### 140218bc0 `	 HOST_INT_STA, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e77dc` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218bc0]`
+
+### 140218bf0 `	 HOST_INT_STA_EXT, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e7843` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218bf0]`
+
+### 140218cb0 `	 WPDMA_GLO_CFG_EXT0, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e79df` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218cb0]`
+
+### 140218ce0 `	 WPDMA_GLO_CFG_EXT1, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e7a46` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218ce0]`
+
+### 140218d10 `	 WPDMA_GLO_CFG_EXT2, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e7aad` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218d10]`
+
+### 140218f80 `	 WFDMA_MSI_CONFIG, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e7eb3` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218f80]`
+
+### 140218fb0 `	 WFDMA_HOST_CONFIG, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e7f1a` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218fb0]`
+
+### 140218fe0 `	 WFDMA_MD_INT_LUMP_SEL, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e7f81` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140218fe0]`
+
+### 1402190e0 `	 WFDMA_DLY_IDX_CFG_0, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e8184` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x1402190e0]`
+
+### 140219110 `	 WFDMA_DLY_IDX_CFG_1, Read CR(0x%08x): 0x%08x\n`
+
+- from `1401e81eb` fn `FUN_1401e7630` (1401e7630) ref=DATA ins=`LEA RDX,[0x140219110]`
+
+### 1402197c0 `HalDownloadPatchFirmware`
+
+- from `1401f0cee` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f0f96` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f10a9` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f105e` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f0ebd` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f0f02` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f0d25` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+- from `1401f0c9f` fn `FUN_1401f0be4` (1401f0be4) ref=DATA ins=`LEA R9,[0x1402197c0]`
+
+### 140244640 `P0R0:FWDL`
+
+- from `1401dd73b` fn `FUN_1401dd194` (1401dd194) ref=DATA ins=`LEA R9,[RSI + -0x1d]`
+- from `1401dd6f5` fn `FUN_1401dd194` (1401dd194) ref=DATA ins=`LEA RAX,[RSI + -0x1d]`
+- from `1401dd727` fn `FUN_1401dd194` (1401dd194) ref=DATA ins=`MOV qword ptr [RSP + 0x20],RAX`
+
+### 140246e00 `P0R0:FWDL`
+
+- from `1401ece6e` fn `FUN_1401ec938` (1401ec938) ref=DATA ins=`LEA R9,[RDI + -0x19]`
+- from `1401ece1e` fn `FUN_1401ec938` (1401ec938) ref=DATA ins=`LEA R8,[RDI + -0x19]`
+- from `1401ece4e` fn `FUN_1401ec938` (1401ec938) ref=DATA ins=`MOV qword ptr [RSP + 0x20],R8`
+
+## Function Call Graph (functions seen in xrefs)
+
+### FUN_1401c5020 @ 1401c5020
+
+Callers:
+- (none)
+Callees:
+- FID_conflict:WPP_SF_LLDD@140007250
+- FUN_1400015d8@1400015d8
+- FUN_140001664@140001664
+- FUN_140006f34@140006f34
+- FUN_14000740c@14000740c
+- FUN_14000749c@14000749c
+- FUN_14000ca20@14000ca20
+- FUN_14000e520@14000e520
+- FUN_14000f5e4@14000f5e4
+- FUN_14000f820@14000f820
+- FUN_14000f850@14000f850
+- FUN_14001203c@14001203c
+- FUN_140012378@140012378
+- FUN_1400150f4@1400150f4
+- FUN_14002e98c@14002e98c
+- FUN_1401c0b0c@1401c0b0c
+- FUN_1401c3158@1401c3158
+- FUN_1401c36f8@1401c36f8
+- FUN_1401c3840@1401c3840
+- FUN_1401f1ad0@1401f1ad0
+- FUN_1401ff080@1401ff080
+- FUN_1401ff340@1401ff340
+- NdisCloseFile@1401fef92
+- NdisFreeMemory@14008bdde
+- NdisInitializeString@1401fefa4
+- NdisMapFile@1401fef98
+- NdisOpenFile@1401fef8c
+- NdisUnmapFile@1401fef9e
+- WPP_SF_s@140001600
+- __security_check_cookie@1401feff0
+
+### FUN_1401c6210 @ 1401c6210
+
+Callers:
+- (none)
+Callees:
+- FUN_1400015d8@1400015d8
+- FUN_140001664@140001664
+- FUN_140006f34@140006f34
+- FUN_14000740c@14000740c
+- FUN_14000f5e4@14000f5e4
+- FUN_14000f820@14000f820
+- FUN_14000f850@14000f850
+- FUN_1401c70c8@1401c70c8
+- FUN_1401c71b8@1401c71b8
+- FUN_1401cdd40@1401cdd40
+- FUN_1401ce394@1401ce394
+- FUN_1401f1ad0@1401f1ad0
+- FUN_1401ff080@1401ff080
+- NdisCloseFile@1401fef92
+- NdisFreeMemory@14008bdde
+- NdisInitializeString@1401fefa4
+- NdisMapFile@1401fef98
+- NdisOpenFile@1401fef8c
+- NdisUnmapFile@1401fef9e
+- WPP_SF_DD@140006f70
+- WPP_SF_s@140001600
+
+### FUN_1401ccdf0 @ 1401ccdf0
+
+Callers:
+- FUN_1401ccb54@1401ccb54
+- FUN_1401ccc7c@1401ccc7c
+Callees:
+- FUN_140001664@140001664
+- FUN_14000740c@14000740c
+- FUN_140008f8c@140008f8c
+- KeStallExecutionProcessor@EXTERNAL:00000055
+
+### FUN_1401ccfe0 @ 1401ccfe0
+
+Callers:
+- FUN_1401c4290@1401c4290
+- FUN_1401c8bc0@1401c8bc0
+- FUN_1401ccd08@1401ccd08
+Callees:
+- FUN_140001664@140001664
+- _guard_dispatch_icall@1401ff020
+
+### FUN_1401d6b90 @ 1401d6b90
+
+Callers:
+- (none)
+Callees:
+- FUN_140008f8c@140008f8c
+- FUN_140008ff8@140008ff8
+- FUN_1400150f4@1400150f4
+
+### FUN_1401d6d30 @ 1401d6d30
+
+Callers:
+- (none)
+Callees:
+- FID_conflict:WPP_SF_LLDD@140007250
+- FUN_140006f34@140006f34
+- FUN_14000749c@14000749c
+- FUN_140007630@140007630
+- FUN_140008f8c@140008f8c
+- FUN_140008ff8@140008ff8
+- WPP_SF_DD@140006f70
+
+### FUN_1401d7ae0 @ 1401d7ae0
+
+Callers:
+- (none)
+Callees:
+- FUN_1400015d8@1400015d8
+- FUN_140001664@140001664
+- FUN_140006f34@140006f34
+- FUN_14000740c@14000740c
+- FUN_14000ca20@14000ca20
+- FUN_14000e520@14000e520
+- FUN_14000f850@14000f850
+- FUN_1401c3840@1401c3840
+- WPP_SF_s@140001600
+
+### FUN_1401d8290 @ 1401d8290
+
+Callers:
+- (none)
+Callees:
+- FUN_14000749c@14000749c
+- FUN_140008f8c@140008f8c
+- FUN_140008ff8@140008ff8
+- FUN_1401ccb54@1401ccb54
+
+### FUN_1401dc538 @ 1401dc538
+
+Callers:
+- FUN_1401dc728@1401dc728
+Callees:
+- FID_conflict:WPP_SF_LLDD@140007250
+- FUN_14000740c@14000740c
+- FUN_140008f8c@140008f8c
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401dcadc @ 1401dcadc
+
+Callers:
+- FUN_1401dc728@1401dc728
+Callees:
+- FUN_1400015d8@1400015d8
+- FUN_140001664@140001664
+- FUN_140008f8c@140008f8c
+- FUN_140008ff8@140008ff8
+- FUN_14001203c@14001203c
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401dd194 @ 1401dd194
+
+Callers:
+- FUN_1401dc728@1401dc728
+Callees:
+- FUN_140001664@140001664
+- FUN_140008f8c@140008f8c
+- FUN_140057008@140057008
+- FUN_14007b80c@14007b80c
+- FUN_1401d89f4@1401d89f4
+- FUN_1401d8b00@1401d8b00
+
+### FUN_1401e183c @ 1401e183c
+
+Callers:
+- FUN_1401dc728@1401dc728
+Callees:
+- FUN_140008f8c@140008f8c
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401e7630 @ 1401e7630
+
+Callers:
+- (none)
+Callees:
+- FUN_140001664@140001664
+- FUN_140008f8c@140008f8c
+- FUN_140008ff8@140008ff8
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401ebcdc @ 1401ebcdc
+
+Callers:
+- FUN_1401ec08c@1401ec08c
+Callees:
+- FID_conflict:WPP_SF_LLDD@140007250
+- FUN_14000740c@14000740c
+- FUN_140008f8c@140008f8c
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401ec280 @ 1401ec280
+
+Callers:
+- FUN_1401ec08c@1401ec08c
+Callees:
+- FUN_1400015d8@1400015d8
+- FUN_140001664@140001664
+- FUN_140008f8c@140008f8c
+- FUN_140008ff8@140008ff8
+- FUN_14001203c@14001203c
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401ec938 @ 1401ec938
+
+Callers:
+- FUN_1401ec08c@1401ec08c
+Callees:
+- FUN_140001664@140001664
+- FUN_140008f8c@140008f8c
+- FUN_14007b80c@14007b80c
+- FUN_1401d1598@1401d1598
+- FUN_1401d8b00@1401d8b00
+
+### FUN_1401ee90c @ 1401ee90c
+
+Callers:
+- FUN_1401ec08c@1401ec08c
+Callees:
+- FUN_140008f8c@140008f8c
+- FUN_14007b80c@14007b80c
+- WPP_SF_DD@140006f70
+
+### FUN_1401f0be4 @ 1401f0be4
+
+Callers:
+- FUN_140037630@140037630
+- FUN_14005324c@14005324c
+- FUN_140054014@140054014
+- FUN_1401c3240@1401c3240
+Callees:
+- FUN_1400015d8@1400015d8
+- FUN_140001664@140001664
+- FUN_140006f34@140006f34
+- FUN_14000740c@14000740c
+- FUN_140047530@140047530
+- FUN_1400b3a8c@1400b3a8c
+- FUN_1400b44c8@1400b44c8
+- FUN_1400b45c8@1400b45c8
+- FUN_1400b46c0@1400b46c0
+- FUN_1400c583c@1400c583c
+- FUN_1400ccb88@1400ccb88
+- FUN_1401d2378@1401d2378
+- FUN_1401d2480@1401d2480
+- FUN_1401d26e0@1401d26e0
+- FUN_1401d28e4@1401d28e4
+- FUN_1401d2ab8@1401d2ab8
+- WPP_SF_s@140001600
+- _guard_dispatch_icall@1401ff020
+
