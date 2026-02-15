@@ -4599,6 +4599,206 @@ skip_mode52_fwdl:
         ret = mt7927_mode40_send_nic_cap(dev);
         dev_info(&pdev->dev, "[MT7927] MODE53: NIC_CAPABILITY result=%d\n", ret);
     }
+    else if (reinit_mode == 54) {
+        u32 mcu_rx0_base, host_rx0_base, fw_sync, mcu_cmd;
+        u32 glo, val;
+        int i;
+
+        dev_info(&pdev->dev, "[MT7927] MODE54: === DYNAMIC RX RING 0 AFTER FWDL ===\n");
+
+        /* Step 1: Verify FWDL success */
+        fw_sync = mt7927_rr(dev, MT_CONN_ON_MISC);
+        mcu_cmd = mt7927_rr(dev, MT_MCU_CMD_REG);
+        dev_info(&pdev->dev, "[MT7927] MODE54: Post-FWDL: fw_sync=0x%08x MCU_CMD=0x%08x\n",
+                 fw_sync, mcu_cmd);
+
+        if ((fw_sync & 0x3) != 0x3) {
+            dev_err(&pdev->dev, "[MT7927] MODE54: FWDL failed (fw_sync=0x%x), aborting\n",
+                    fw_sync);
+            goto mode54_done;
+        }
+
+        dev_info(&pdev->dev, "[MT7927] MODE54: FWDL success (fw_sync=0x3), proceeding...\n");
+
+        /* Step 2: Check MCU_RX0 before dynamic ring_rx0 */
+        mcu_rx0_base = ioread32(dev->bar0 + 0x02500);
+        dev_info(&pdev->dev, "[MT7927] MODE54: MCU_RX0 before ring_rx0: BASE=0x%08x\n",
+                 mcu_rx0_base);
+
+        /* Step 3: Disable WFDMA (clear TX_DMA_EN, RX_DMA_EN, chain_en) */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Disabling WFDMA for ring reconfiguration...\n");
+        glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        dev_info(&pdev->dev, "[MT7927] MODE54: GLO_CFG before disable: 0x%08x\n", glo);
+
+        glo &= ~(MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN |
+                 MT_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
+                 MT_GLO_CFG_OMIT_TX_INFO | MT_GLO_CFG_OMIT_RX_INFO_PFET2);
+        mt7927_wr_verify(dev, MT_WPDMA_GLO_CFG, glo, "mode54_dma_disable");
+
+        /* Wait for DMA to go idle */
+        for (i = 0; i < 100; i++) {
+            val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+            if (!(val & (MT_WFDMA_GLO_CFG_TX_DMA_BUSY | MT_WFDMA_GLO_CFG_RX_DMA_BUSY)))
+                break;
+            usleep_range(500, 1000);
+        }
+        dev_info(&pdev->dev, "[MT7927] MODE54: DMA idle after %d iterations, GLO_CFG=0x%08x\n",
+                 i, val);
+
+        /* Step 4: Allocate HOST RX ring 0 (128 entries at HW ring 0) */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Allocating HOST RX ring 0 (128 entries)...\n");
+        ret = mt7927_rx_ring_alloc(dev, &dev->ring_rx0, 0, 128, MT_RX_BUF_SIZE);
+        if (ret) {
+            dev_err(&pdev->dev, "[MT7927] MODE54: ring_rx0 allocation failed: %d\n", ret);
+            goto mode54_reenable_dma;
+        }
+        dev_info(&pdev->dev, "[MT7927] MODE54: ring_rx0 allocated: BASE=0x%08x ndesc=%d\n",
+                 lower_32_bits(dev->ring_rx0.desc_dma), dev->ring_rx0.ndesc);
+
+        /* Step 5: Verify ring_rx0 registers written by mt7927_rx_ring_alloc() */
+        host_rx0_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(0));
+        val = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(0));
+        dev_info(&pdev->dev, "[MT7927] MODE54: HOST_RX0 regs: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 host_rx0_base,
+                 val,
+                 mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(0)),
+                 mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(0)));
+
+        /* Step 6: Update prefetch entries — add RX0 to prefetch chain
+         * Vendor order: RX4-7 → TX16 → ...
+         * We insert RX0 at the start (base_ptr=0x0000), shift others:
+         *   RX0: base_ptr=0x0000, depth=0x8
+         *   RX4: base_ptr=0x0080, depth=0x8
+         *   RX5: base_ptr=0x0100, depth=0x8
+         *   RX6: base_ptr=0x0180, depth=0x8
+         *   RX7: base_ptr=0x0200, depth=0x4
+         *   TX16: base_ptr=0x0240, depth=0x4
+         *   TX0-1,2-3,15: shifted accordingly
+         */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Updating prefetch entries (add RX0)...\n");
+        mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(0),
+                         PREFETCH(0x0000, 0x8), "mode54_rx0_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(4),
+                         PREFETCH(0x0080, 0x8), "mode54_rx4_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(5),
+                         PREFETCH(0x0100, 0x8), "mode54_rx5_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(6),
+                         PREFETCH(0x0180, 0x8), "mode54_rx6_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(7),
+                         PREFETCH(0x0200, 0x4), "mode54_rx7_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_TX_RING_EXT_CTRL(16),
+                         PREFETCH(0x0240, 0x4), "mode54_tx16_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_TX_RING_EXT_CTRL(0),
+                         PREFETCH(0x0280, 0x10), "mode54_tx0_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_TX_RING_EXT_CTRL(1),
+                         PREFETCH(0x0380, 0x10), "mode54_tx1_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_TX_RING_EXT_CTRL(2),
+                         PREFETCH(0x0480, 0x4), "mode54_tx2_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_TX_RING_EXT_CTRL(3),
+                         PREFETCH(0x04C0, 0x4), "mode54_tx3_ext");
+        mt7927_wr_verify(dev, MT_WFDMA_TX_RING_EXT_CTRL(15),
+                         PREFETCH(0x0500, 0x4), "mode54_tx15_ext");
+
+        /* Step 7: Reset DMA index pointers */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+        msleep(10);
+
+mode54_reenable_dma:
+        /* Step 8: Re-enable WFDMA with full configuration */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Re-enabling WFDMA...\n");
+        glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        glo |= MT_WPDMA_GLO_CFG_MT76_SET;
+        glo |= MT_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;
+        glo |= BIT(26);  /* ADDR_EXT_EN */
+        /* Keep DMASHDL bypass OFF for post-FWDL (Windows clears it in PostFwDownloadInit) */
+        glo &= ~MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+        glo |= MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN;
+        mt7927_wr_verify(dev, MT_WPDMA_GLO_CFG, glo, "mode54_dma_enable");
+
+        /* Step 9: DMASHDL enable (Windows PostFwDownloadInit step 1) */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Enabling DMASHDL (0xd6060 |= 0x10101)...\n");
+        val = mt7927_rr(dev, 0xd6060);
+        mt7927_wr_verify(dev, 0xd6060, val | 0x10101, "mode54_dmashdl_enable");
+
+        /* Step 10: Clear DMASHDL bypass in HIF_DMASHDL_SW_CONTROL */
+        val = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+        val &= ~MT_HIF_DMASHDL_BYPASS_EN;
+        mt7927_wr_verify(dev, MT_HIF_DMASHDL_SW_CONTROL, val, "mode54_clear_bypass");
+
+        /* Step 11: Update interrupt enables to include RX ring 0 */
+        mt7927_wr_verify(dev, MT_WFDMA_HOST_INT_ENA,
+                         HOST_RX_DONE_INT_ENA0 | HOST_RX_DONE_INT_ENA1 |
+                         HOST_RX_DONE_INT_ENA(evt_ring_qid) |
+                         HOST_TX_DONE_INT_ENA15 | HOST_TX_DONE_INT_ENA16 |
+                         HOST_TX_DONE_INT_ENA17, "mode54_int_ena");
+
+        /* Step 12: Wait for FW to detect ring_rx0 and potentially configure MCU_RX0 */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Waiting 100ms for FW to detect ring_rx0...\n");
+        msleep(100);
+
+mode54_done:
+        /* Step 13: Full diagnostic dump */
+        dev_info(&pdev->dev, "[MT7927] MODE54: === DIAGNOSTIC DUMP ===\n");
+
+        /* MCU DMA0 RX rings */
+        for (i = 0; i < 4; i++) {
+            dev_info(&pdev->dev, "[MT7927] MODE54: MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                     i,
+                     ioread32(dev->bar0 + 0x02500 + (i << 4)),
+                     ioread32(dev->bar0 + 0x02504 + (i << 4)),
+                     ioread32(dev->bar0 + 0x02508 + (i << 4)),
+                     ioread32(dev->bar0 + 0x0250c + (i << 4)));
+        }
+
+        /* HOST rings */
+        dev_info(&pdev->dev, "[MT7927] MODE54: HOST_RX0: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(0)),
+                 mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(0)),
+                 mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(0)),
+                 mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(0)));
+        dev_info(&pdev->dev, "[MT7927] MODE54: HOST_TX15: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_TX_RING_BASE(15)),
+                 mt7927_rr(dev, MT_WPDMA_TX_RING_CNT(15)),
+                 mt7927_rr(dev, MT_WPDMA_TX_RING_CIDX(15)),
+                 mt7927_rr(dev, MT_WPDMA_TX_RING_DIDX(15)));
+
+        /* WFDMA state */
+        dev_info(&pdev->dev, "[MT7927] MODE54: GLO_CFG=0x%08x HOST_INT_STA=0x%08x HOST_INT_ENA=0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_STA),
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA));
+
+        /* DMASHDL state */
+        dev_info(&pdev->dev, "[MT7927] MODE54: DMASHDL: 0xd6060=0x%08x SW_CONTROL=0x%08x\n",
+                 mt7927_rr(dev, 0xd6060),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+
+        /* MCU state */
+        mcu_rx0_base = ioread32(dev->bar0 + 0x02500);
+        fw_sync = mt7927_rr(dev, MT_CONN_ON_MISC);
+        mcu_cmd = mt7927_rr(dev, MT_MCU_CMD_REG);
+        dev_info(&pdev->dev, "[MT7927] MODE54: fw_sync=0x%08x MCU_CMD=0x%08x\n",
+                 fw_sync, mcu_cmd);
+        dev_info(&pdev->dev, "[MT7927] MODE54: *** MCU_RX0 BASE=0x%08x *** (KEY METRIC)\n",
+                 mcu_rx0_base);
+
+        if (mcu_rx0_base != 0) {
+            dev_info(&pdev->dev, "[MT7927] MODE54: *** SUCCESS! MCU_RX0 CONFIGURED! ***\n");
+        } else {
+            dev_info(&pdev->dev, "[MT7927] MODE54: MCU_RX0 still 0 — FW did not configure it\n");
+        }
+
+        /* Step 14: Send NIC_CAPABILITY */
+        dev_info(&pdev->dev, "[MT7927] MODE54: Sending NIC_CAPABILITY...\n");
+        ret = mt7927_mode40_send_nic_cap(dev);
+        dev_info(&pdev->dev, "[MT7927] MODE54: NIC_CAPABILITY result=%d\n", ret);
+
+        /* Final MCU_RX0 check */
+        mcu_rx0_base = ioread32(dev->bar0 + 0x02500);
+        dev_info(&pdev->dev, "[MT7927] MODE54: MCU_RX0 after NIC_CAP: 0x%08x\n", mcu_rx0_base);
+    }
 
     return 0;
 
