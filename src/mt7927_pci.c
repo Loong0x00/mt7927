@@ -2001,33 +2001,14 @@ static int mt7927_mcu_hw_scan(struct mt7927_dev *dev,
 		 "scan: type=%d ssids=%d channels=%d\n",
 		 req->scan_type, ssid->ssids_num, chan->channels_num);
 
-	/* 诊断: scan 前 RX ring 6 状态 */
-	{
-		struct mt7927_ring *rxr = &dev->ring_rx6;
-		u32 hw_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(6));
-		u32 hw_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
-		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
-		u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
-		u32 desc_ctrl = le32_to_cpu(rxr->desc[rxr->tail].ctrl);
-
-		dev_info(&dev->pdev->dev,
-			 "scan-pre: rx6 tail=%u hw_cidx=%u hw_didx=%u desc[tail].ctrl=0x%08x INT_STA=0x%08x INT_ENA=0x%08x\n",
-			 rxr->tail, hw_cidx, hw_didx, desc_ctrl, int_sta, int_ena);
-	}
-
 	/* ⚠️ scan 命令必须使用 option=0x07 (ACK+UNI+SET), 不是 0x06!
 	 * mt7925 在 mt7925_mcu_fill_message() 中 non-query 命令使用
 	 * MCU_CMD_UNI_EXT_ACK = 0x07, 并且 wait_resp=true.
 	 * 缺少 BIT(0) ACK 位, 固件会静默忽略 scan 命令. */
 	ret = mt7927_mcu_send_unicmd(dev, MCU_UNI_CMD_SCAN_REQ,
 				     UNI_CMD_OPT_SET_ACK, buf, buf_len);
-	if (ret) {
+	if (ret)
 		clear_bit(MT7927_SCANNING, &dev->scan_state);
-	} else {
-		/* 安排延迟诊断: 3 秒后检查 RX ring 6 是否收到事件 */
-		schedule_delayed_work(&dev->scan_work,
-				      msecs_to_jiffies(3000));
-	}
 
 	kfree(buf);
 	return ret;
@@ -2057,7 +2038,12 @@ static int mt7927_mcu_cancel_hw_scan(struct mt7927_dev *dev,
 					   &req, sizeof(req));
 }
 
-/* scan 工作队列 — 在 MCU 事件中触发 */
+/* scan 工作队列 — scan_done 事件触发后延迟通知 mac80211
+ * 来源: mt7925/main.c mt7925_scan_work()
+ *
+ * 注意: ieee80211_scan_completed() 不能从 NAPI/tasklet 上下文调用,
+ * 因为 mac80211 内部需要获取 mutex 和调度其他工作.
+ * mt7925 也通过 work queue 来调用. */
 static void mt7927_scan_work(struct work_struct *work)
 {
 	struct mt7927_dev *dev = container_of(work, struct mt7927_dev,
@@ -2066,36 +2052,10 @@ static void mt7927_scan_work(struct work_struct *work)
 		.aborted = false,
 	};
 
-	/* 诊断: scan 超时时的 RX ring 6 状态 */
-	{
-		struct mt7927_ring *rxr = &dev->ring_rx6;
-		u32 hw_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(6));
-		u32 hw_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
-		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
-		u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
-		u32 desc_ctrl = le32_to_cpu(rxr->desc[rxr->tail].ctrl);
-		u32 desc_buf0 = le32_to_cpu(rxr->desc[rxr->tail].buf0);
-
-		dev_info(&dev->pdev->dev,
-			 "scan_work: rx6 tail=%u hw_cidx=%u hw_didx=%u desc[tail].ctrl=0x%08x buf0=0x%08x INT_STA=0x%08x INT_ENA=0x%08x scanning=%d\n",
-			 rxr->tail, hw_cidx, hw_didx, desc_ctrl, desc_buf0,
-			 int_sta, int_ena,
-			 test_bit(MT7927_SCANNING, &dev->scan_state) ? 1 : 0);
-
-		/* 检查 desc[tail] 是否已有 DMA 数据 (DMA_DONE 但 NAPI 没处理) */
-		if (desc_ctrl & MT_DMA_CTL_DMA_DONE) {
-			u32 *evt = rxr->buf[rxr->tail];
-			u32 sdl0 = FIELD_GET(MT_DMA_CTL_SD_LEN0, desc_ctrl);
-
-			dev_info(&dev->pdev->dev,
-				 "  MISSED EVENT at tail=%u: sdl0=%u w0=0x%08x w1=0x%08x w2=0x%08x\n",
-				 rxr->tail, sdl0,
-				 evt ? evt[0] : 0, evt ? evt[1] : 0,
-				 evt ? evt[2] : 0);
-		}
-	}
-
-	if (test_and_clear_bit(MT7927_SCANNING, &dev->scan_state)) {
+	/* scan_done 事件已清除 MT7927_SCANNING 标志,
+	 * 这里直接通知 mac80211 扫描完成.
+	 * 如果 scanning 标志仍然设置 (超时路径), 也清除它. */
+	if (!test_bit(MT7927_SCANNING, &dev->scan_state)) {
 		if (dev->hw && dev->hw_init_done)
 			ieee80211_scan_completed(dev->hw, &info);
 	}

@@ -376,7 +376,7 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	u32 rxd0, rxd1, rxd2, rxd3, rxd4;
 	bool unicast, hdr_trans;
 	u16 seq_ctrl = 0;
-	u8 chfreq;
+	u8 chfreq, remove_pad;
 
 	memset(status, 0, sizeof(*status));
 
@@ -395,6 +395,11 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 		return -EINVAL;
 
 	hdr_trans = !!(rxd2 & MT_RXD2_NORMAL_HDR_TRANS);
+
+	/* HDR_OFFSET: additional padding between RXD groups and frame data
+	 * 来源: mt7925/mac.c line 436, 546 — hdr_gap += 2 * remove_pad
+	 * 这个值指示 RXD 末尾到实际帧数据之间的填充字节数 (单位: 2字节) */
+	remove_pad = FIELD_GET(MT_RXD2_NORMAL_HDR_OFFSET, rxd2);
 
 	/* Header translation + cipher mismatch → drop */
 	if (hdr_trans && (rxd1 & MT_RXD1_NORMAL_CM))
@@ -496,9 +501,16 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	if (rxd1 & MT_RXD1_NORMAL_GROUP_5)
 		rxd += 24;
 
-	/* --- Strip RXD from SKB, leaving only the frame payload --- */
+	/* --- Strip RXD + padding from SKB, leaving only the frame payload ---
+	 * hdr_gap = RXD headers + 2 * remove_pad (additional padding)
+	 * 来源: mt7925/mac.c line 546-554 */
+	{
+		u16 hdr_gap = (u8 *)rxd - skb->data + 2 * remove_pad;
 
-	skb_pull(skb, (u8 *)rxd - skb->data);
+		if (hdr_gap > skb->len)
+			return -EINVAL;
+		skb_pull(skb, hdr_gap);
+	}
 
 	/* --- Handle header translation --- */
 
@@ -552,25 +564,18 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 
 	rxd = (struct mt7927_mcu_rxd *)skb->data;
 
-	dev_info(&dev->pdev->dev,
-		 "mcu-rx-event: eid=0x%02x ext_eid=0x%02x seq=%u option=0x%02x pkt_type_id=0x%04x len=%u\n",
-		 rxd->eid, rxd->ext_eid, rxd->seq, rxd->option,
-		 le16_to_cpu(rxd->pkt_type_id), le16_to_cpu(rxd->len));
-
 	/* MCU_UNI_EVENT_SCAN_DONE = 0x0e — 匹配 eid 字段
-	 * 来源: mt76/mt76_connac_mcu.h, mt7925/mcu.c line 587 */
+	 * 来源: mt76/mt76_connac_mcu.h, mt7925/mcu.c line 587
+	 *
+	 * 注意: ieee80211_scan_completed() 不能在 NAPI/tasklet 上下文调用,
+	 * 必须通过 scan_work 延迟执行, 否则会触发 WARNING.
+	 * 来源: net/mac80211/scan.c __ieee80211_scan_completed() 检查 SDATA_STATE_RUNNING */
 	if (rxd->eid == MCU_UNI_EVENT_SCAN_DONE) {
-		struct cfg80211_scan_info info = {
-			.aborted = false,
-		};
-
-		dev_info(&dev->pdev->dev, "scan_done event received!\n");
-		clear_bit(MT7927_SCANNING, &dev->scan_state);
-		if (dev->hw && dev->hw_init_done)
-			ieee80211_scan_completed(dev->hw, &info);
+		if (test_and_clear_bit(MT7927_SCANNING, &dev->scan_state)) {
+			/* 通过 scan_work 延迟通知 mac80211, 避免从 NAPI 上下文直接调用 */
+			schedule_delayed_work(&dev->scan_work, 0);
+		}
 	}
-
-	/* TODO: handle other MCU events (BSS info, STA events, etc.) */
 
 out:
 	dev_kfree_skb(skb);
@@ -599,6 +604,7 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 	/*
 	 * CONNAC3 SW_PKT_TYPE check: some data frames arrive with
 	 * non-zero PKT_TYPE but should be treated as normal frames.
+	 * 来源: mt7925/mac.c mt7925_queue_rx_skb() lines 1215-1221
 	 */
 	if (type != PKT_TYPE_NORMAL) {
 		u32 sw_type = FIELD_GET(MT_RXD0_SW_PKT_TYPE_MASK, rxd0);
@@ -608,9 +614,24 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 			type = PKT_TYPE_NORMAL;
 	}
 
+	/*
+	 * mt7925 特殊处理: PKT_TYPE_RX_EVENT(7) + flag=0x1 表示
+	 * 这是通过 MCU ring 路由的普通数据帧 (如扫描期间的 beacon/probe response),
+	 * 不是真正的 MCU 事件. 重新归类为 PKT_TYPE_NORMAL_MCU.
+	 * 来源: mt7925/mac.c line 1223-1224
+	 */
+	if (type == PKT_TYPE_RX_EVENT && flag == 0x1)
+		type = PKT_TYPE_NORMAL_MCU;
+
 	switch (type) {
+	case PKT_TYPE_NORMAL_MCU:
 	case PKT_TYPE_NORMAL:
-		/* Data frame: parse RXD and deliver to mac80211 */
+		/*
+		 * 数据帧 (beacon, probe response, data 等):
+		 * 解析 RXD 并交给 mac80211. 扫描期间 beacon/probe response
+		 * 可能通过 MCU ring (ring 6) 到达, 类型为 PKT_TYPE_NORMAL_MCU(8).
+		 * 来源: mt7925/mac.c lines 1240-1246
+		 */
 		if (mt7927_mac_fill_rx(dev, skb)) {
 			dev_kfree_skb(skb);
 			return;
@@ -622,24 +643,8 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 		return;
 
 	case PKT_TYPE_RX_EVENT:
-		/*
-		 * PKT_TYPE_RX_EVENT == PKT_TYPE_NORMAL_MCU == 1.
-		 * Distinguish via flag or queue: MCU queue → event handler,
-		 * data queue → treat as data frame.
-		 */
-		if (q == MT_RXQ_MCU) {
-			mt7927_mcu_rx_event(dev, skb);
-		} else {
-			/* Data frame on RX_EVENT type */
-			if (mt7927_mac_fill_rx(dev, skb)) {
-				dev_kfree_skb(skb);
-				return;
-			}
-			if (dev->hw)
-				ieee80211_rx_irqsafe(dev->hw, skb);
-			else
-				dev_kfree_skb(skb);
-		}
+		/* 真正的 MCU 事件 (flag != 0x1), 路由到 MCU 事件处理器 */
+		mt7927_mcu_rx_event(dev, skb);
 		return;
 
 	case PKT_TYPE_TXRX_NOTIFY:
@@ -653,6 +658,9 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 		return;
 
 	default:
+		dev_dbg(&dev->pdev->dev,
+			"rx-unknown: q=%d type=%u flag=0x%x rxd0=0x%08x len=%u\n",
+			q, type, flag, rxd0, skb->len);
 		dev_kfree_skb(skb);
 		return;
 	}
