@@ -574,9 +574,12 @@ static int mt7927_mcu_wait_resp(struct mt7927_dev *dev, int timeout_ms)
 			/* 推进 tail */
 			ring->tail = (ring->tail + 1) % ring->ndesc;
 
-			/* 归还 buffer 到硬件 */
+			/* 归还 buffer 到硬件 — 写回新 tail 位置
+			 * 注意: 不能写 idx，那会把 CIDX 从 255 降到 12，
+			 * 导致 DMA 认为 slot 13-255 全部不可用 */
 			mt7927_wr(dev,
-				  MT_WPDMA_RX_RING_CIDX(ring->qid), idx);
+				  MT_WPDMA_RX_RING_CIDX(ring->qid),
+				  ring->tail);
 
 			return 0;
 		}
@@ -1351,6 +1354,9 @@ static int mt7927_fw_download(struct mt7927_dev *dev)
 	return 0;
 }
 
+/* Forward declaration — 定义在 post_fw_init 之后的 section 7h */
+static int mt7927_mcu_set_eeprom(struct mt7927_dev *dev);
+
 /* ------- 7g. PostFwDownloadInit -------
  * 来源: Windows AsicConnac3xPostFwDownloadInit (FUN_1401c9510)
  * register_playbook.md 行 240-266 */
@@ -1598,6 +1604,11 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 				 "LogConfig 失败: %d (继续)\n", ret);
 	}
 
+	/* Step 10: EFUSE_CTRL / EEPROM 模式设置
+	 * 参考: mt76/mt7925/init.c line 110 — mt7925_mcu_set_eeprom(dev)
+	 * 在 PostFwDownloadInit 之后、mac80211 注册之前 */
+	mt7927_mcu_set_eeprom(dev);
+
 	/* 诊断: 检查所有 HOST RX 环的 DIDX 变化 */
 	dev_info(&dev->pdev->dev,
 		 "PostFwInit RX status: RX4 DIDX=%u RX6 DIDX=%u RX7 DIDX=%u\n",
@@ -1612,6 +1623,190 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 
 	dev_info(&dev->pdev->dev, "===== PostFwDownloadInit 完成 =====\n");
 	return 0;
+}
+
+/* =====================================================================
+ * 7h. 扫描前置 MCU 命令 — 固件不收到这些命令会静默丢弃 scan 请求
+ * ===================================================================== */
+
+/* SET_DOMAIN_INFO (CID=0x15) — 告诉固件合法信道列表
+ * 参考: mt76/mt7925/mcu.c mt7925_mcu_set_channel_domain()
+ * 在 mac80211 .start() 回调中发送
+ * payload 格式:
+ *   hdr: alpha2[4], bw_2g, bw_5g, bw_6g, pad
+ *   TLV(tag=2): n_2ch, n_5ch, n_6ch, pad
+ *   信道列表: {hw_value(le16), pad(le16), flags(le32)} × N
+ */
+static int mt7927_mcu_set_channel_domain(struct mt7927_dev *dev)
+{
+	struct {
+		u8 alpha2[4];
+		u8 bw_2g;
+		u8 bw_5g;
+		u8 bw_6g;
+		u8 pad;
+	} __packed hdr;
+	struct {
+		__le16 tag;
+		__le16 len;
+		u8 n_2ch;
+		u8 n_5ch;
+		u8 n_6ch;
+		u8 pad;
+	} __packed n_ch;
+	struct {
+		__le16 hw_value;
+		__le16 pad;
+		__le32 flags;
+	} __packed chan_entry;
+
+	int n_2ch = ARRAY_SIZE(mt7927_2ghz_channels);
+	int n_5ch = ARRAY_SIZE(mt7927_5ghz_channels);
+	int total_ch = n_2ch + n_5ch;
+	size_t buf_len = sizeof(hdr) + sizeof(n_ch) +
+			 total_ch * sizeof(chan_entry);
+	u8 *buf, *ptr;
+	int i, ret;
+
+	buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	/* 填充 header */
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.alpha2[0] = '0';
+	hdr.alpha2[1] = '0';  /* world domain */
+	hdr.bw_2g = 0;        /* BW_20_40M */
+	hdr.bw_5g = 3;        /* BW_20_40_80_160M */
+	hdr.bw_6g = 3;
+
+	/* 填充 TLV header */
+	memset(&n_ch, 0, sizeof(n_ch));
+	n_ch.tag = cpu_to_le16(2);  /* UNI_CMD_CHANNEL_DOMAIN_SET_DOMAIN_INFO = 2 */
+	n_ch.len = cpu_to_le16(sizeof(n_ch) +
+			       total_ch * sizeof(chan_entry));
+	n_ch.n_2ch = n_2ch;
+	n_ch.n_5ch = n_5ch;
+	n_ch.n_6ch = 0;
+
+	/* 组装 buffer */
+	ptr = buf;
+	memcpy(ptr, &hdr, sizeof(hdr));
+	ptr += sizeof(hdr);
+	memcpy(ptr, &n_ch, sizeof(n_ch));
+	ptr += sizeof(n_ch);
+
+	/* 2.4GHz channels */
+	for (i = 0; i < n_2ch; i++) {
+		memset(&chan_entry, 0, sizeof(chan_entry));
+		chan_entry.hw_value = cpu_to_le16(
+			mt7927_2ghz_channels[i].hw_value);
+		chan_entry.flags = cpu_to_le32(
+			mt7927_2ghz_channels[i].flags);
+		memcpy(ptr, &chan_entry, sizeof(chan_entry));
+		ptr += sizeof(chan_entry);
+	}
+
+	/* 5GHz channels */
+	for (i = 0; i < n_5ch; i++) {
+		memset(&chan_entry, 0, sizeof(chan_entry));
+		chan_entry.hw_value = cpu_to_le16(
+			mt7927_5ghz_channels[i].hw_value);
+		chan_entry.flags = cpu_to_le32(
+			mt7927_5ghz_channels[i].flags);
+		memcpy(ptr, &chan_entry, sizeof(chan_entry));
+		ptr += sizeof(chan_entry);
+	}
+
+	dev_info(&dev->pdev->dev,
+		 "SET_DOMAIN_INFO: n_2ch=%d n_5ch=%d total_len=%zu\n",
+		 n_2ch, n_5ch, buf_len);
+
+	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_SET_DOMAIN,
+				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+				      buf, buf_len);
+	kfree(buf);
+
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "SET_DOMAIN_INFO 失败: %d\n", ret);
+
+	return ret;
+}
+
+/* BAND_CONFIG / RTS_THRESHOLD (CID=0x08, tag=0x08)
+ * 参考: mt76/mt7925/mcu.c mt7925_mcu_set_rts_thresh()
+ * 在 mac80211 .start() 回调中发送
+ */
+static int mt7927_mcu_set_rts_thresh(struct mt7927_dev *dev)
+{
+	struct {
+		u8 band_idx;
+		u8 _rsv[3];
+		__le16 tag;
+		__le16 len;
+		__le32 len_thresh;
+		__le32 pkt_thresh;
+	} __packed req = {
+		.band_idx = 0,
+		.tag = cpu_to_le16(0x08),  /* UNI_BAND_CONFIG_RTS_THRESHOLD */
+		.len = cpu_to_le16(sizeof(req) - 4),
+		.len_thresh = cpu_to_le32(0x92b),  /* 2347 */
+		.pkt_thresh = cpu_to_le32(0x02),
+	};
+	int ret;
+
+	dev_info(&dev->pdev->dev,
+		 "BAND_CONFIG RTS_THRESH: thresh=0x%x pkt=0x%x\n",
+		 0x92b, 0x02);
+
+	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_BAND_CONFIG,
+				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+				      &req, sizeof(req));
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "BAND_CONFIG RTS 失败: %d\n", ret);
+
+	return ret;
+}
+
+/* EFUSE_CTRL / EEPROM (CID=0x2d, tag=0x02)
+ * 参考: mt76/mt7925/mcu.c mt7925_mcu_set_eeprom()
+ * 在 post_fw_init 末尾发送
+ */
+static int mt7927_mcu_set_eeprom(struct mt7927_dev *dev)
+{
+	struct {
+		u8 _rsv[4];
+		__le16 tag;
+		__le16 len;
+		u8 buffer_mode;
+		u8 format;
+		__le16 buf_len;
+	} __packed req = {
+		.tag = cpu_to_le16(0x02),  /* UNI_EFUSE_BUFFER_MODE */
+		.len = cpu_to_le16(sizeof(req) - 4),
+		.buffer_mode = 0,  /* EE_MODE_EFUSE */
+		.format = 1,       /* EE_FORMAT_WHOLE */
+	};
+	int ret;
+
+	dev_info(&dev->pdev->dev,
+		 "EFUSE_CTRL: mode=%d format=%d\n",
+		 req.buffer_mode, req.format);
+
+	/* mt7925 使用 send_and_get (wait_resp=true) 等待响应,
+	 * 但我们的 MCU 事件接收路径在 PostFwDownloadInit 之后不可靠,
+	 * 先用 fire-and-forget (0x06) 避免超时阻塞初始化
+	 * TODO: 修复 MCU 事件接收后改回 0x07 */
+	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_EFUSE_CTRL,
+				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+				      &req, sizeof(req));
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "EFUSE_CTRL 失败: %d\n", ret);
+
+	return ret;
 }
 
 /* =====================================================================
@@ -1696,6 +1891,9 @@ static void mt7927_dump_status(struct mt7927_dev *dev)
 static int mt7927_mcu_send_unicmd_set(struct mt7927_dev *dev, u16 cmd_id,
 				       const void *payload, size_t plen)
 {
+	/* 使用 option=0x06 (UNI+SET, 不等 ACK) 用于一般 SET 命令
+	 * DEV_INFO/BSS_INFO 用 0x07 会导致超时 — 固件可能不对这些命令发 ACK
+	 * scan 命令单独在调用处使用 0x07 */
 	return mt7927_mcu_send_unicmd(dev, cmd_id, 0x06, payload, plen);
 }
 
@@ -1802,10 +2000,33 @@ static int mt7927_mcu_hw_scan(struct mt7927_dev *dev,
 		 "scan: type=%d ssids=%d channels=%d\n",
 		 req->scan_type, ssid->ssids_num, chan->channels_num);
 
-	ret = mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_SCAN_REQ,
-					  buf, buf_len);
-	if (ret)
+	/* 诊断: scan 前 RX ring 6 状态 */
+	{
+		struct mt7927_ring *rxr = &dev->ring_rx6;
+		u32 hw_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(6));
+		u32 hw_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+		u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
+		u32 desc_ctrl = le32_to_cpu(rxr->desc[rxr->tail].ctrl);
+
+		dev_info(&dev->pdev->dev,
+			 "scan-pre: rx6 tail=%u hw_cidx=%u hw_didx=%u desc[tail].ctrl=0x%08x INT_STA=0x%08x INT_ENA=0x%08x\n",
+			 rxr->tail, hw_cidx, hw_didx, desc_ctrl, int_sta, int_ena);
+	}
+
+	/* ⚠️ scan 命令必须使用 option=0x07 (ACK+UNI+SET), 不是 0x06!
+	 * mt7925 在 mt7925_mcu_fill_message() 中 non-query 命令使用
+	 * MCU_CMD_UNI_EXT_ACK = 0x07, 并且 wait_resp=true.
+	 * 缺少 BIT(0) ACK 位, 固件会静默忽略 scan 命令. */
+	ret = mt7927_mcu_send_unicmd(dev, MCU_UNI_CMD_SCAN_REQ,
+				     UNI_CMD_OPT_SET_ACK, buf, buf_len);
+	if (ret) {
 		clear_bit(MT7927_SCANNING, &dev->scan_state);
+	} else {
+		/* 安排延迟诊断: 3 秒后检查 RX ring 6 是否收到事件 */
+		schedule_delayed_work(&dev->scan_work,
+				      msecs_to_jiffies(3000));
+	}
 
 	kfree(buf);
 	return ret;
@@ -1843,6 +2064,35 @@ static void mt7927_scan_work(struct work_struct *work)
 	struct cfg80211_scan_info info = {
 		.aborted = false,
 	};
+
+	/* 诊断: scan 超时时的 RX ring 6 状态 */
+	{
+		struct mt7927_ring *rxr = &dev->ring_rx6;
+		u32 hw_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(6));
+		u32 hw_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+		u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
+		u32 desc_ctrl = le32_to_cpu(rxr->desc[rxr->tail].ctrl);
+		u32 desc_buf0 = le32_to_cpu(rxr->desc[rxr->tail].buf0);
+
+		dev_info(&dev->pdev->dev,
+			 "scan_work: rx6 tail=%u hw_cidx=%u hw_didx=%u desc[tail].ctrl=0x%08x buf0=0x%08x INT_STA=0x%08x INT_ENA=0x%08x scanning=%d\n",
+			 rxr->tail, hw_cidx, hw_didx, desc_ctrl, desc_buf0,
+			 int_sta, int_ena,
+			 test_bit(MT7927_SCANNING, &dev->scan_state) ? 1 : 0);
+
+		/* 检查 desc[tail] 是否已有 DMA 数据 (DMA_DONE 但 NAPI 没处理) */
+		if (desc_ctrl & MT_DMA_CTL_DMA_DONE) {
+			u32 *evt = rxr->buf[rxr->tail];
+			u32 sdl0 = FIELD_GET(MT_DMA_CTL_SD_LEN0, desc_ctrl);
+
+			dev_info(&dev->pdev->dev,
+				 "  MISSED EVENT at tail=%u: sdl0=%u w0=0x%08x w1=0x%08x w2=0x%08x\n",
+				 rxr->tail, sdl0,
+				 evt ? evt[0] : 0, evt ? evt[1] : 0,
+				 evt ? evt[2] : 0);
+		}
+	}
 
 	if (test_and_clear_bit(MT7927_SCANNING, &dev->scan_state)) {
 		if (dev->hw && dev->hw_init_done)
@@ -1890,9 +2140,17 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	req.hdr.bss_idx = mvif->bss_idx;
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.network_type = cpu_to_le32(NETWORK_INFRA);
 	req.basic.active = enable;
+	req.basic.omac_idx = mvif->omac_idx;
+	req.basic.hw_bss_idx = mvif->bss_idx;
+	req.basic.band_idx = mvif->band_idx;
+	/* STA 模式: conn_type = CONNECTION_INFRA_STA (0x10001)
+	 * 来源: mt76_connac_mcu.c line 1206 */
+	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
+	req.basic.conn_state = enable ? 1 : 0;
 	req.basic.wmm_idx = mvif->wmm_idx;
+	req.basic.bmc_tx_wlan_idx = cpu_to_le16(mvif->sta.wcid.idx);
+	req.basic.sta_idx = cpu_to_le16(mvif->sta.wcid.idx);
 
 	if (vif->cfg.assoc && vif->bss_conf.bssid) {
 		memcpy(req.basic.bssid, vif->bss_conf.bssid, ETH_ALEN);
@@ -2082,8 +2340,30 @@ static void mt7927_mac80211_tx(struct ieee80211_hw *hw,
 static int mt7927_mac80211_start(struct ieee80211_hw *hw)
 {
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
+	int ret;
 
 	dev_info(&dev->pdev->dev, "mac80211: start\n");
+
+	/* 发送固件必需的扫描前置命令
+	 * 参考: mt76/mt7925/main.c mt7925_start() lines 314-329
+	 * 缺少这些命令，固件会静默丢弃 scan 请求！ */
+
+	/* 1. SET_DOMAIN_INFO — 信道域信息 (最关键!)
+	 * 固件不知道合法信道列表就不会扫描 */
+	ret = mt7927_mcu_set_channel_domain(dev);
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "mac80211 start: set_channel_domain 失败: %d (继续)\n",
+			 ret);
+
+	/* 2. BAND_CONFIG / RTS_THRESHOLD
+	 * 参考: mt7925/main.c line 325 */
+	ret = mt7927_mcu_set_rts_thresh(dev);
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "mac80211 start: set_rts_thresh 失败: %d (继续)\n",
+			 ret);
+
 	return 0;
 }
 
@@ -2100,7 +2380,7 @@ static int mt7927_add_interface(struct ieee80211_hw *hw,
 {
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
-	int idx;
+	int idx, ret;
 
 	for (idx = 0; idx < 4; idx++) {
 		if (!(dev->vif_mask & BIT_ULL(idx)))
@@ -2119,13 +2399,27 @@ static int mt7927_add_interface(struct ieee80211_hw *hw,
 	dev->vif_mask |= BIT_ULL(idx);
 	dev->omac_mask |= BIT_ULL(idx);
 
-	/* 发送 DEV_INFO MCU 命令激活接口 */
-	mt7927_mcu_uni_add_dev(dev, vif, true);
+	/* 按 mt7925 顺序发送 MCU 命令:
+	 * 1. DEV_INFO_UPDATE — 激活 OMAC
+	 * 2. BSS_INFO_UPDATE — 创建 BSS, 固件分配资源
+	 * 缺少 BSS_INFO 会导致 scan 等后续命令被固件静默忽略 */
+	ret = mt7927_mcu_uni_add_dev(dev, vif, true);
+	if (ret)
+		goto err;
+
+	ret = mt7927_mcu_add_bss_info(dev, vif, true);
+	if (ret)
+		goto err;
 
 	dev_info(&dev->pdev->dev,
 		 "mac80211: add_interface bss_idx=%d type=%d\n",
 		 idx, vif->type);
 	return 0;
+
+err:
+	dev->vif_mask &= ~BIT_ULL(idx);
+	dev->omac_mask &= ~BIT_ULL(idx);
+	return ret;
 }
 
 static void mt7927_remove_interface(struct ieee80211_hw *hw,
@@ -2134,7 +2428,8 @@ static void mt7927_remove_interface(struct ieee80211_hw *hw,
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 
-	/* 停用接口 */
+	/* 停用接口 — mt7925 顺序: BSS_INFO(off) → DEV_INFO(off) */
+	mt7927_mcu_add_bss_info(dev, vif, false);
 	mt7927_mcu_uni_add_dev(dev, vif, false);
 
 	dev->vif_mask &= ~BIT_ULL(mvif->bss_idx);
@@ -2534,6 +2829,38 @@ static int mt7927_pci_probe(struct pci_dev *pdev,
 				 "PostFwDownloadInit 失败: %d (继续)\n", ret);
 	}
 
+	/* 诊断 A: PostFwDownloadInit 刚完成, 测试 MCU 通信
+	 * 此时环境和 PostFwDownloadInit 中的 NIC_CAP 完全一样
+	 * 如果失败 → PostFwDownloadInit 本身破坏了某些状态 */
+	dev_info(&pdev->dev,
+		 "诊断A: PostFwDownloadInit 刚完成, 重新发送 NIC_CAP\n");
+	{
+		int test_ret;
+		u32 tx15_cidx_before, tx15_didx_before, rx6_didx_before;
+		u32 tx15_cidx_after, tx15_didx_after, rx6_didx_after;
+
+		tx15_cidx_before = mt7927_rr(dev, MT_WPDMA_TX_RING_CIDX(15));
+		tx15_didx_before = mt7927_rr(dev, MT_WPDMA_TX_RING_DIDX(15));
+		rx6_didx_before = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+
+		test_ret = mt7927_mcu_send_unicmd(dev,
+			UNI_CMD_ID_NIC_CAP, UNI_CMD_OPT_SET_ACK,
+			NULL, 0);
+
+		tx15_cidx_after = mt7927_rr(dev, MT_WPDMA_TX_RING_CIDX(15));
+		tx15_didx_after = mt7927_rr(dev, MT_WPDMA_TX_RING_DIDX(15));
+		rx6_didx_after = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+
+		dev_info(&pdev->dev,
+			 "诊断A: NIC_CAP %s (ret=%d)\n"
+			 "  TX15: CIDX %u→%u DIDX %u→%u  RX6: DIDX %u→%u  tail=%u\n",
+			 test_ret ? "失败" : "成功", test_ret,
+			 tx15_cidx_before, tx15_cidx_after,
+			 tx15_didx_before, tx15_didx_after,
+			 rx6_didx_before, rx6_didx_after,
+			 dev->ring_rx6.tail);
+	}
+
 	/* 诊断 dump */
 	mt7927_dump_status(dev);
 
@@ -2565,12 +2892,22 @@ static int mt7927_pci_probe(struct pci_dev *pdev,
 	tasklet_init(&dev->irq_tasklet, mt7927_irq_tasklet,
 		     (unsigned long)dev);
 
-	/* 阶段 7d: 注册 IRQ */
+	/* 阶段 7d: 注册 IRQ
+	 * 顺序: 先关 WFDMA 中断 → 开 PCIe MAC 中断转发 → 注册 IRQ →
+	 *        开 WFDMA 中断 + MCU2HOST 软件中断
+	 * 来源: mt76/mt7925/pci.c probe 顺序 */
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_INTX);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "IRQ 向量分配失败: %d\n", ret);
 		goto err_napi;
 	}
+
+	/* 先关闭 WFDMA 中断, 防止注册前触发 */
+	mt7927_wr(dev, MT_WFDMA_HOST_INT_ENA, 0);
+
+	/* 开启 PCIe MAC 层中断转发 — 没有这步中断无法到达 CPU!
+	 * 来源: mt7925/pci.c line 407 */
+	mt7927_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0xff);
 
 	ret = request_irq(pci_irq_vector(pdev, 0), mt7927_irq_handler,
 			  IRQF_SHARED, "mt7927", dev);
@@ -2579,12 +2916,78 @@ static int mt7927_pci_probe(struct pci_dev *pdev,
 		goto err_irq_vec;
 	}
 
+	/* 在开启中断前，清除 PostFwDownloadInit 遗留的中断状态
+	 * INT_STA=0x06004000 (NIC_CAP + TX done) 会导致虚假 IRQ
+	 * MCU_CMD=0x00008000 未 ACK 可能阻塞固件事件队列 */
+	{
+		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+		u32 mcu_cmd = mt7927_rr(dev, MT_MCU_CMD_REG);
+
+		mt7927_wr(dev, MT_WFDMA_HOST_INT_STA, int_sta);
+		if (mcu_cmd)
+			mt7927_wr(dev, MT_MCU_CMD_REG, mcu_cmd);
+
+		dev_info(&pdev->dev,
+			 "清除遗留中断: INT_STA=0x%08x MCU_CMD=0x%08x\n",
+			 int_sta, mcu_cmd);
+	}
+
+	/* 开启 WFDMA 中断 (所有 RX/TX/MCU) */
+	mt7927_config_int_mask(dev, true);
+
+	/* 开启 MCU→HOST 软件中断
+	 * 来源: mt7925/pci.c line 555 */
+	mt7927_rmw(dev, MT_MCU2HOST_SW_INT_ENA, 0,
+		   MT_MCU_CMD_WAKE_RX_PCIE);
+
+	dev_info(&pdev->dev,
+		 "IRQ 初始化: INT_ENA=0x%08x PCIE_MAC_INT=0x%08x MCU_SW_INT_ENA=0x%08x\n",
+		 mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA),
+		 mt7927_rr(dev, MT_PCIE_MAC_INT_ENABLE),
+		 mt7927_rr(dev, MT_MCU2HOST_SW_INT_ENA));
+
 	/* 阶段 7e: 初始化数据 TX ring 0 */
 	ret = mt7927_dma_init_data_rings(dev);
 	if (ret) {
 		dev_warn(&pdev->dev,
 			 "TX ring 0 初始化失败: %d (继续)\n", ret);
 		/* 非致命: 扫描仍可工作，只是数据路径不可用 */
+	}
+
+	/* 诊断B: IRQ/NAPI/TX0 都初始化后, 禁用中断再测 MCU
+	 * 如果诊断A成功但诊断B失败 → 某个初始化步骤破坏了 MCU */
+	dev_info(&pdev->dev, "诊断B: 全初始化后, 禁用中断重发 NIC_CAP\n");
+	{
+		int test_ret;
+		u32 tx15_cidx_before, tx15_didx_before, rx6_didx_before;
+		u32 tx15_cidx_after, tx15_didx_after, rx6_didx_after;
+
+		/* 禁用中断, 模拟 PostFwDownloadInit 的环境 */
+		mt7927_wr(dev, MT_WFDMA_HOST_INT_ENA, 0);
+
+		tx15_cidx_before = mt7927_rr(dev, MT_WPDMA_TX_RING_CIDX(15));
+		tx15_didx_before = mt7927_rr(dev, MT_WPDMA_TX_RING_DIDX(15));
+		rx6_didx_before = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+
+		test_ret = mt7927_mcu_send_unicmd(dev,
+			UNI_CMD_ID_NIC_CAP, UNI_CMD_OPT_SET_ACK,
+			NULL, 0);
+
+		tx15_cidx_after = mt7927_rr(dev, MT_WPDMA_TX_RING_CIDX(15));
+		tx15_didx_after = mt7927_rr(dev, MT_WPDMA_TX_RING_DIDX(15));
+		rx6_didx_after = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+
+		dev_info(&pdev->dev,
+			 "诊断B: NIC_CAP %s (ret=%d)\n"
+			 "  TX15: CIDX %u→%u DIDX %u→%u  RX6: DIDX %u→%u  tail=%u\n",
+			 test_ret ? "失败" : "成功", test_ret,
+			 tx15_cidx_before, tx15_cidx_after,
+			 tx15_didx_before, tx15_didx_after,
+			 rx6_didx_before, rx6_didx_after,
+			 dev->ring_rx6.tail);
+
+		/* 恢复中断 */
+		mt7927_config_int_mask(dev, true);
 	}
 
 	/* 阶段 8: mac80211 注册 (让 wlan0 出现) */
@@ -2639,6 +3042,7 @@ static void mt7927_pci_remove(struct pci_dev *pdev)
 
 	mt7927_unregister_device(dev);
 	mt7927_config_int_mask(dev, false);
+	mt7927_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0);
 
 	/* 释放 IRQ */
 	free_irq(pci_irq_vector(pdev, 0), dev);

@@ -327,6 +327,14 @@
 #define MT_CB_INFRA_MCU_OWN         0x1f5030  /* MCU_OWN 状态 */
 #define MT_CB_INFRA_MCU_OWN_SET     0x1f5034  /* MCU_OWN 设置 */
 
+/* PCIe MAC 中断使能寄存器
+ * 来源: mt76/mt792x_regs.h — PCIe MAC 层中断转发
+ * ⚠️ 必须设置为 0xff 才能将 WFDMA 中断转发到主机 CPU
+ */
+#define MT_PCIE_MAC_BASE            0x10000
+#define MT_PCIE_MAC(ofs)            (MT_PCIE_MAC_BASE + (ofs))
+#define MT_PCIE_MAC_INT_ENABLE      MT_PCIE_MAC(0x188)  /* BAR0+0x10188 */
+
 /* PCIe 睡眠配置 (HIF Init)
  * 来源: register_playbook.md 行 399, reusable_code.md 行 643-647
  */
@@ -490,6 +498,9 @@
 #define MT_MCU_CLASS_BUF_DL         0xed  /* Buffer 下载 (可选) */
 #define MT_MCU_CLASS_DBDC           0x28  /* DBDC (仅 MT6639/MT7927) */
 #define MT_MCU_CLASS_SCAN_CFG       0xca  /* Scan/chip/log config */
+#define MT_MCU_CLASS_SET_DOMAIN     0x15  /* SET_DOMAIN_INFO — 信道域信息 */
+#define MT_MCU_CLASS_BAND_CONFIG    0x08  /* BAND_CONFIG — RTS 阈值等 */
+#define MT_MCU_CLASS_EFUSE_CTRL     0x2d  /* EFUSE_CTRL — EEPROM 模式 */
 #define MT_MCU_TARGET               0xed  /* 所有命令使用 target=0xed */
 
 #define MT_MCU_CMD_WAKE_RX_PCIE     BIT(0)
@@ -1320,24 +1331,27 @@ struct dev_info_active_tlv {
 	u8 pad[2];
 } __packed;
 
-/* BSS_INFO_BASIC TLV (tag=0) */
+/* BSS_INFO_BASIC TLV (tag=0)
+ * 来源: mt76/mt76_connac_mcu.h line 1452 — 必须和固件结构体一致! */
 struct mt76_connac_bss_basic_tlv {
 	__le16 tag;
 	__le16 len;
-	__le32 network_type;
 	u8 active;
-	u8 __rsv0;
-	__le16 bcn_interval;
-	u8 bssid[ETH_ALEN];
+	u8 omac_idx;
+	u8 hw_bss_idx;
+	u8 band_idx;
+	__le32 conn_type;
+	u8 conn_state;
 	u8 wmm_idx;
+	u8 bssid[ETH_ALEN];
+	__le16 bmc_tx_wlan_idx;
+	__le16 bcn_interval;
 	u8 dtim_period;
-	u8 bmc_wcid_lo;
-	u8 cipher;
-	u8 phy_mode;
-	u8 max_bssid;
-	u8 non_tx_bssid;
-	u8 bmc_wcid_hi;
-	u8 __rsv1[2];
+	u8 phymode;
+	__le16 sta_idx;
+	__le16 nonht_basic_phy;
+	u8 phymode_ext;
+	u8 link_idx;
 } __packed;
 
 /* BSS_INFO_RLM TLV */
