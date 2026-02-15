@@ -81,9 +81,10 @@ static inline void dma_rmw(struct mt7927_dev *dev, u32 reg, u32 clr, u32 set)
 				 MT_INT_RX_DONE_AUX)
 
 /* TX done — reuse header definitions */
+#define MT_INT_TX_DONE_DATA	HOST_TX_DONE_INT_ENA0   /* BIT(4) — TX ring 0 data */
 #define MT_INT_TX_DONE_WM	HOST_TX_DONE_INT_ENA15  /* BIT(25) */
 #define MT_INT_TX_DONE_FWDL	HOST_TX_DONE_INT_ENA16  /* BIT(26) */
-#define MT_INT_TX_DONE_ALL	(MT_INT_TX_DONE_WM | MT_INT_TX_DONE_FWDL)
+#define MT_INT_TX_DONE_ALL	(MT_INT_TX_DONE_DATA | MT_INT_TX_DONE_WM | MT_INT_TX_DONE_FWDL)
 
 /* ============================================================================
  * RX Processing Helpers
@@ -389,23 +390,26 @@ int mt7927_poll_tx(struct napi_struct *napi, int budget)
  * ============================================================================ */
 
 /*
- * mt7927_tx_queue_skb — Enqueue a data skb into a TX ring
+ * mt7927_tx_queue_skb — Enqueue a data skb into a TX ring (CT mode)
  *
- * Maps the skb data for DMA, fills the TX descriptor, and stores
- * the skb pointer for later cleanup on TX completion.
+ * CT mode: the DMA descriptor points to TXD+TXP in coherent memory.
+ * The actual frame payload is pointed to by TXP scatter-gather entries.
+ * Token-based: skb cleanup happens in TXFREE event, not TX completion.
  *
- * The caller should build the TXD (via mt7927_mac_write_txwi) before
- * calling this function. The skb->data should start with the TXD header.
+ * The caller must call mt7927_tx_prepare_skb() first to build TXD+TXP
+ * and obtain the token and txwi_dma address.
  *
  * Returns 0 on success, negative errno on failure.
  */
 int mt7927_tx_queue_skb(struct mt7927_dev *dev, struct mt7927_ring *ring,
-			struct sk_buff *skb)
+			struct sk_buff *skb, struct mt7927_wcid *wcid)
 {
 	struct mt76_desc *desc;
-	dma_addr_t addr;
+	dma_addr_t txwi_dma;
+	int token;
 	u32 ctrl;
 	u16 idx;
+	int ret;
 
 	/* Check for ring full: head has caught up with tail */
 	if (((ring->head + 1) % ring->ndesc) == ring->tail) {
@@ -415,33 +419,29 @@ int mt7927_tx_queue_skb(struct mt7927_dev *dev, struct mt7927_ring *ring,
 		return -ENOSPC;
 	}
 
-	/* DMA map the skb data */
-	addr = dma_map_single(&dev->pdev->dev, skb->data, skb->len,
-			      DMA_TO_DEVICE);
-	if (dma_mapping_error(&dev->pdev->dev, addr)) {
-		dev_err(&dev->pdev->dev, "TX DMA mapping failed\n");
-		return -ENOMEM;
-	}
+	/* Prepare TXD+TXP in coherent pool and DMA map payload */
+	ret = mt7927_tx_prepare_skb(dev, skb, wcid, &token, &txwi_dma);
+	if (ret)
+		return ret;
 
 	idx = ring->head;
 	desc = &ring->desc[idx];
 
-	/* Fill TX descriptor */
-	desc->buf0 = cpu_to_le32(lower_32_bits(addr));
+	/* Fill TX descriptor: buf0 = TXD+TXP coherent DMA address */
+	desc->buf0 = cpu_to_le32(lower_32_bits(txwi_dma));
 	desc->buf1 = cpu_to_le32(0);
 	desc->info = cpu_to_le32(0);
 
-	/* ctrl: length + LAST_SEC0 + DMA_DONE (ready for DMA engine)
-	 * Note: For WFDMA TX, DMA_DONE=1 means "CPU has filled this slot,
-	 * DMA can consume it" — opposite of RX where DMA sets it */
-	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, skb->len) |
-	       MT_DMA_CTL_LAST_SEC0 |
-	       MT_DMA_CTL_DMA_DONE;
+	/* ctrl: length of TXD+TXP (64 bytes) + LAST_SEC0
+	 * DMA_DONE=0 means "pending for DMA" */
+	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, MT7927_TXWI_SIZE) |
+	       MT_DMA_CTL_LAST_SEC0;
 	desc->ctrl = cpu_to_le32(ctrl);
 
-	/* Store skb and DMA address for TX completion cleanup */
-	ring->buf[idx] = skb;
-	ring->buf_dma[idx] = addr;
+	/* Store token (as void*) for ring slot tracking.
+	 * txwi_dma stored for diagnostic purposes. */
+	ring->buf[idx] = (void *)(unsigned long)token;
+	ring->buf_dma[idx] = txwi_dma;
 
 	/* Advance producer index */
 	ring->head = (ring->head + 1) % ring->ndesc;
@@ -461,17 +461,28 @@ void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring)
 	/* Ensure all descriptor writes are visible before poking HW */
 	wmb();
 	dma_wr(dev, MT_WPDMA_TX_RING_CIDX(ring->qid), ring->head);
+
+	/* Diagnostic: read back ring state after kick */
+	{
+		u32 base = dma_rr(dev, MT_WPDMA_TX_RING_BASE(ring->qid));
+		u32 cnt  = dma_rr(dev, MT_WPDMA_TX_RING_CNT(ring->qid));
+		u32 cidx = dma_rr(dev, MT_WPDMA_TX_RING_CIDX(ring->qid));
+		u32 didx = dma_rr(dev, MT_WPDMA_TX_RING_DIDX(ring->qid));
+
+		dev_info(&dev->pdev->dev,
+			 "TX%d kick: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
+			 ring->qid, base, cnt, cidx, didx);
+	}
 }
 
 /*
- * mt7927_tx_complete — Process completed TX descriptors
+ * mt7927_tx_complete — Process completed TX descriptors (CT mode)
  *
- * Scans from ring->tail up to the hardware's DMA index (DIDX) for
- * completed transmissions. For each completed descriptor:
- *   1. DMA unmap the buffer
- *   2. Free the skb
- *   3. Reset the descriptor
- *   4. Advance ring->tail
+ * In CT mode, the actual skb cleanup (DMA unmap + kfree) is done
+ * by the TXFREE event handler (mt7927_mac_tx_free). This function
+ * only advances the ring tail to free descriptor slots.
+ *
+ * Scans from ring->tail up to the hardware's DMA index (DIDX).
  */
 void mt7927_tx_complete(struct mt7927_dev *dev, struct mt7927_ring *ring)
 {
@@ -485,20 +496,8 @@ void mt7927_tx_complete(struct mt7927_dev *dev, struct mt7927_ring *ring)
 
 	while (ring->tail != dma_idx) {
 		struct mt76_desc *desc = &ring->desc[ring->tail];
-		struct sk_buff *skb;
-		dma_addr_t addr;
 
-		/* Get stored skb and DMA address */
-		skb = ring->buf[ring->tail];
-		addr = ring->buf_dma[ring->tail];
-
-		if (skb && addr) {
-			dma_unmap_single(&dev->pdev->dev, addr, skb->len,
-					 DMA_TO_DEVICE);
-			dev_kfree_skb_any(skb);
-		}
-
-		/* Clear the slot */
+		/* Clear the ring slot (skb freed by TXFREE event) */
 		ring->buf[ring->tail] = NULL;
 		ring->buf_dma[ring->tail] = 0;
 
@@ -542,14 +541,31 @@ int mt7927_dma_init_data_rings(struct mt7927_dev *dev)
 	ring->tail = 0;
 	ring->buf_size = 0;
 
+	/* Allocate TXD+TXP coherent DMA buffer pool (CT mode)
+	 * Each token gets MT7927_TXWI_SIZE (64) bytes for TXD+TXP */
+	dev->txwi_buf = dma_alloc_coherent(&dev->pdev->dev,
+					   MT7927_TOKEN_SIZE * MT7927_TXWI_SIZE,
+					   &dev->txwi_dma, GFP_KERNEL);
+	if (!dev->txwi_buf)
+		return -ENOMEM;
+	memset(dev->txwi_buf, 0, MT7927_TOKEN_SIZE * MT7927_TXWI_SIZE);
+	spin_lock_init(&dev->tx_token.lock);
+	dev->tx_token.next_id = 0;
+
+	dev_info(&dev->pdev->dev,
+		 "TXWI pool: %u tokens × %lu bytes = %lu bytes, dma=0x%pad\n",
+		 MT7927_TOKEN_SIZE, (unsigned long)MT7927_TXWI_SIZE,
+		 (unsigned long)(MT7927_TOKEN_SIZE * MT7927_TXWI_SIZE),
+		 &dev->txwi_dma);
+
 	/* Allocate DMA-coherent descriptor ring */
 	ring->desc = dma_alloc_coherent(&dev->pdev->dev,
 					ndesc * sizeof(struct mt76_desc),
 					&ring->desc_dma, GFP_KERNEL);
 	if (!ring->desc)
-		return -ENOMEM;
+		goto err_txwi;
 
-	/* Allocate tracking arrays for TX skb and DMA addresses */
+	/* Allocate tracking arrays for TX token and DMA addresses */
 	ring->buf = kcalloc(ndesc, sizeof(*ring->buf), GFP_KERNEL);
 	ring->buf_dma = kcalloc(ndesc, sizeof(*ring->buf_dma), GFP_KERNEL);
 	if (!ring->buf || !ring->buf_dma)
@@ -583,6 +599,13 @@ err:
 				  ndesc * sizeof(struct mt76_desc),
 				  ring->desc, ring->desc_dma);
 		ring->desc = NULL;
+	}
+err_txwi:
+	if (dev->txwi_buf) {
+		dma_free_coherent(&dev->pdev->dev,
+				  MT7927_TOKEN_SIZE * MT7927_TXWI_SIZE,
+				  dev->txwi_buf, dev->txwi_dma);
+		dev->txwi_buf = NULL;
 	}
 	return -ENOMEM;
 }

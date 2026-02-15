@@ -100,6 +100,12 @@ static void mt7927_mac_write_txwi_80211(struct mt7927_dev *dev, __le32 *txwi,
 	val = FIELD_PREP(MT_TXD1_TID, tid) |
 	      FIELD_PREP(MT_TXD1_HDR_FORMAT_V3, MT_HDR_FORMAT_802_11) |
 	      FIELD_PREP(MT_TXD1_HDR_INFO, mac_hdr_len / 2);
+
+	/* 管理帧需要固定速率发送 (基本速率)
+	 * 来源: mt7925/mac.c line 682-684 */
+	if (!ieee80211_is_data(fc))
+		val |= MT_TXD1_FIXED_RATE;
+
 	txwi[1] |= cpu_to_le32(val);
 
 	/* TXD[2]: frame type/subtype + header padding for encryption */
@@ -130,7 +136,7 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	bool is_8023 = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
-	u8 p_fmt = MT_TX_TYPE_CT; /* Cut-through for data */
+	u8 p_fmt = MT_TX_TYPE_CT; /* Cut-through: TXD+TXP in coherent, payload separate */
 	u8 q_idx;
 	u16 wlan_idx = wcid ? wcid->idx : 0;
 	u8 omac_idx = 0;
@@ -152,6 +158,10 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 	if (beacon) {
 		q_idx = MT_TX_MCU_PORT_RX_Q0;
 		p_fmt = MT_TX_TYPE_FW;
+	} else if (!is_8023) {
+		/* 管理帧 (auth/assoc/probe) 必须走 ALTX0 队列
+		 * 来源: mt7925/mac.c line 757-763, qid >= MT_TXQ_PSD → ALTX0 */
+		q_idx = 0x10; /* MT_LMAC_ALTX0 */
 	} else {
 		q_idx = mt7927_lmac_mapping(skb_get_queue_mapping(skb));
 	}
@@ -201,34 +211,245 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 	      MT_TXD6_DAS |
 	      MT_TXD6_DIS_MAT;
 	txwi[6] = cpu_to_le32(val);
+
+	/* 使用固定速率时: 设置 TX_RATE + 禁用 BA
+	 * 来源: mt7925/mac.c line 817-834
+	 * MT792x_BASIC_RATES_TBL = 11 (基址)
+	 * 5GHz 需要跳过 4 个 CCK 速率 → index 15 (OFDM 6Mbps)
+	 * 2.4GHz 用 index 11 (CCK 1Mbps) */
+	if (txwi[1] & cpu_to_le32(MT_TXD1_FIXED_RATE)) {
+		u8 rate_idx = 11; /* 2.4GHz: CCK 1Mbps */
+
+		if (dev->hw && dev->hw->conf.chandef.chan &&
+		    dev->hw->conf.chandef.chan->band != NL80211_BAND_2GHZ)
+			rate_idx = 15; /* 5GHz/6GHz: OFDM 6Mbps */
+
+		txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, rate_idx));
+		txwi[3] |= cpu_to_le32(MT_TXD3_BA_DISABLE);
+	}
 }
 
 /*
- * mt7927_tx_prepare_skb - Prepend TXD to SKB for transmission
+ * mt7927_tx_prepare_skb - CT mode: build TXD+TXP in coherent pool, DMA map payload
  *
- * Builds the CONNAC3 TXD and pushes it onto the front of the SKB.
- * After this call, skb->data points to the TXD, followed by the frame.
+ * CT (Cut-Through) mode flow:
+ *   1. Allocate a token (simple round-robin, check slot is free)
+ *   2. DMA map skb->data (payload — do NOT prepend TXD!)
+ *   3. Build TXD (32 bytes) + TXP (32 bytes) in txwi_buf[token]
+ *   4. TXP points to payload DMA address via scatter-gather
+ *   5. Return token and txwi DMA address to caller
+ *
+ * 来源: mt7925/pci_mac.c mt7925e_tx_prepare_skb()
  */
 int mt7927_tx_prepare_skb(struct mt7927_dev *dev, struct sk_buff *skb,
-			  struct mt7927_wcid *wcid)
+			  struct mt7927_wcid *wcid, int *token_out,
+			  dma_addr_t *txwi_dma_out)
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	struct ieee80211_key_conf *key = info->control.hw_key;
-	__le32 txwi_buf[MT_TXD_SIZE / 4];
+	struct mt7927_hw_txp *txp;
+	dma_addr_t payload_dma;
+	unsigned long flags;
 	__le32 *txwi;
+	int token;
+	u16 i;
 
-	/* Build TXD using original payload length */
-	mt7927_mac_write_txwi(dev, txwi_buf, skb, wcid, key, 0, false);
+	if (!dev->txwi_buf)
+		return -EINVAL;
 
-	/* Make room for TXD at head of skb */
-	if (skb_cow_head(skb, MT_TXD_SIZE))
+	/* 1. Allocate token — simple round-robin scan */
+	spin_lock_irqsave(&dev->tx_token.lock, flags);
+	for (i = 0; i < MT7927_TOKEN_SIZE; i++) {
+		token = dev->tx_token.next_id;
+		dev->tx_token.next_id = (token + 1) % MT7927_TOKEN_SIZE;
+		if (!dev->tx_token.skb[token])
+			break;
+	}
+	if (i == MT7927_TOKEN_SIZE) {
+		spin_unlock_irqrestore(&dev->tx_token.lock, flags);
+		dev_dbg(&dev->pdev->dev, "TX: token pool exhausted\n");
+		return -ENOSPC;
+	}
+	/* Reserve the slot */
+	dev->tx_token.skb[token] = skb;
+	spin_unlock_irqrestore(&dev->tx_token.lock, flags);
+
+	/* 诊断: 管理帧 dump 802.11 header (前 30 字节) */
+	{
+		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+
+		if (ieee80211_is_mgmt(hdr->frame_control)) {
+			dev_info(&dev->pdev->dev,
+				 "TX mgmt payload: fc=0x%04x len=%u\n",
+				 le16_to_cpu(hdr->frame_control), skb->len);
+			print_hex_dump(KERN_INFO, "TX-frame: ",
+				       DUMP_PREFIX_OFFSET,
+				       16, 1, skb->data,
+				       min_t(int, skb->len, 30), false);
+		}
+	}
+
+	/* 2. DMA map payload (skb->data, not prepended with TXD) */
+	payload_dma = dma_map_single(&dev->pdev->dev, skb->data, skb->len,
+				     DMA_TO_DEVICE);
+	if (dma_mapping_error(&dev->pdev->dev, payload_dma)) {
+		spin_lock_irqsave(&dev->tx_token.lock, flags);
+		dev->tx_token.skb[token] = NULL;
+		spin_unlock_irqrestore(&dev->tx_token.lock, flags);
 		return -ENOMEM;
+	}
 
-	/* Prepend TXD */
-	txwi = (__le32 *)skb_push(skb, MT_TXD_SIZE);
-	memcpy(txwi, txwi_buf, MT_TXD_SIZE);
+	/* Save mapping info for TXFREE cleanup */
+	dev->tx_token.dma_addr[token] = payload_dma;
+	dev->tx_token.dma_len[token] = skb->len;
+
+	/* 3. Compute txwi location in coherent pool */
+	txwi = (__le32 *)(dev->txwi_buf + token * MT7927_TXWI_SIZE);
+
+	/* 4. Build TXD (first 32 bytes) */
+	mt7927_mac_write_txwi(dev, txwi, skb, wcid, key, 0, false);
+
+	/* 5. Fill TXP (second 32 bytes) — scatter-gather page table */
+	txp = (struct mt7927_hw_txp *)(txwi + MT_TXD_SIZE / 4);
+	memset(txp, 0, sizeof(*txp));
+
+	txp->msdu_id[0] = cpu_to_le16(token | MT_MSDU_ID_VALID);
+
+	/* ptr[0].buf0 = payload DMA address, len0 = length | LAST */
+	txp->ptr[0].buf0 = cpu_to_le32(lower_32_bits(payload_dma));
+	txp->ptr[0].len0 = cpu_to_le16(skb->len | MT_TXP_LEN_LAST);
+
+	/* 诊断: 管理帧 dump TXD + TXP 分开显示, 含字段解析 */
+	{
+		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+
+		if (ieee80211_is_mgmt(hdr->frame_control)) {
+			u32 txd1 = le32_to_cpu(txwi[1]);
+			u16 wlan_idx = FIELD_GET(MT_TXD1_WLAN_IDX, txd1);
+			u8 own_mac = FIELD_GET(MT_TXD1_OWN_MAC, txd1);
+
+			dev_info(&dev->pdev->dev,
+				 "TX mgmt: fc=0x%04x wlan_idx=%u own_mac=%u len=%u token=%u\n",
+				 le16_to_cpu(hdr->frame_control),
+				 wlan_idx, own_mac, skb->len, token);
+			print_hex_dump(KERN_INFO, "mt7927 TXD: ",
+				       DUMP_PREFIX_OFFSET,
+				       16, 4, txwi, MT_TXD_SIZE, false);
+			print_hex_dump(KERN_INFO, "mt7927 TXP: ",
+				       DUMP_PREFIX_OFFSET,
+				       16, 4, txp, sizeof(*txp), false);
+		}
+	}
+
+	/* 6. Output token and txwi DMA address */
+	*token_out = token;
+	*txwi_dma_out = dev->txwi_dma + token * MT7927_TXWI_SIZE;
 
 	return 0;
+}
+
+/*
+ * mt7927_mac_tx_free - Handle TXFREE (TX completion) event from firmware
+ *
+ * TXFREE events arrive as PKT_TYPE_TXRX_NOTIFY on the MCU RX ring.
+ * Each event contains a list of completed MSDU IDs (tokens).
+ * For each token, we DMA unmap the payload and free the skb.
+ *
+ * TXFREE format (CONNAC3):
+ *   DW0: PKT_TYPE | MSDU_CNT | RX_BYTE_CNT
+ *   DW1: VER | ...
+ *   DW2+: per-MSDU info words (token ID in bits 14:0)
+ *
+ * 来源: mt76/mt76_connac_mac.c mt76_connac2_mac_write_txwi() → tx_free
+ *       mt76/mt7925/mac.c mt7925_mac_tx_free()
+ */
+void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
+{
+	__le32 *data = (__le32 *)skb->data;
+	u32 hdr0, hdr1;
+	u16 msdu_cnt;
+	int i;
+	unsigned long flags;
+
+	if (skb->len < 8)
+		goto out;
+
+	hdr0 = le32_to_cpu(data[0]);
+	hdr1 = le32_to_cpu(data[1]);
+	msdu_cnt = FIELD_GET(MT_TXFREE0_MSDU_CNT, hdr0);
+
+	dev_info(&dev->pdev->dev,
+		 "TXFREE: msdu_cnt=%u ver=%lu len=%u\n",
+		 msdu_cnt, (unsigned long)FIELD_GET(MT_TXFREE1_VER, hdr1),
+		 skb->len);
+
+	/* Parse per-MSDU info words starting at DW2.
+	 *
+	 * TXFREE word types:
+	 *   PAIR (bit31=1): contains WLAN_ID, no MSDU IDs — skip
+	 *   HEADER (bit30=1, bit31=0): TX status header with STAT/COUNT — log
+	 *   MSDU (bit31=0, bit30=0): packed 2× 15-bit MSDU IDs (low + high)
+	 *     Low  = bits 14:0, High = bits 29:15, 0x7FFF = invalid
+	 *
+	 * 来源: mt76/mt7925/mac.c mt7925_mac_tx_free() */
+	for (i = 2; i < (skb->len / 4); i++) {
+		u32 info = le32_to_cpu(data[i]);
+		int j;
+
+		/* PAIR word (bit 31) contains actual WLAN_ID used for TX */
+		if (info & MT_TXFREE_INFO_PAIR) {
+			dev_info(&dev->pdev->dev,
+				 "TXFREE: pair wlan=%lu\n",
+				 (unsigned long)FIELD_GET(
+					MT_TXFREE_INFO_WLAN_ID, info));
+			continue;
+		}
+
+		/* Bug 3 fix: HEADER word (bit 30) — log TX status for debug */
+		if (info & MT_TXFREE_INFO_HEADER) {
+			u8 stat = FIELD_GET(MT_TXFREE_INFO_STAT, info);
+			u8 count = FIELD_GET(MT_TXFREE_INFO_COUNT, info);
+
+			if (stat)
+				dev_info(&dev->pdev->dev,
+					 "TXFREE: hdr stat=%u count=%u wlan=%lu\n",
+					 stat, count,
+					 (unsigned long)FIELD_GET(
+						MT_TXFREE_INFO_WLAN_ID, info));
+			continue;
+		}
+
+		/* Bug 2 fix: MSDU word packs 2× 15-bit token IDs
+		 * j=0: bits 14:0, j=1: bits 29:15 */
+		for (j = 0; j < 2; j++) {
+			u16 msdu_id = (info >> (15 * j)) & 0x7FFF;
+			struct sk_buff *tx_skb;
+			dma_addr_t addr;
+			u32 len;
+
+			if (msdu_id == 0x7FFF || msdu_id >= MT7927_TOKEN_SIZE)
+				continue;
+
+			spin_lock_irqsave(&dev->tx_token.lock, flags);
+			tx_skb = dev->tx_token.skb[msdu_id];
+			addr = dev->tx_token.dma_addr[msdu_id];
+			len = dev->tx_token.dma_len[msdu_id];
+
+			dev->tx_token.skb[msdu_id] = NULL;
+			dev->tx_token.dma_addr[msdu_id] = 0;
+			dev->tx_token.dma_len[msdu_id] = 0;
+			spin_unlock_irqrestore(&dev->tx_token.lock, flags);
+
+			if (tx_skb && addr) {
+				dma_unmap_single(&dev->pdev->dev, addr, len,
+						 DMA_TO_DEVICE);
+				dev_kfree_skb_any(tx_skb);
+			}
+		}
+	}
+
+out:
+	dev_kfree_skb(skb);
 }
 
 /* ============================================================================
@@ -564,6 +785,12 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 
 	rxd = (struct mt7927_mcu_rxd *)skb->data;
 
+	/* 诊断: dump 所有 MCU 事件前 64 字节 */
+	dev_info(&dev->pdev->dev,
+		 "mcu-evt: eid=0x%02x len=%u\n", rxd->eid, skb->len);
+	print_hex_dump(KERN_INFO, "mcu-evt: ", DUMP_PREFIX_OFFSET,
+		       16, 1, skb->data, min_t(int, skb->len, 64), false);
+
 	/* MCU_UNI_EVENT_SCAN_DONE = 0x0e — 匹配 eid 字段
 	 * 来源: mt76/mt76_connac_mcu.h, mt7925/mcu.c line 587
 	 *
@@ -648,8 +875,8 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 		return;
 
 	case PKT_TYPE_TXRX_NOTIFY:
-		/* TX completion notification — free for now */
-		dev_kfree_skb(skb);
+		/* TXFREE — TX completion notification with token IDs */
+		mt7927_mac_tx_free(dev, skb);
 		return;
 
 	case PKT_TYPE_TXS:

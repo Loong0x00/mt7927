@@ -366,8 +366,23 @@ static void mt7927_ring_free(struct mt7927_dev *dev,
 		for (i = 0; i < ring->ndesc; i++) {
 			if (!ring->buf[i])
 				continue;
-			dma_free_coherent(&dev->pdev->dev, ring->buf_size,
-					  ring->buf[i], ring->buf_dma[i]);
+			if (ring->buf_size > 0) {
+				/* RX ring: buf[i] is coherent DMA buffer */
+				dma_free_coherent(&dev->pdev->dev,
+						  ring->buf_size,
+						  ring->buf[i],
+						  ring->buf_dma[i]);
+			} else {
+				/* TX ring: buf[i] is skb pointer */
+				struct sk_buff *skb = ring->buf[i];
+
+				if (ring->buf_dma[i])
+					dma_unmap_single(&dev->pdev->dev,
+							 ring->buf_dma[i],
+							 skb->len,
+							 DMA_TO_DEVICE);
+				dev_kfree_skb_any(skb);
+			}
 		}
 	}
 	kfree(ring->buf);
@@ -429,6 +444,7 @@ static void mt7927_reprogram_prefetch(struct mt7927_dev *dev)
 	mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7), PREFETCH(0x0100, 0x4));
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x0140, 0x4));
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0180, 0x10));
+	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(0), PREFETCH(0x0280, 0x4));
 }
 
 /* =====================================================================
@@ -529,79 +545,92 @@ static int mt7927_kick_ring_buf(struct mt7927_dev *dev,
 	return -ETIMEDOUT;
 }
 
-/* 在 RX ring 6 (MCU 事件) 上轮询响应 */
+/* 消费 RX ring 6 中一个 DMA_DONE 的 slot, 推进 tail + CIDX + 清 INT_STA */
+static void mt7927_mcu_consume_slot(struct mt7927_dev *dev,
+				    struct mt7927_ring *ring)
+{
+	struct mt76_desc *d = &ring->desc[ring->tail];
+
+	/* 清除 DMA_DONE, 重置描述符 */
+	d->ctrl = cpu_to_le32(
+		FIELD_PREP(MT_DMA_CTL_SD_LEN0, ring->buf_size));
+
+	/* 推进 tail */
+	ring->tail = (ring->tail + 1) % ring->ndesc;
+
+	/* 归还已处理的 slot 给 DMA — 写 CIDX = tail */
+	mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid), ring->tail);
+
+	/* 清除 INT_STA (W1C) */
+	{
+		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+
+		if (int_sta)
+			mt7927_wr(dev, MT_WFDMA_HOST_INT_STA, int_sta);
+	}
+}
+
+/* 在 RX ring 6 (MCU 事件) 上轮询响应, 匹配 CID + seq
+ *
+ * UniEvent 在 DMA buf 中的布局 (little-endian):
+ *   evt[0..7]: RXD (32 bytes)
+ *   evt[8]:    len(16) | pkt_type_id(16)    — offset 0x20
+ *   evt[9]:    eid(8) | seq(8) | option(8) | rsv(8) — offset 0x24
+ *   evt[10]:   ext_eid(8) | rsv1[2](16) | s2d(8)   — offset 0x28
+ *
+ * 匹配规则: evt_seq == mcu_wait_seq
+ * ext_eid 对应发送的 CID 低 8 位 (作为额外验证) */
 static int mt7927_mcu_wait_resp(struct mt7927_dev *dev, int timeout_ms)
 {
 	struct mt7927_ring *ring = &dev->ring_rx6;
 	unsigned long timeout = jiffies + msecs_to_jiffies(timeout_ms);
-	struct mt76_desc *d;
-	u32 ctrl;
+	u8 wait_seq = dev->mcu_wait_seq;
+	u16 wait_cid = dev->mcu_wait_cid;
 
 	do {
-		d = &ring->desc[ring->tail];
-		ctrl = le32_to_cpu(d->ctrl);
+		struct mt76_desc *d = &ring->desc[ring->tail];
+		u32 ctrl = le32_to_cpu(d->ctrl);
 
 		if (ctrl & MT_DMA_CTL_DMA_DONE) {
 			u16 idx = ring->tail;
 			u32 *evt = ring->buf[idx];
 			u32 sdl0 = FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl);
+			u8 evt_eid, evt_seq, evt_ext_eid;
+
+			/* 解析 UniEvent 头字段 */
+			evt_eid = evt[9] & 0xff;
+			evt_seq = (evt[9] >> 8) & 0xff;
+			evt_ext_eid = evt[10] & 0xff;
 
 			dev_info(&dev->pdev->dev,
-				 "mcu-evt: q%u idx=%u ctrl=0x%08x sdl0=%u w0=0x%08x w1=0x%08x w2=0x%08x\n",
-				 ring->qid, idx, ctrl, sdl0,
-				 evt[0], evt[1], evt[2]);
+				 "mcu-evt: q%u idx=%u sdl0=%u eid=0x%02x ext_eid=0x%02x seq=%u (wait: cid=0x%04x seq=%u)\n",
+				 ring->qid, idx, sdl0,
+				 evt_eid, evt_ext_eid, evt_seq,
+				 wait_cid, wait_seq);
 
-			/* Hex dump 前 64 字节用于分析 UniCmd 响应 */
-			if (sdl0 > 12) {
-				int dump_words = (sdl0 + 3) / 4;
-
-				if (dump_words > 16)
-					dump_words = 16;
+			/* 检查是否匹配等待的命令响应 */
+			if (evt_seq == wait_seq) {
+				/* 命令响应 — 匹配成功 */
 				dev_info(&dev->pdev->dev,
-					 "  evt[3..7]: %08x %08x %08x %08x %08x\n",
-					 evt[3], evt[4], evt[5], evt[6], evt[7]);
-				if (dump_words > 8)
-					dev_info(&dev->pdev->dev,
-						 "  evt[8..12]: %08x %08x %08x %08x %08x\n",
-						 evt[8], evt[9], evt[10], evt[11], evt[12]);
+					 "mcu-resp: matched cid=0x%04x seq=%u ext_eid=0x%02x\n",
+					 wait_cid, evt_seq, evt_ext_eid);
+				mt7927_mcu_consume_slot(dev, ring);
+				return 0;
 			}
 
-			/* 清除 DMA_DONE, 重置描述符 */
-			d->ctrl = cpu_to_le32(
-				FIELD_PREP(MT_DMA_CTL_SD_LEN0,
-					   ring->buf_size));
-
-			/* 推进 tail */
-			ring->tail = (ring->tail + 1) % ring->ndesc;
-
-			/* 归还已处理的 slot 给 DMA — 写 CIDX = tail
-			 * tail 指向下一个待处理位置，告诉 DMA 之前的 slot 可重用
-			 * 参考: mt76/dma.c mt76_dma_kick_queue() 写 q->head
-			 * 不更新 CIDX 会导致 256 事件后 ring 耗尽 */
-			mt7927_wr(dev,
-				  MT_WPDMA_RX_RING_CIDX(ring->qid),
-				  ring->tail);
-
-			/* 清除 INT_STA 中对应 RX ring 的中断状态位
-			 * WFDMA 使用 W1C (Write-1-to-Clear) 语义
-			 * 参考: mt76/mt792x_dma.c mt792x_irq_tasklet()
-			 * 如果不清除，WFDMA 可能不再触发后续 DMA 写入 */
-			{
-				u32 int_sta = mt7927_rr(dev,
-							MT_WFDMA_HOST_INT_STA);
-				if (int_sta)
-					mt7927_wr(dev, MT_WFDMA_HOST_INT_STA,
-						  int_sta);
-			}
-
-			return 0;
+			/* 异步事件 — seq 不匹配, 跳过 */
+			dev_info(&dev->pdev->dev,
+				 "mcu-async: skipping eid=0x%02x ext_eid=0x%02x seq=%u (wanted seq=%u)\n",
+				 evt_eid, evt_ext_eid, evt_seq, wait_seq);
+			mt7927_mcu_consume_slot(dev, ring);
+			continue;
 		}
 		usleep_range(1000, 2000);
 	} while (time_before(jiffies, timeout));
 
 	dev_warn(&dev->pdev->dev,
-		 "mcu-evt 超时: q%u tail=%u cidx=0x%x didx=0x%x\n",
-		 ring->qid, ring->tail,
+		 "mcu-evt 超时: cid=0x%04x seq=%u q%u tail=%u cidx=0x%x didx=0x%x\n",
+		 wait_cid, wait_seq, ring->qid, ring->tail,
 		 mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid)),
 		 mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(ring->qid)));
 	return -ETIMEDOUT;
@@ -762,11 +791,15 @@ static int mt7927_mcu_send_unicmd(struct mt7927_dev *dev, u16 cmd_id,
 	/* 通过 TX ring 15 发送 */
 	ret = mt7927_kick_ring_buf(dev, &dev->ring_wm, dma, len, true);
 	if (!ret && (option & UNI_CMD_OPT_ACK)) {
+		/* 记录等待的 CID 和 seq, 供 wait_resp 匹配 */
+		dev->mcu_wait_cid = cmd_id;
+		dev->mcu_wait_seq = txd->seq;
+
 		/* 暂时禁用 RX6 中断, 防止 NAPI 和轮询同时消费 RX ring 6
 		 * 不禁用会导致 race: NAPI 消费事件后推进 tail,
 		 * 轮询看到 tail 位置没有 DMA_DONE 就超时 */
 		mt7927_wr(dev, MT_WFDMA_INT_ENA_CLR, BIT(14));  /* RX6 int */
-		ret = mt7927_mcu_wait_resp(dev, 200);
+		ret = mt7927_mcu_wait_resp(dev, 2000);
 		mt7927_wr(dev, MT_WFDMA_INT_ENA_SET, BIT(14));  /* restore */
 	}
 
@@ -1092,15 +1125,10 @@ static void mt7927_wpdma_config(struct mt7927_dev *dev, bool enable)
 		mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7), PREFETCH(0x0100, 0x4));
 		mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x0140, 0x4));
 		mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0180, 0x10));
-
-		/* 诊断: 读回 EXT_CTRL 验证配置 */
-		dev_info(&dev->pdev->dev,
-			 "EXT_CTRL: RX4=0x%08x RX6=0x%08x RX7=0x%08x TX15=0x%08x TX16=0x%08x\n",
-			 mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4)),
-			 mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6)),
-			 mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7)),
-			 mt7927_rr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15)),
-			 mt7927_rr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16)));
+		/* TX ring 0 (数据帧) — 放在 TX15 之后 (0x0180 + 0x10*16 = 0x0280)
+		 * depth=0x4 与 mt7925 一致 (mt7925/pci.c line 232)
+		 * 缺少此配置导致 auth 帧无法通过 DMA 发出 */
+		mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(0), PREFETCH(0x0280, 0x4));
 
 		/* GLO_CFG: 启用 TX_DMA_EN | RX_DMA_EN + Windows 关键位 (步骤 4)
 		 * 来源: Windows — glo_cfg |= 0x5 + 额外关键位
@@ -1675,8 +1703,8 @@ static int mt7927_mcu_set_channel_domain(struct mt7927_dev *dev)
 
 	/* 填充 header */
 	memset(&hdr, 0, sizeof(hdr));
-	hdr.alpha2[0] = '0';
-	hdr.alpha2[1] = '0';  /* world domain */
+	hdr.alpha2[0] = 'C';
+	hdr.alpha2[1] = 'N';  /* China domain — 匹配实际使用环境 */
 	hdr.bw_2g = 0;        /* BW_20_40M */
 	hdr.bw_5g = 3;        /* BW_20_40_80_160M */
 	hdr.bw_6g = 3;
@@ -1739,7 +1767,7 @@ static int mt7927_mcu_set_channel_domain(struct mt7927_dev *dev)
  * 参考: mt76/mt7925/mcu.c mt7925_mcu_set_rts_thresh()
  * 在 mac80211 .start() 回调中发送
  */
-static int mt7927_mcu_set_rts_thresh(struct mt7927_dev *dev)
+static int mt7927_mcu_set_rts_thresh(struct mt7927_dev *dev, u32 val)
 {
 	struct {
 		u8 band_idx;
@@ -1752,14 +1780,14 @@ static int mt7927_mcu_set_rts_thresh(struct mt7927_dev *dev)
 		.band_idx = 0,
 		.tag = cpu_to_le16(0x08),  /* UNI_BAND_CONFIG_RTS_THRESHOLD */
 		.len = cpu_to_le16(sizeof(req) - 4),
-		.len_thresh = cpu_to_le32(0x92b),  /* 2347 */
+		.len_thresh = cpu_to_le32(val),
 		.pkt_thresh = cpu_to_le32(0x02),
 	};
 	int ret;
 
 	dev_info(&dev->pdev->dev,
 		 "BAND_CONFIG RTS_THRESH: thresh=0x%x pkt=0x%x\n",
-		 0x92b, 0x02);
+		 val, 0x02);
 
 	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_BAND_CONFIG,
 				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
@@ -1896,6 +1924,59 @@ static int mt7927_mcu_send_unicmd_set(struct mt7927_dev *dev, u16 cmd_id,
 	 * DEV_INFO/BSS_INFO 用 0x07 会导致超时 — 固件可能不对这些命令发 ACK
 	 * scan 命令单独在调用处使用 0x07 */
 	return mt7927_mcu_send_unicmd(dev, cmd_id, 0x06, payload, plen);
+}
+
+/* --- 速率表初始化 --- */
+
+/* 编程 WTBL 固定速率表的单个条目
+ * 参考: mt7925/mac.c mt7925_mac_set_fixed_rate_table() */
+static void mt7927_mac_set_fixed_rate_table(struct mt7927_dev *dev,
+					    u8 tbl_idx, u16 rate_idx)
+{
+	u32 ctrl = MT_WTBL_ITCR_WR | MT_WTBL_ITCR_EXEC | tbl_idx;
+
+	mt7927_wr(dev, MT_WTBL_ITDR0, rate_idx);
+	mt7927_wr(dev, MT_WTBL_ITDR1, MT_WTBL_SPE_IDX_SEL);
+	mt7927_wr(dev, MT_WTBL_ITCR, ctrl);
+}
+
+/* 基本速率 hw_value (从 mt76 mac80211.c mt76_rates[] 复制)
+ * 格式: (MT_PHY_TYPE_xxx << 8) | rate_idx
+ *   MT_PHY_TYPE_CCK = 0, MT_PHY_TYPE_OFDM = 1 */
+static const u16 mt7927_basic_rate_hw_values[] = {
+	0x0000,  /* CCK 1Mbps   */
+	0x0001,  /* CCK 2Mbps   */
+	0x0002,  /* CCK 5.5Mbps */
+	0x0003,  /* CCK 11Mbps  */
+	0x010b,  /* OFDM 6Mbps  */
+	0x010f,  /* OFDM 9Mbps  */
+	0x010a,  /* OFDM 12Mbps */
+	0x010e,  /* OFDM 18Mbps */
+	0x0109,  /* OFDM 24Mbps */
+	0x010d,  /* OFDM 36Mbps */
+	0x0108,  /* OFDM 48Mbps */
+	0x010c,  /* OFDM 54Mbps */
+};
+
+/* 初始化基本速率表 (idx 11-22)
+ * 参考: mt7925/init.c mt7925_mac_init_basic_rates()
+ * TXD 中 FIXED_RATE=1 + TX_RATE=15 使用的就是速率表索引 15 (OFDM 6Mbps) */
+static void mt7927_mac_init_basic_rates(struct mt7927_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(mt7927_basic_rate_hw_values); i++) {
+		u16 hw_val = mt7927_basic_rate_hw_values[i];
+		/* 转换 hw_value 为 WTBL 速率格式:
+		 * MT_TX_RATE_MODE = GENMASK(9,6), MT_TX_RATE_IDX = GENMASK(5,0) */
+		u16 rate = ((hw_val >> 8) << 6) | (hw_val & 0x3f);
+		u16 idx = 11 + i;  /* MT792x_BASIC_RATES_TBL = 11 */
+
+		mt7927_mac_set_fixed_rate_table(dev, idx, rate);
+	}
+	dev_info(&dev->pdev->dev,
+		 "rate: programmed %d basic rates (idx 11-22)\n",
+		 (int)ARRAY_SIZE(mt7927_basic_rate_hw_values));
 }
 
 /* --- 扫描 MCU 命令 --- */
@@ -2093,42 +2174,76 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 				   struct ieee80211_vif *vif, bool enable)
 {
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
+	struct ieee80211_channel *chan = dev->hw->conf.chandef.chan;
 	struct {
 		struct bss_req_hdr hdr;
 		struct mt76_connac_bss_basic_tlv basic;
+		struct bss_rlm_tlv rlm;
 	} __packed req = {};
 
 	req.hdr.bss_idx = mvif->bss_idx;
+
+	/* === BSS_BASIC TLV (tag=0) === */
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
 	req.basic.active = enable;
 	req.basic.omac_idx = mvif->omac_idx;
 	req.basic.hw_bss_idx = mvif->bss_idx;
 	req.basic.band_idx = mvif->band_idx;
-	/* STA 模式: conn_type = CONNECTION_INFRA_STA (0x10001)
-	 * 来源: mt76_connac_mcu.c line 1206 */
 	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
 	req.basic.conn_state = enable ? 1 : 0;
 	req.basic.wmm_idx = mvif->wmm_idx;
 	req.basic.bmc_tx_wlan_idx = cpu_to_le16(mvif->sta.wcid.idx);
 	req.basic.sta_idx = cpu_to_le16(mvif->sta.wcid.idx);
 
-	if (vif->cfg.assoc && vif->bss_conf.bssid) {
+	if (vif->bss_conf.bssid)
 		memcpy(req.basic.bssid, vif->bss_conf.bssid, ETH_ALEN);
+	if (vif->bss_conf.beacon_int) {
 		req.basic.bcn_interval =
 			cpu_to_le16(vif->bss_conf.beacon_int);
 		req.basic.dtim_period = vif->bss_conf.dtim_period;
 	}
 
+	/* === BSS_RLM TLV (tag=2) — 告诉固件信道/频段/带宽 === */
+	req.rlm.tag = cpu_to_le16(UNI_BSS_INFO_RLM);
+	req.rlm.len = cpu_to_le16(sizeof(req.rlm));
+	if (chan) {
+		req.rlm.control_channel = chan->hw_value;
+		req.rlm.center_chan = chan->hw_value; /* 20MHz: center=control */
+		req.rlm.bw = 0;  /* CMD_CBW_20MHZ */
+		req.rlm.tx_streams = 2;  /* MT6639: 2T2R */
+		req.rlm.rx_streams = 2;
+		req.rlm.ht_op_info = 4;  /* HT 40MHz allowed */
+		switch (chan->band) {
+		case NL80211_BAND_5GHZ:
+			req.rlm.band = 2;  /* CMD_BAND_5G */
+			break;
+		case NL80211_BAND_6GHZ:
+			req.rlm.band = 3;  /* CMD_BAND_6G */
+			break;
+		default:
+			req.rlm.band = 1;  /* CMD_BAND_24G */
+			break;
+		}
+	}
+
 	dev_info(&dev->pdev->dev,
-		 "mcu: BSS_INFO bss=%d active=%d bssid=%pM\n",
-		 mvif->bss_idx, enable, req.basic.bssid);
+		 "mcu: BSS_INFO bss=%d active=%d bssid=%pM ch=%u band=%u\n",
+		 mvif->bss_idx, enable, req.basic.bssid,
+		 req.rlm.control_channel, req.rlm.band);
 
 	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_BSS_INFO, &req,
 					   sizeof(req));
 }
 
-/* STA_REC_UPDATE (CID=0x03) — 添加/更新 STA 记录 */
+/* STA_REC_UPDATE (CID=0x03) — 添加/更新 STA 记录
+ *
+ * 关键: enable=true 时必须包含 STA_REC_WTBL TLV，里面嵌套
+ * WTBL_GENERIC + WTBL_RX 子 TLV，否则固件不创建 WTBL 条目，
+ * 导致 TX 帧被静默丢弃 (TXFREE 返回 wlan=0)
+ *
+ * 来源: mt76/mt76_connac_mcu.c mt76_connac_mcu_sta_cmd()
+ */
 static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 				 struct ieee80211_vif *vif,
 				 struct ieee80211_sta *sta,
@@ -2140,7 +2255,40 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 		struct sta_req_hdr hdr;
 		struct sta_rec_basic basic;
 		struct sta_rec_hdr_trans hdr_trans;
+		/* STA_REC_WTBL container with nested WTBL sub-TLVs */
+		struct {
+			__le16 tag;             /* STA_REC_WTBL = 0x0d */
+			__le16 len;             /* total size of this struct */
+			/* wtbl_req_hdr (8 bytes) */
+			u8 wlan_idx_lo;
+			u8 operation;           /* WTBL_RESET_AND_SET */
+			__le16 wtbl_tlv_num;    /* number of nested WTBL TLVs */
+			u8 wlan_idx_hi;
+			u8 wtbl_rsv[3];
+			/* WTBL_GENERIC (tag=0, 20 bytes) */
+			__le16 wg_tag;
+			__le16 wg_len;
+			u8 peer_addr[ETH_ALEN];
+			u8 muar_idx;
+			u8 skip_tx;
+			u8 cf_ack;
+			u8 qos;
+			u8 mesh;
+			u8 adm;
+			__le16 partial_aid;
+			u8 baf_en;
+			u8 aad_om;
+			/* WTBL_RX (tag=1, 12 bytes) */
+			__le16 wr_tag;
+			__le16 wr_len;
+			u8 rcid;
+			u8 rca1;
+			u8 rca2;
+			u8 rv;
+			u8 rx_rsv[4];
+		} __packed wtbl;
 	} __packed req = {};
+	int send_len;
 
 	if (sta)
 		msta = (struct mt7927_sta *)sta->drv_priv;
@@ -2151,15 +2299,35 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	req.hdr.bss_idx = mvif->bss_idx;
 	req.hdr.wlan_idx_lo = msta->wcid.idx & 0xff;
 	req.hdr.wlan_idx_hi = (msta->wcid.idx >> 8) & 0xff;
-	req.hdr.tlv_num = cpu_to_le16(2);
+	req.hdr.muar_idx = mvif->omac_idx;
 	req.hdr.is_tlv_append = 1;
 
-	/* STA_REC_BASIC (tag=0) */
+	/* STA_REC_BASIC (tag=0)
+	 * 来源: mt76/mt76_connac_mcu.c mt76_connac_mcu_sta_basic_tlv()
+	 * 新建 STA (NOTEXIST→NONE): DISCONNECT + EXTRA_INFO_NEW
+	 * 更新 STA (AUTH→ASSOC 等): 用传入的 conn_state, 无 NEW 标志
+	 * 删除 STA: DISCONNECT, 无 NEW */
 	req.basic.tag = cpu_to_le16(STA_REC_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
-	req.basic.conn_state = conn_state;
-	req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER | EXTRA_INFO_NEW);
+	if (vif->type == NL80211_IFTYPE_STATION)
+		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
+	else
+		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
+
+	if (enable) {
+		req.basic.conn_state = conn_state;
+		/* mt7925 逻辑 (mt76_connac_mcu.c:385):
+		 * newly=true 且 conn_state != DISCONNECT 时设 EXTRA_INFO_NEW
+		 * sta_add: PORT_SECURE + NEW → 创建新 WTBL 条目
+		 * sta_assoc: PORT_SECURE (无 NEW) → 更新已有条目 */
+		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
+		if (conn_state != CONN_STATE_DISCONNECT)
+			req.basic.extra_info |= cpu_to_le16(EXTRA_INFO_NEW);
+	} else {
+		req.basic.conn_state = CONN_STATE_DISCONNECT;
+		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
+	}
+
 	if (sta) {
 		req.basic.qos = sta->wme;
 		req.basic.aid = cpu_to_le16(sta->aid);
@@ -2169,15 +2337,58 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	/* STA_REC_HDR_TRANS (tag=0x2B) */
 	req.hdr_trans.tag = cpu_to_le16(STA_REC_HDR_TRANS);
 	req.hdr_trans.len = cpu_to_le16(sizeof(req.hdr_trans));
-	req.hdr_trans.from_ds = 1;
-	req.hdr_trans.to_ds = 1;
+	req.hdr_trans.from_ds = 0;
+	req.hdr_trans.to_ds = 1;  /* STA mode: to_ds=1, from_ds=0 */
+	req.hdr_trans.dis_rx_hdr_tran = 1;  /* disable RX header translation */
+
+	if (enable) {
+		/* STA_REC_WTBL container: 固件根据此 TLV 创建 WTBL 条目 */
+		req.wtbl.tag = cpu_to_le16(STA_REC_WTBL);
+		req.wtbl.len = cpu_to_le16(sizeof(req.wtbl));
+		req.wtbl.wlan_idx_lo = msta->wcid.idx & 0xff;
+		req.wtbl.wlan_idx_hi = (msta->wcid.idx >> 8) & 0xff;
+		req.wtbl.operation = WTBL_RESET_AND_SET;
+		req.wtbl.wtbl_tlv_num = cpu_to_le16(2); /* GENERIC + RX */
+
+		/* WTBL_GENERIC (tag=0) — MAC 地址 + 基础参数 */
+		req.wtbl.wg_tag = cpu_to_le16(WTBL_GENERIC);
+		req.wtbl.wg_len = cpu_to_le16(20); /* sizeof this sub-TLV */
+		if (sta)
+			memcpy(req.wtbl.peer_addr, sta->addr, ETH_ALEN);
+		req.wtbl.muar_idx = mvif->omac_idx;
+		if (sta)
+			req.wtbl.qos = sta->wme;
+		if (vif->type == NL80211_IFTYPE_STATION)
+			req.wtbl.partial_aid = cpu_to_le16(vif->cfg.aid);
+		else if (sta)
+			req.wtbl.partial_aid = cpu_to_le16(sta->aid);
+
+		/* WTBL_RX (tag=1) — RX 过滤参数 */
+		req.wtbl.wr_tag = cpu_to_le16(WTBL_RX);
+		req.wtbl.wr_len = cpu_to_le16(12); /* sizeof this sub-TLV */
+		req.wtbl.rca1 = (vif->type != NL80211_IFTYPE_AP);
+		req.wtbl.rca2 = 1;
+		req.wtbl.rv = 1;
+
+		req.hdr.tlv_num = cpu_to_le16(3); /* BASIC + HDR_TRANS + WTBL */
+		send_len = sizeof(req);
+	} else {
+		req.hdr.tlv_num = cpu_to_le16(2); /* BASIC + HDR_TRANS */
+		send_len = offsetof(typeof(req), wtbl);
+	}
 
 	dev_info(&dev->pdev->dev,
-		 "mcu: STA_REC wcid=%d state=%d enable=%d\n",
-		 msta->wcid.idx, conn_state, enable);
+		 "mcu: STA_REC wcid=%d conn_state=%d enable=%d wtbl=%s len=%d\n",
+		 msta->wcid.idx, req.basic.conn_state, enable,
+		 enable ? "yes" : "no", send_len);
+	print_hex_dump(KERN_INFO, "STA_REC payload: ", DUMP_PREFIX_OFFSET,
+		       16, 4, &req, send_len, false);
 
-	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_STA_REC, &req,
-					   sizeof(req));
+	/* mt7925 uses option=0x07 (wait for ACK) for STA_REC_UPDATE.
+	 * Fire-and-forget (0x06) may cause firmware to silently drop
+	 * the WTBL creation. Use ACK mode for reliable WTBL setup. */
+	return mt7927_mcu_send_unicmd(dev, MCU_UNI_CMD_STA_REC,
+				      UNI_CMD_OPT_SET_ACK, &req, send_len);
 }
 
 /* 密钥安装 (STA_REC_UPDATE + STA_REC_KEY_V3) */
@@ -2275,26 +2486,33 @@ static void mt7927_mac80211_tx(struct ieee80211_hw *hw,
 		wcid = &msta->wcid;
 	}
 
-	/* 构建 TXD 并 prepend 到 skb */
-	ret = mt7927_tx_prepare_skb(dev, skb, wcid);
-	if (ret) {
-		dev_kfree_skb(skb);
-		return;
+	{
+		struct ieee80211_hdr *hdr = (void *)skb->data;
+		u16 fc = le16_to_cpu(hdr->frame_control);
+
+		dev_info(&dev->pdev->dev,
+			 "TX: fc=0x%04x len=%u wcid=%d\n",
+			 fc, skb->len,
+			 wcid ? wcid->idx : -1);
 	}
 
-	/* 入队到 TX ring 0 */
+	/* 入队到 TX ring 0 (CT mode: prepare_skb is called inside queue_skb) */
 	if (!dev->ring_tx0.desc) {
+		dev_err(&dev->pdev->dev, "TX: ring_tx0 not initialized!\n");
 		dev_kfree_skb(skb);
 		return;
 	}
 
-	ret = mt7927_tx_queue_skb(dev, &dev->ring_tx0, skb);
+	ret = mt7927_tx_queue_skb(dev, &dev->ring_tx0, skb, wcid);
 	if (ret) {
+		dev_err(&dev->pdev->dev, "TX: queue_skb failed: %d\n", ret);
 		dev_kfree_skb(skb);
 		return;
 	}
 
 	mt7927_tx_kick(dev, &dev->ring_tx0);
+	dev_info(&dev->pdev->dev, "TX: kicked ring_tx0, head=%u\n",
+		 dev->ring_tx0.head);
 }
 
 /* --- start/stop --- */
@@ -2330,7 +2548,7 @@ static int mt7927_mac80211_start(struct ieee80211_hw *hw)
 
 	/* 2. BAND_CONFIG / RTS_THRESHOLD
 	 * 参考: mt7925/main.c line 325 */
-	ret = mt7927_mcu_set_rts_thresh(dev);
+	ret = mt7927_mcu_set_rts_thresh(dev, 0x92b);
 	if (ret)
 		dev_warn(&dev->pdev->dev,
 			 "mac80211 start: set_rts_thresh 失败: %d (继续)\n",
@@ -2435,10 +2653,26 @@ static void mt7927_bss_info_changed(struct ieee80211_hw *hw,
 {
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 
+	/* BSS_CHANGED_BSSID: mac80211 设置了目标 AP 的 BSSID (auth 之前)
+	 * 必须更新固件的 BSS_INFO，否则固件不知道目标 BSS，auth 帧无法发出 */
+	if (changed & BSS_CHANGED_BSSID) {
+		mt7927_mcu_add_bss_info(dev, vif, true);
+		dev_info(&dev->pdev->dev,
+			 "mac80211: bss_info BSSID changed to %pM\n",
+			 vif->bss_conf.bssid);
+	}
+
 	if (changed & BSS_CHANGED_ASSOC) {
 		mt7927_mcu_add_bss_info(dev, vif, vif->cfg.assoc);
 		dev_info(&dev->pdev->dev,
 			 "mac80211: bss_info assoc=%d\n", vif->cfg.assoc);
+	}
+
+	if (changed & BSS_CHANGED_BEACON_INT) {
+		mt7927_mcu_add_bss_info(dev, vif, true);
+		dev_info(&dev->pdev->dev,
+			 "mac80211: beacon_int=%d\n",
+			 vif->bss_conf.beacon_int);
 	}
 }
 
@@ -2474,12 +2708,13 @@ static int mt7927_sta_state(struct ieee80211_hw *hw,
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 	struct mt7927_sta *msta = (struct mt7927_sta *)sta->drv_priv;
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
+	int ret;
 
 	dev_info(&dev->pdev->dev,
 		 "mac80211: sta_state %d->%d addr=%pM\n",
 		 old_state, new_state, sta->addr);
 
-	/* NOTEXIST → NONE: 分配 WCID */
+	/* NOTEXIST → NONE: 分配 WCID + 通知固件 */
 	if (old_state == IEEE80211_STA_NOTEXIST &&
 	    new_state == IEEE80211_STA_NONE) {
 		int idx;
@@ -2496,6 +2731,17 @@ static int mt7927_sta_state(struct ieee80211_hw *hw,
 		msta->wcid.sta = sta;
 		msta->vif = mvif;
 		dev->wcid[idx] = &msta->wcid;
+
+		/* 告诉固件创建 WTBL 条目 — 没有这步, 固件不知道目标 STA,
+		 * auth 帧会被静默丢弃!
+		 * mt7925: enable=true → PORT_SECURE + EXTRA_INFO_NEW
+		 * (mt7925/mcu.c:1974 + mt76_connac_mcu.c:385) */
+		ret = mt7927_mcu_sta_update(dev, vif, sta, true,
+					    CONN_STATE_PORT_SECURE);
+		if (ret) {
+			dev->wcid[idx] = NULL;
+			return ret;
+		}
 		return 0;
 	}
 
@@ -2568,6 +2814,190 @@ static int mt7927_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	return 0;
 }
 
+static int mt7927_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
+				    u32 val)
+{
+	struct mt7927_dev *dev = mt7927_hw_dev(hw);
+
+	return mt7927_mcu_set_rts_thresh(dev, val);
+}
+
+/* =====================================================================
+ * UNI_CHANNEL_SWITCH — 完整配置 TX+RX 射频链路
+ * ROC 只配置 RX 监听，不配置 TX 射频。固件需要 CHANNEL_SWITCH 才能发帧。
+ * 参考: mt7996/mcu.c mt7996_mcu_set_chan_info()
+ * ===================================================================== */
+static int mt7927_mcu_set_chan_info(struct mt7927_dev *dev,
+				    struct ieee80211_channel *chan,
+				    u16 tag)
+{
+	struct {
+		u8 rsv[4];		/* UniCmd body 通用头 */
+
+		__le16 tag;		/* +0 */
+		__le16 len;		/* +2 */
+		u8 control_ch;		/* +4: chan->hw_value */
+		u8 center_ch;		/* +5: = control_ch (20MHz) */
+		u8 bw;			/* +6: 0=20MHz */
+		u8 tx_path_num;		/* +7: tx chain count */
+		u8 rx_path;		/* +8: rx chain count or mask */
+		u8 switch_reason;	/* +9: CH_SWITCH_NORMAL=0 */
+		u8 band_idx;		/* +10: 0 */
+		u8 center_ch2;		/* +11: 0 (80+80 only) */
+		__le16 cac_case;	/* +12: 0 */
+		u8 channel_band;	/* +14: 1=2.4G, 2=5G, 3=6G */
+		u8 rsv0;		/* +15 */
+		__le32 outband_freq;	/* +16: 0 */
+		u8 txpower_drop;	/* +20: 0 */
+		u8 ap_bw;		/* +21: 0 */
+		u8 ap_center_ch;	/* +22: 0 */
+		u8 rsv1[53];		/* +23: padding to match mt7996 */
+	} __packed req = {0};
+
+	req.tag = cpu_to_le16(tag);
+	req.len = cpu_to_le16(sizeof(req) - 4);
+	req.control_ch = chan->hw_value;
+	req.center_ch = chan->hw_value;	/* 20MHz: center = control */
+	req.bw = 0;			/* CMD_CBW_20MHZ */
+	req.tx_path_num = 2;		/* MT6639: 2T2R */
+	req.switch_reason = CH_SWITCH_NORMAL;
+	req.band_idx = 0;
+
+	/* rx_path: CHANNEL_SWITCH 用 count, RX_PATH 用 bitmask
+	 * 参考 mt7996: if (tag == UNI_CHANNEL_SWITCH) req.rx_path = hweight8() */
+	if (tag == UNI_CHANNEL_SWITCH)
+		req.rx_path = 2;	/* 2 RX chains */
+	else
+		req.rx_path = 0x3;	/* bitmask: chain 0 + chain 1 */
+
+	/* band 映射: 1=2.4G, 2=5G, 3=6G (CMD_BAND_*, 与 ROC 一致)
+	 * MT7927/MT6639 固件要求 CMD_BAND_* 编码, 不是 mt7996 的 0-indexed */
+	switch (chan->band) {
+	case NL80211_BAND_5GHZ:
+		req.channel_band = 2;
+		break;
+	case NL80211_BAND_6GHZ:
+		req.channel_band = 3;
+		break;
+	default:
+		req.channel_band = 1;
+		break;
+	}
+
+	dev_info(&dev->pdev->dev,
+		 "CHAN_INFO: tag=%u ch=%u band=%u bw=%u tx=%u rx=0x%x reason=%u\n",
+		 tag, req.control_ch, req.channel_band, req.bw,
+		 req.tx_path_num, req.rx_path, req.switch_reason);
+
+	/* mt7996 用 wait_resp=true — 必须等固件完成信道切换再继续 */
+	return mt7927_mcu_send_unicmd(dev, UNI_CMD_ID_CHANNEL_SWITCH,
+				       UNI_CMD_OPT_SET_ACK, &req, sizeof(req));
+}
+
+/* ROC (Remain On Channel) — 让固件切到目标 AP 频道 */
+static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
+				   struct ieee80211_vif *vif,
+				   struct ieee80211_prep_tx_info *info)
+{
+	struct mt7927_dev *dev = mt7927_hw_dev(hw);
+	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
+	struct ieee80211_channel *chan;
+	u16 duration = info->duration ? info->duration : 1000; /* 默认 1 秒 */
+	/* ROC TLV 结构 — 匹配 mt7925/mcu.h UNI_ROC_ACQUIRE 布局 */
+	struct {
+		u8 rsv[4];              /* UniCmd body 通用头 */
+		__le16 tag;             /* +0: UNI_ROC_ACQUIRE = 0 */
+		__le16 len;             /* +2 */
+		u8 bss_idx;             /* +4 */
+		u8 tokenid;             /* +5 */
+		u8 control_channel;     /* +6: chan->hw_value */
+		u8 sco;                 /* +7: 0 */
+		u8 band;                /* +8: 0=2.4G, 1=5G */
+		u8 bw;                  /* +9: 0=20MHz */
+		u8 center_chan;          /* +10: = control_channel */
+		u8 center_chan2;         /* +11: 0 */
+		u8 bw_from_ap;          /* +12: 0 */
+		u8 center_chan_from_ap;  /* +13: 0 */
+		u8 center_chan2_from_ap; /* +14: 0 */
+		u8 reqtype;             /* +15: 0 = JOIN */
+		__le32 maxinterval;     /* +16: duration (ms) */
+		u8 dbdcband;            /* +20: 0xfe (BAND_ALL) */
+		u8 pad[3];              /* +21: padding */
+	} __packed req = {0};
+
+	/* 获取频道 — 优先从 vif BSS conf 获取 */
+	if (vif->bss_conf.chanreq.oper.chan)
+		chan = vif->bss_conf.chanreq.oper.chan;
+	else
+		chan = hw->conf.chandef.chan;
+	if (!chan) {
+		dev_warn(&dev->pdev->dev, "mgd_prepare_tx: no channel!\n");
+		return;
+	}
+
+	req.tag = cpu_to_le16(0);  /* UNI_ROC_ACQUIRE */
+	req.len = cpu_to_le16(sizeof(req) - 4);
+	req.bss_idx = mvif->bss_idx;
+	req.control_channel = chan->hw_value;
+	req.bw = 0;  /* CMD_CBW_20MHZ */
+	req.bw_from_ap = 0;  /* CMD_CBW_20MHZ */
+	req.center_chan = chan->hw_value;
+	req.center_chan_from_ap = chan->hw_value;
+	req.reqtype = 0;  /* JOIN */
+	req.dbdcband = 0xfe;  /* mt7925 对 JOIN 类型用 0xfe */
+	req.maxinterval = cpu_to_le32(duration);
+
+	/* band 映射: mt7925 用 1=2.4G, 2=5G, 3=6G */
+	switch (chan->band) {
+	case NL80211_BAND_5GHZ:
+		req.band = 2;
+		break;
+	default:
+		req.band = 1;  /* 2.4GHz */
+		break;
+	}
+
+	/* MT6639 固件可能需要 CHANNEL_SWITCH 来切换信道 (不同于 mt7925)
+	 * 实验: 同时发送 CHANNEL_SWITCH + ROC, 看哪个有效 */
+	mt7927_mcu_set_chan_info(dev, chan, UNI_CHANNEL_SWITCH);
+
+	dev_info(&dev->pdev->dev,
+		 "mgd_prepare_tx: ROC acquire bss=%u ch=%u band=%u dur=%u\n",
+		 mvif->bss_idx, chan->hw_value, req.band, duration);
+
+	mt7927_mcu_send_unicmd(dev, 0x27, /* MCU_UNI_CMD_ROC */
+			       UNI_CMD_OPT_SET_ACK, /* 0x07 — 需要响应 */
+			       &req, sizeof(req));
+}
+
+static void mt7927_mgd_complete_tx(struct ieee80211_hw *hw,
+				   struct ieee80211_vif *vif,
+				   struct ieee80211_prep_tx_info *info)
+{
+	struct mt7927_dev *dev = mt7927_hw_dev(hw);
+	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
+	struct {
+		u8 rsv[4];
+		__le16 tag;     /* UNI_ROC_ABORT = 1 */
+		__le16 len;
+		u8 bss_idx;
+		u8 tokenid;
+		u8 dbdcband;    /* 0xff = auto */
+		u8 rsv2[5];
+	} __packed req = {0};
+
+	req.tag = cpu_to_le16(1);  /* UNI_ROC_ABORT */
+	req.len = cpu_to_le16(sizeof(req) - 4);
+	req.bss_idx = mvif->bss_idx;
+	req.dbdcband = 0xff;
+
+	dev_info(&dev->pdev->dev, "mgd_complete_tx: ROC abort\n");
+
+	mt7927_mcu_send_unicmd(dev, 0x27, /* MCU_UNI_CMD_ROC */
+			       UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET, /* 0x06 fire-and-forget */
+			       &req, sizeof(req));
+}
+
 /* ieee80211_ops 回调集合 */
 static const struct ieee80211_ops mt7927_ops = {
 	.tx			= mt7927_mac80211_tx,
@@ -2582,6 +3012,9 @@ static const struct ieee80211_ops mt7927_ops = {
 	.cancel_hw_scan		= mt7927_cancel_hw_scan,
 	.sta_state		= mt7927_sta_state,
 	.set_key		= mt7927_set_key,
+	.set_rts_threshold	= mt7927_set_rts_threshold,
+	.mgd_prepare_tx		= mt7927_mgd_prepare_tx,
+	.mgd_complete_tx	= mt7927_mgd_complete_tx,
 	.wake_tx_queue		= ieee80211_handle_wake_tx_queue,
 	.add_chanctx		= ieee80211_emulate_add_chanctx,
 	.remove_chanctx		= ieee80211_emulate_remove_chanctx,
@@ -2617,8 +3050,7 @@ static int mt7927_register_device(struct mt7927_dev *dev)
 	hw->max_report_rates = 7;
 
 	/* 硬件特性标志 */
-	/* 注: HAS_RATE_CONTROL 暂不设置 — 让 mac80211 用 minstrel_ht,
-	 * 等数据路径完善后再切换到固件 rate control */
+	ieee80211_hw_set(hw, HAS_RATE_CONTROL);
 	ieee80211_hw_set(hw, REPORTS_TX_ACK_STATUS);
 	ieee80211_hw_set(hw, SIGNAL_DBM);
 	ieee80211_hw_set(hw, SINGLE_SCAN_ON_ALL_BANDS);
@@ -2637,6 +3069,11 @@ static int mt7927_register_device(struct mt7927_dev *dev)
 
 	/* MAC 地址 (初期使用随机本地地址, 后续从 NIC_CAP 获取) */
 	eth_random_addr(hw->wiphy->perm_addr);
+
+	/* 监管域: 驱动自管理，避免内核世界域给 5GHz 加 NO_IR/PASSIVE-SCAN
+	 * 没有这个标志，所有 5GHz 信道都是 PASSIVE-SCAN，无法发送 auth 帧!
+	 * 来源: mt76/mac80211.c → REGULATORY_WIPHY_SELF_MANAGED */
+	hw->wiphy->regulatory_flags |= REGULATORY_WIPHY_SELF_MANAGED;
 
 	/* 扫描支持 */
 	hw->wiphy->max_scan_ssids = MT7927_SCAN_MAX_SSIDS;
@@ -2975,6 +3412,11 @@ static int mt7927_pci_probe(struct pci_dev *pdev,
 		/* 恢复中断 */
 		mt7927_config_int_mask(dev, true);
 	}
+
+	/* 阶段 7f: 编程基本速率表 (idx 11-22)
+	 * TXD FIXED_RATE=1 + TX_RATE=15 引用索引 15 = OFDM 6Mbps
+	 * 不编程 → 索引指向垃圾值 → AP 不 ACK */
+	mt7927_mac_init_basic_rates(dev);
 
 	/* 阶段 8: mac80211 注册 (让 wlan0 出现) */
 	ret = mt7927_register_device(dev);

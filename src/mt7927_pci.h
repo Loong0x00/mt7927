@@ -94,12 +94,16 @@
  *   BIT(25) = 未确定 (可能 WDT)
  *   BIT(15:12) = 0xF = RX ring 4/5/6/7 完成中断
  */
-#define MT_WFDMA_INT_MASK_WIN       0x2600f000
+/* Windows 中断掩码 + TX ring 0 完成中断 (BIT(4))
+ * 原始 Windows: 0x2600f000, 加 BIT(4) 给 TX data ring
+ * 来源: mt76/mt792x_regs.h HOST_TX_DONE_INT_ENA0 = BIT(4) */
+#define MT_WFDMA_INT_MASK_WIN       0x2600f010
 
 /* 中断位定义 */
 #define HOST_RX_DONE_INT_ENA0       BIT(0)
 #define HOST_RX_DONE_INT_ENA1       BIT(1)
 #define HOST_RX_DONE_INT_ENA(n)     BIT(n)   /* RX done for ring n (0-7) */
+#define HOST_TX_DONE_INT_ENA0       BIT(4)   /* TX ring 0 data done */
 #define HOST_TX_DONE_INT_ENA15      BIT(25)
 #define HOST_TX_DONE_INT_ENA16      BIT(26)
 #define HOST_TX_DONE_INT_ENA17      BIT(27)
@@ -401,6 +405,22 @@
 #define MT_HW_EMI_CTL_SLPPROT_EN     BIT(1)
 
 /* ============================================================================
+ * WTBL 速率表寄存器 (Rate Table via Indirect Access)
+ * Bus base: 0x820d0000 → BAR0 0x030000 (WF_LMAC_TOP WF_WTBLON)
+ * 来源: mt792x_regs.h MT_WTBLON_TOP(0x3b0/0x3b8/0x3bc)
+ *        mt7925/init.c mt7925_mac_init_basic_rates()
+ *        mt7925/mac.c mt7925_mac_set_fixed_rate_table()
+ * ============================================================================ */
+#define MT_WTBLON_TOP_BAR0           0x030000
+#define MT_WTBL_ITCR                 (MT_WTBLON_TOP_BAR0 + 0x43b0)
+#define MT_WTBL_ITCR_WR              BIT(16)
+#define MT_WTBL_ITCR_EXEC            BIT(31)
+#define MT_WTBL_ITDR0                (MT_WTBLON_TOP_BAR0 + 0x43b8)
+#define MT_WTBL_ITDR1                (MT_WTBLON_TOP_BAR0 + 0x43bc)
+#define MT_WTBL_SPE_IDX_SEL          BIT(6)
+#define MT_BASIC_RATES_TBL           11
+
+/* ============================================================================
  * TXD/RXD 格式定义 - CONNAC3 格式
  * 来源: analysis_windows_full_init.md 行 276-314
  * ============================================================================ */
@@ -586,6 +606,16 @@ struct mt7927_mcu_uni_txd {
 #define UNI_CMD_ID_POWER_CTRL   0x000F
 #define UNI_CMD_ID_MBMC         0x0028   /* DBDC, MT6639 only */
 #define UNI_CMD_ID_SCAN_CONFIG  0x00ca   /* Scan/chip/log config */
+#define UNI_CMD_ID_CHANNEL_SWITCH 0x0034 /* Channel switch (CID=0x34) */
+
+/* CHANNEL_SWITCH TLV tags */
+#define UNI_CHANNEL_SWITCH      0
+#define UNI_CHANNEL_RX_PATH     1
+
+/* Channel switch reasons */
+#define CH_SWITCH_NORMAL        0
+#define CH_SWITCH_SCAN          3
+#define CH_SWITCH_SCAN_BYPASS_DPD 9
 
 /* CHIP_CONFIG tags */
 #define UNI_CHIP_CONFIG_NIC_CAP   3
@@ -650,6 +680,32 @@ struct mt76_connac2_fw_region {
 	u8 type;
 	u8 rsv1[14];
 } __packed;
+
+/* ============================================================================
+ * HW TXP — scatter-gather page table (32 bytes, follows TXD)
+ * CT (Cut-Through) mode: DMA descriptor points to TXD+TXP in coherent
+ * memory; TXP contains DMA address of actual frame payload.
+ * 来源: mt76/mt76_connac.h line 145-158
+ * ============================================================================ */
+#define MT7927_TXP_MAX_BUF_NUM		4
+#define MT_MSDU_ID_VALID		BIT(15)
+#define MT_TXP_LEN_MASK		GENMASK(11, 0)
+#define MT_TXP_LEN_LAST		BIT(15)
+
+struct mt7927_txp_ptr {
+	__le32 buf0;
+	__le16 len0;
+	__le16 len1;
+	__le32 buf1;
+} __packed __aligned(4);
+
+struct mt7927_hw_txp {
+	__le16 msdu_id[4];
+	struct mt7927_txp_ptr ptr[MT7927_TXP_MAX_BUF_NUM / 2];
+} __packed __aligned(4);
+
+#define MT7927_TXWI_SIZE	(MT_TXD_SIZE + sizeof(struct mt7927_hw_txp))  /* 32+32=64 */
+#define MT7927_TOKEN_SIZE	256
 
 /* DMA Ring 结构 */
 struct mt7927_ring {
@@ -735,8 +791,10 @@ struct mt7927_dev {
 	bool fw_loaded;
 	u32 fw_sync;
 
-	/* MCU 序列号 */
+	/* MCU 序列号 + 响应匹配 */
 	u8 mcu_seq;
+	u16 mcu_wait_cid;	/* 当前等待响应的 CID */
+	u8 mcu_wait_seq;	/* 当前等待响应的 seq */
 
 	/* mac80211 集成 */
 	struct ieee80211_hw *hw;		/* mac80211 硬件抽象 */
@@ -767,6 +825,19 @@ struct mt7927_dev {
 
 	/* 数据 TX ring */
 	struct mt7927_ring ring_tx0;		/* TX ring 0 - 数据 */
+
+	/* TX token management (CT mode) */
+	struct {
+		struct sk_buff *skb[MT7927_TOKEN_SIZE];
+		dma_addr_t dma_addr[MT7927_TOKEN_SIZE];
+		u32 dma_len[MT7927_TOKEN_SIZE];
+		u16 next_id;
+		spinlock_t lock;
+	} tx_token;
+
+	/* TXD+TXP coherent DMA buffer pool */
+	void *txwi_buf;
+	dma_addr_t txwi_dma;
 };
 
 /* ============================================================================
@@ -1248,7 +1319,7 @@ struct mt7927_mcu_scan_chinfo_event {
 /* 网络类型 */
 #define NETWORK_INFRA			BIT(16)
 #define CONNECTION_INFRA_STA		(BIT(0) | BIT(16))	/* 0x10001 */
-#define CONNECTION_INFRA_AP		(BIT(2) | BIT(16))
+#define CONNECTION_INFRA_AP		(BIT(1) | BIT(16))	/* 0x10002 */
 
 /* 连接状态 */
 #define CONN_STATE_DISCONNECT		0
@@ -1280,6 +1351,7 @@ enum {
 	STA_REC_HT = 7,
 	STA_REC_VHT = 8,
 	STA_REC_APPS = 9,
+	STA_REC_WTBL = 0x0d,
 	STA_REC_PHY = 0x15,
 	STA_REC_HE = 0x17,
 	STA_REC_HE_6G = 0x25,
@@ -1288,6 +1360,19 @@ enum {
 	STA_REC_EHT = 0x22,
 	STA_REC_MLD = 0x20,
 };
+
+/* WTBL sub-TLV tags (nested inside STA_REC_WTBL) */
+enum {
+	WTBL_GENERIC = 0,
+	WTBL_RX = 1,
+	WTBL_HT = 2,
+	WTBL_VHT = 3,
+	WTBL_HDR_TRANS = 6,
+};
+
+/* WTBL operations */
+#define WTBL_RESET_AND_SET	1
+#define WTBL_SET		2
 
 /* EXTRA_INFO 标志 */
 #define EXTRA_INFO_VER			BIT(0)
@@ -1479,7 +1564,9 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 			    struct ieee80211_key_conf *key, int pid,
 			    bool beacon);
 int mt7927_tx_prepare_skb(struct mt7927_dev *dev, struct sk_buff *skb,
-			  struct mt7927_wcid *wcid);
+			  struct mt7927_wcid *wcid, int *token_out,
+			  dma_addr_t *txwi_dma_out);
+void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb);
 
 /* mac.c — RXD 解析 */
 int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb);
@@ -1499,7 +1586,7 @@ int mt7927_poll_tx(struct napi_struct *napi, int budget);
 
 /* dma.c — TX/RX */
 int mt7927_tx_queue_skb(struct mt7927_dev *dev, struct mt7927_ring *ring,
-			struct sk_buff *skb);
+			struct sk_buff *skb, struct mt7927_wcid *wcid);
 void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring);
 void mt7927_tx_complete(struct mt7927_dev *dev, struct mt7927_ring *ring);
 int mt7927_dma_init_data_rings(struct mt7927_dev *dev);
