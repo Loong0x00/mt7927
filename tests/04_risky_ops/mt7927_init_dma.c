@@ -521,7 +521,7 @@ MODULE_PARM_DESC(mcif_remap_val, "MCIF remap value (default 0x18051803 from vend
 
 static int reinit_mode;
 module_param(reinit_mode, int, 0644);
-MODULE_PARM_DESC(reinit_mode, "Experiment mode (40=CB_INFRA_RGU post-FWDL diagnostics + NIC_CAP test)");
+MODULE_PARM_DESC(reinit_mode, "Experiment mode (40=CB_INFRA_RGU post-FWDL diagnostics + NIC_CAP test, 51=Second CLR_OWN after NEED_REINIT)");
 
 /*
  * Windows MT6639 reverse evidence (docs/reverse/mtkwecx_mt6639_fw_dma_reverse.md):
@@ -2661,7 +2661,129 @@ static void mt7927_mode40_post_fwdl(struct mt7927_dev *dev)
     }
 
     /* ---- Phase 4: DMASHDL enable (PostFwDownloadInit step 1) ---- */
-    {
+    if (reinit_mode == 50) {
+        /* Mode 50: Full vendor DMASHDL configuration sequence */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: === FULL VENDOR DMASHDL CONFIGURATION ===\n");
+
+        /* Step 1: Clear DMASHDL bypass in GLO_CFG (if still set) */
+        {
+            u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+            if (glo & MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL) {
+                glo &= ~MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+                mt7927_wr(dev, MT_WPDMA_GLO_CFG, glo);
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE50: Cleared GLO_CFG BIT(9) bypass: 0x%08x\n",
+                         mt7927_rr(dev, MT_WPDMA_GLO_CFG));
+            }
+        }
+
+        /* Step 2: Packet max page size (0xd601c) */
+        /* PLE_MAX_PAGE=0x1, PSE_MAX_PAGE=0x18 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE, (0x1 << 0) | (0x18 << 16));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: PKT_MAX_SIZE(0xd601c)=0x%08x (PLE=0x1 PSE=0x18)\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE));
+
+        /* Step 3: Group refill enable (0xd6010) */
+        /* Enable groups 0/1/2, disable 3-15 */
+        /* BIT(16+i) = DISABLE refill for group i */
+        /* Disable 3-15: 0xFFF80000 (BIT(19)..BIT(31)) */
+        mt7927_wr(dev, MT_HIF_DMASHDL_REFILL_CONTROL, 0xFFF80000);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: REFILL_CONTROL(0xd6010)=0x%08x (G0/1/2=en G3-15=dis)\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_REFILL_CONTROL));
+
+        /* Step 4: Group quota (0xd6020 + group*4) */
+        /* Format: [27:16]=MAX_QUOTA [11:0]=MIN_QUOTA */
+        /* Group 0/1/2: max=0xfff, min=0x10 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(0), (0xfff << 16) | 0x10);
+        mt7927_wr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(1), (0xfff << 16) | 0x10);
+        mt7927_wr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(2), (0xfff << 16) | 0x10);
+        /* Groups 3-14: max=0, min=0 */
+        for (i = 3; i < 15; i++)
+            mt7927_wr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(i), 0);
+        /* Group 15: max=0x30, min=0 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(15), (0x30 << 16) | 0);
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: GROUP quota: G0/1/2=0x%08x G15=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(0)),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(15)));
+
+        /* Step 5: Queue -> Group mapping (0xd6060 + reg*4, 8 queues per reg) */
+        /* PCIe variant from vendor:
+         * Q0->G0, Q1->G0, Q2->G0, Q3->G2, Q4->G1, Q5->G1, Q6->G1, Q7->G2
+         * Format: each queue is 4 bits, 8 queues per register (32 bits)
+         * QUEUE_MAPPING0 bits: Q0[3:0] Q1[7:4] Q2[11:8] Q3[15:12] Q4[19:16] Q5[23:20] Q6[27:24] Q7[31:28]
+         * = 0x21110000
+         */
+        mt7927_wr(dev, MT_HIF_DMASHDL_QUEUE_MAP0, 0x21110000);  /* Q0-7 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_QUEUE_MAP1, 0x00000000);  /* Q8-15 -> G0 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_QUEUE_MAP2, 0x00000000);  /* Q16-23 -> G0 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_QUEUE_MAP3, 0x00000000);  /* Q24-31 -> G0 */
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: QUEUE_MAP: 0=0x%08x 1=0x%08x 2=0x%08x 3=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP1),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP2),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP3));
+
+        /* Step 6: Priority -> Group mapping (0xd6070 + reg*4) */
+        /* PCIe: direct mapping (priority N -> group N) */
+        /* SCHED_SET0: P0-7 -> G0-7 = 0x76543210 */
+        /* SCHED_SET1: P8-15 -> G8-15 = 0xfedcba98 */
+        mt7927_wr(dev, MT_HIF_DMASHDL_SCHED_SET0, 0x76543210);
+        mt7927_wr(dev, MT_HIF_DMASHDL_SCHED_SET1, 0xfedcba98);
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: SCHED_SET: 0=0x%08x 1=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_SCHED_SET0),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_SCHED_SET1));
+
+        /* Step 7: Slot arbiter disable */
+        /* Read SW_CONTROL, clear BIT(0) (SLOT_ARBITER_EN) */
+        {
+            u32 sw_ctrl = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+            sw_ctrl &= ~BIT(0);  /* Disable slot arbiter */
+            mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, sw_ctrl);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE50: SW_CONTROL(0xd6004)=0x%08x (arbiter disabled)\n",
+                     mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+        }
+
+        /* Step 8: Optional control (0xd6008) */
+        /* HIF_ACK_CNT_TH=4 (bits 23:16), HIF_GUP_ACT_MAP=0x8007 (bits 15:0) */
+        mt7927_wr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL, (0x4 << 16) | 0x8007);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: OPT_CTRL(0xd6008)=0x%08x (ACK_TH=4 GUP_ACT=0x8007)\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL));
+
+        /* Step 9: Diagnostic dump — read back all DMASHDL registers */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: === DMASHDL VERIFICATION ===\n");
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50:   PKT_MAX=0x%08x REFILL=0x%08x PAGE_SET=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_REFILL_CONTROL),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_PAGE_SETTING));
+        for (i = 0; i < 16; i += 4)
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE50:   GROUP%d-%d: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+                     i, i+3,
+                     mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(i)),
+                     mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(i+1)),
+                     mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(i+2)),
+                     mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(i+3)));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50:   STATUS_RD=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_STATUS_RD));
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE50: === DMASHDL INIT COMPLETE ===\n");
+    } else {
+        /* Original Mode 40-49: simple 0xd6060 |= 0x10101 */
         u32 dmashdl_before, dmashdl_after;
 
         dmashdl_before = mt7927_rr(dev, MT_DMASHDL_ENABLE);
@@ -3053,6 +3175,198 @@ static void mt7927_mode43_vendor_order(struct mt7927_dev *dev, int mode)
                  mode,
                  mt7927_rr(dev, MT_WPDMA_GLO_CFG),
                  mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+    }
+
+    /* ---- Phase 2d: Mode 51 - Second CLR_OWN after NEED_REINIT ---- */
+    if (mode == 51) {
+        u32 dummy, lpctl;
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51: === SECOND CLR_OWN AFTER NEED_REINIT ===\n");
+
+        /* Step 1: Record current NEED_REINIT and MCU_RX0 status */
+        dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51: BEFORE second CLR_OWN:\n");
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   DUMMY_CR = 0x%08x (NEED_REINIT=%d)\n",
+                 dummy, !!(dummy & BIT(1)));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX0 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02500));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX1 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02510));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX2 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02540));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX3 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02550));
+
+        /* Step 2: Ensure NEED_REINIT=1 (should already be set from Phase 2c) */
+        if (!(dummy & BIT(1))) {
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE51:   NEED_REINIT not set, setting it now...\n");
+            mt7927_wr(dev, MT_MCU_WPDMA0_DUMMY_CR, dummy | BIT(1));
+            wmb();
+            msleep(10);
+            dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE51:   DUMMY_CR after set = 0x%08x\n", dummy);
+        }
+
+        /* Step 3: Do second SET_OWN/CLR_OWN cycle */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51: Starting second SET_OWN/CLR_OWN cycle...\n");
+
+        /* SET_OWN: BIT(0) -> LPCTL (0xd4010) */
+        mt7927_wr(dev, MT_CONN_ON_LPCTL, BIT(0));
+        wmb();
+
+        /* Wait for OWN_SYNC (BIT(2)) to be set */
+        for (i = 0; i < 2000; i++) {
+            lpctl = mt7927_rr(dev, MT_CONN_ON_LPCTL);
+            if (lpctl & BIT(2))
+                break;
+            udelay(100);
+        }
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   SET_OWN: OWN_SYNC=%d after %d polls, LPCTL=0x%08x\n",
+                 !!(lpctl & BIT(2)), i, lpctl);
+
+        /* CLR_OWN: BIT(1) -> LPCTL */
+        mt7927_wr(dev, MT_CONN_ON_LPCTL, BIT(1));
+        wmb();
+
+        /* Wait for CLR_OWN complete: OWN_SYNC goes to 0, LPCTL BIT(0) clears */
+        for (i = 0; i < 2000; i++) {
+            lpctl = mt7927_rr(dev, MT_CONN_ON_LPCTL);
+            if (!(lpctl & BIT(0)))
+                break;
+            udelay(100);
+        }
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   CLR_OWN: complete after %d polls, LPCTL=0x%08x\n",
+                 i, lpctl);
+
+        /* Step 4: Check if MCU_RX0 is NOW configured */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51: AFTER second CLR_OWN:\n");
+        dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   DUMMY_CR = 0x%08x (NEED_REINIT=%d)\n",
+                 dummy, !!(dummy & BIT(1)));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX0 BASE = 0x%08x  *** KEY METRIC ***\n",
+                 ioread32(dev->bar0 + 0x02500));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX1 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02510));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX2 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02540));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX3 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02550));
+
+        /* Step 5: CLR_OWN wipes HOST rings, reprogram them */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51: Reprogramming HOST rings (CLR_OWN wiped them)...\n");
+
+        /* Reset DMA pointers */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+
+        /* TX ring WM (q15) */
+        mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_wm.qid),
+                  lower_32_bits(dev->ring_wm.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_wm.qid), dev->ring_wm.ndesc);
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_wm.qid), 0);
+        dev->ring_wm.head = 0;
+
+        /* TX ring FWDL (q16) */
+        mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_fwdl.qid),
+                  lower_32_bits(dev->ring_fwdl.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_fwdl.qid), dev->ring_fwdl.ndesc);
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_fwdl.qid), 0);
+        dev->ring_fwdl.head = 0;
+
+        /* RX ring event */
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(dev->ring_evt.qid),
+                  lower_32_bits(dev->ring_evt.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(dev->ring_evt.qid), dev->ring_evt.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(dev->ring_evt.qid), 0);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
+        dev->ring_evt.tail = 0;
+
+        /* Dummy RX rings 4, 5, 7 */
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(4), dev->ring_rx4.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(4), dev->ring_rx4.head);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(5), lower_32_bits(dev->ring_rx5.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(5), dev->ring_rx5.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(5), dev->ring_rx5.head);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(7), lower_32_bits(dev->ring_rx7.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(7), dev->ring_rx7.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(7), dev->ring_rx7.head);
+
+        /* Prefetch entries */
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4), PREFETCH(0x0000, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(5), PREFETCH(0x0080, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6), PREFETCH(0x0100, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7), PREFETCH(0x0180, 0x4));
+        mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x01C0, 0x4));
+        mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0200, 0x4));
+
+        /* Reset pointers again after prefetch */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   HOST rings reprogrammed\n");
+
+        /* Step 6: Read HOST GLO_CFG/INT_ENA to see what CLR_OWN changed */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   HOST GLO_CFG = 0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51:   HOST INT_ENA = 0x%08x\n",
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA));
+
+        /* Re-enable DMA for FWDL (CLR_OWN wiped GLO_CFG) */
+        val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        val |= MT_WPDMA_GLO_CFG_MT76_SET;
+        val |= MT_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;
+        val |= MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+        val |= BIT(26);  /* ADDR_EXT_EN */
+        val |= MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN;
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
+
+        /* Re-enable DMASHDL bypass for FWDL */
+        val = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+        val |= MT_HIF_DMASHDL_BYPASS_EN;
+        mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, val);
+
+        /* Re-enable interrupts */
+        mt7927_wr(dev, MT_WFDMA_HOST_INT_ENA,
+                  HOST_RX_DONE_INT_ENA0 | HOST_RX_DONE_INT_ENA1 |
+                  HOST_RX_DONE_INT_ENA(evt_ring_qid) |
+                  HOST_TX_DONE_INT_ENA15 | HOST_TX_DONE_INT_ENA16 |
+                  HOST_TX_DONE_INT_ENA17);
+        mt7927_wr(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+
+        /* Re-signal NEED_REINIT (CLR_OWN may have cleared it) */
+        val = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        val |= MT_WFDMA_NEED_REINIT;
+        mt7927_wr(dev, MT_MCU_WPDMA0_DUMMY_CR, val);
+        wmb();
+        msleep(10);
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE51: Second CLR_OWN complete, DMA re-configured for FWDL\n");
     }
 
     /* ---- Phase 3: Re-download firmware ---- */
@@ -3747,6 +4061,191 @@ static int mt7927_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         dev_warn(&pdev->dev, "continue despite dma path probe failure: %d\n", ret);
 
+    dev_info(&pdev->dev, "[MT7927] reinit_mode check: reinit_mode=%d\n", reinit_mode);
+
+    /* Mode 51: Second CLR_OWN before FWDL (after NEED_REINIT=1) */
+    if (reinit_mode == 51) {
+        u32 dummy, lpctl;
+        int i;
+
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51: === SECOND CLR_OWN BEFORE FWDL ===\n");
+
+        /* Step 1: Record current NEED_REINIT and MCU_RX0 status */
+        dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51: BEFORE second CLR_OWN:\n");
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   DUMMY_CR = 0x%08x (NEED_REINIT=%d)\n",
+                 dummy, !!(dummy & BIT(1)));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX0 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02500));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX1 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02510));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX2 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02540));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX3 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02550));
+
+        /* Step 2: Ensure NEED_REINIT=1 (should already be set from dma_enable) */
+        if (!(dummy & BIT(1))) {
+            dev_info(&pdev->dev,
+                     "[MT7927] MODE51:   NEED_REINIT not set, setting it now...\n");
+            mt7927_wr(dev, MT_MCU_WPDMA0_DUMMY_CR, dummy | BIT(1));
+            wmb();
+            msleep(10);
+            dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+            dev_info(&pdev->dev,
+                     "[MT7927] MODE51:   DUMMY_CR after set = 0x%08x\n", dummy);
+        }
+
+        /* Step 3: Do second SET_OWN/CLR_OWN cycle */
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51: Starting second SET_OWN/CLR_OWN cycle...\n");
+
+        /* SET_OWN: BIT(0) -> LPCTL (0xe0010) */
+        mt7927_wr(dev, MT_CONN_ON_LPCTL, BIT(0));
+        wmb();
+
+        /* Wait for OWN_SYNC (BIT(2)) to be set */
+        for (i = 0; i < 2000; i++) {
+            lpctl = mt7927_rr(dev, MT_CONN_ON_LPCTL);
+            if (lpctl & BIT(2))
+                break;
+            udelay(100);
+        }
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   SET_OWN: OWN_SYNC=%d after %d polls, LPCTL=0x%08x\n",
+                 !!(lpctl & BIT(2)), i, lpctl);
+
+        /* CLR_OWN: BIT(1) -> LPCTL */
+        mt7927_wr(dev, MT_CONN_ON_LPCTL, BIT(1));
+        wmb();
+
+        /* Wait for CLR_OWN complete: OWN_SYNC goes to 0, LPCTL BIT(0) clears */
+        for (i = 0; i < 2000; i++) {
+            lpctl = mt7927_rr(dev, MT_CONN_ON_LPCTL);
+            if (!(lpctl & BIT(0)))
+                break;
+            udelay(100);
+        }
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   CLR_OWN: complete after %d polls, LPCTL=0x%08x\n",
+                 i, lpctl);
+
+        /* Step 4: Check if MCU_RX0 is NOW configured */
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51: AFTER second CLR_OWN:\n");
+        dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   DUMMY_CR = 0x%08x (NEED_REINIT=%d)\n",
+                 dummy, !!(dummy & BIT(1)));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX0 BASE = 0x%08x  *** KEY METRIC ***\n",
+                 ioread32(dev->bar0 + 0x02500));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX1 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02510));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX2 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02540));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   MCU_RX3 BASE = 0x%08x\n",
+                 ioread32(dev->bar0 + 0x02550));
+
+        /* Step 5: CLR_OWN wipes HOST rings, reprogram them */
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51: Reprogramming HOST rings after second CLR_OWN...\n");
+
+        /* Reset DMA pointers */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+
+        /* TX ring WM (q15) */
+        mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_wm.qid),
+                  lower_32_bits(dev->ring_wm.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_wm.qid), dev->ring_wm.ndesc);
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_wm.qid), 0);
+        dev->ring_wm.head = 0;
+
+        /* TX ring FWDL (q16) */
+        mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_fwdl.qid),
+                  lower_32_bits(dev->ring_fwdl.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_fwdl.qid), dev->ring_fwdl.ndesc);
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_fwdl.qid), 0);
+        dev->ring_fwdl.head = 0;
+
+        /* RX ring event */
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(dev->ring_evt.qid),
+                  lower_32_bits(dev->ring_evt.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(dev->ring_evt.qid), dev->ring_evt.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(dev->ring_evt.qid), 0);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
+        dev->ring_evt.tail = 0;
+
+        /* Dummy RX rings 4, 5, 7 */
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(4), dev->ring_rx4.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(4), dev->ring_rx4.head);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(5), lower_32_bits(dev->ring_rx5.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(5), dev->ring_rx5.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(5), dev->ring_rx5.head);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(7), lower_32_bits(dev->ring_rx7.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(7), dev->ring_rx7.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(7), dev->ring_rx7.head);
+
+        /* Prefetch entries */
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4), PREFETCH(0x0000, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(5), PREFETCH(0x0080, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6), PREFETCH(0x0100, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7), PREFETCH(0x0180, 0x4));
+        mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x01C0, 0x4));
+        mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0200, 0x4));
+
+        /* Reset pointers again after prefetch */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   HOST rings reprogrammed\n");
+
+        /* Step 6: Read HOST GLO_CFG/INT_ENA to see what CLR_OWN changed */
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   HOST GLO_CFG = 0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG));
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51:   HOST INT_ENA = 0x%08x\n",
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA));
+
+        /* Re-enable DMA (CLR_OWN may have changed GLO_CFG) */
+        val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        val |= MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN;
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
+
+        /* Re-enable interrupts */
+        mt7927_wr(dev, MT_WFDMA_HOST_INT_ENA,
+                  HOST_RX_DONE_INT_ENA0 | HOST_RX_DONE_INT_ENA1 |
+                  HOST_RX_DONE_INT_ENA(evt_ring_qid) |
+                  HOST_TX_DONE_INT_ENA15 | HOST_TX_DONE_INT_ENA16 |
+                  HOST_TX_DONE_INT_ENA17);
+        mt7927_wr(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+
+        /* Re-signal NEED_REINIT */
+        dummy = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        mt7927_wr(dev, MT_MCU_WPDMA0_DUMMY_CR, dummy | MT_WFDMA_NEED_REINIT);
+        wmb();
+        msleep(10);
+
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51: Second CLR_OWN complete, proceeding to FWDL...\n");
+    }
+
     ret = mt7927_mcu_fw_download(dev);
 
     dev_info(&pdev->dev, "HOST_INT_STA final: 0x%08x\n",
@@ -3758,10 +4257,55 @@ static int mt7927_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         dev_info(&pdev->dev, "MT7927 firmware flow done\n");
 
     /* Post-FWDL experiment modes */
-    if (reinit_mode == 40)
+    if (reinit_mode == 40 || reinit_mode == 50)
         mt7927_mode40_post_fwdl(dev);
     else if (reinit_mode >= 43 && reinit_mode <= 49)
         mt7927_mode43_vendor_order(dev, reinit_mode);
+    else if (reinit_mode == 51) {
+        /* Mode 51: Skip WFSYS reset — just check MCU_RX0 after second CLR_OWN + FWDL */
+        u32 mcu_rx0_base = mt7927_rr(dev, 0x54000 + 0x100);
+        u32 mcu_rx1_base = mt7927_rr(dev, 0x54000 + 0x150);
+        u32 fw_sync = mt7927_rr(dev, MT_CONN_ON_MISC);
+        u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51 POST-FWDL: *** MCU_RX0 BASE=0x%08x *** MCU_RX1=0x%08x\n",
+                 mcu_rx0_base, mcu_rx1_base);
+        dev_info(&pdev->dev,
+                 "[MT7927] MODE51 POST-FWDL: fw_sync=0x%08x GLO_CFG=0x%08x\n",
+                 fw_sync, glo);
+
+        if (mcu_rx0_base != 0) {
+            dev_info(&pdev->dev,
+                     "[MT7927] MODE51: *** MCU_RX0 CONFIGURED! Second CLR_OWN worked! ***\n");
+        } else {
+            dev_info(&pdev->dev,
+                     "[MT7927] MODE51: MCU_RX0 still 0 — second CLR_OWN didn't help\n");
+        }
+
+        /* Try DMASHDL enable + NIC_CAP anyway */
+        {
+            u32 val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+            /* Clear DMASHDL bypass */
+            val &= ~BIT(9);
+            mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
+            /* Enable DMASHDL refill */
+            val = mt7927_rr(dev, 0xd4404); /* GLO_CFG_EXT1 */
+            val |= BIT(28);
+            mt7927_wr(dev, 0xd4404, val);
+            /* DMASHDL queue mapping */
+            val = mt7927_rr(dev, 0xd6060);
+            mt7927_wr(dev, 0xd6060, val | 0x10101);
+        }
+
+        /* Send NIC_CAPABILITY with Q_IDX=0x20 */
+        dev_info(&pdev->dev, "[MT7927] MODE51: Sending NIC_CAPABILITY...\n");
+        {
+            int nic_ret = mt7927_mode40_send_nic_cap(dev);
+            dev_info(&pdev->dev,
+                     "[MT7927] MODE51: NIC_CAPABILITY result=%d\n", nic_ret);
+        }
+    }
 
     return 0;
 
