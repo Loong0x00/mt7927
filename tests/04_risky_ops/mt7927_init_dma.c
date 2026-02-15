@@ -1357,7 +1357,8 @@ static void mt7927_dma_cleanup(struct mt7927_dev *dev)
     mt7927_ring_free(dev, &dev->ring_wm);
     mt7927_ring_free(dev, &dev->ring_fwdl);
     mt7927_ring_free(dev, &dev->ring_evt);
-    mt7927_ring_free(dev, &dev->ring_rx0);
+    if (dev->ring_rx0.desc)
+        mt7927_ring_free(dev, &dev->ring_rx0);
     mt7927_ring_free(dev, &dev->ring_rx4);
     mt7927_ring_free(dev, &dev->ring_rx5);
     mt7927_ring_free(dev, &dev->ring_rx7);
@@ -1749,13 +1750,15 @@ static int mt7927_dma_init(struct mt7927_dev *dev)
         return ret;
 
     /* HOST RX ring 0: MCU event ring (mt7925 uses 512 entries at ring 0).
-     * FW may require this ring to exist before configuring MCU_RX0.
+     * Only allocate for Mode 53 — adding ring 0 breaks FWDL on other modes.
      */
-    ret = mt7927_rx_ring_alloc(dev, &dev->ring_rx0, 0, 128, MT_RX_BUF_SIZE);
-    if (ret)
-        return ret;
-    dev_info(&dev->pdev->dev, "HOST RX ring 0 (MCU event): BASE=0x%08x ndesc=%d\n",
-             lower_32_bits(dev->ring_rx0.desc_dma), dev->ring_rx0.ndesc);
+    if (reinit_mode == 53) {
+        ret = mt7927_rx_ring_alloc(dev, &dev->ring_rx0, 0, 128, MT_RX_BUF_SIZE);
+        if (ret)
+            return ret;
+        dev_info(&dev->pdev->dev, "HOST RX ring 0 (MCU event): BASE=0x%08x ndesc=%d\n",
+                 lower_32_bits(dev->ring_rx0.desc_dma), dev->ring_rx0.ndesc);
+    }
 
     /* Allocate dummy RX rings 4, 5, 7 so prefetch chain doesn't stall.
      * The vendor driver allocates ALL RX rings (4-7) before enabling WFDMA.
@@ -2558,11 +2561,13 @@ static void mt7927_mode40_post_fwdl(struct mt7927_dev *dev)
     mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
     dev->ring_evt.tail = 0;
 
-    /* HOST RX ring 0 (MCU event) */
-    mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
-    mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
-    mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
-    mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+    /* HOST RX ring 0 (MCU event) - only if allocated (mode 53) */
+    if (dev->ring_rx0.desc) {
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+    }
 
     /* Dummy RX rings 4, 5, 7 */
     mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
@@ -3121,11 +3126,13 @@ static void mt7927_mode43_vendor_order(struct mt7927_dev *dev, int mode)
         mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
         dev->ring_evt.tail = 0;
 
-        /* HOST RX ring 0 (MCU event) */
-        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        /* HOST RX ring 0 (MCU event) - only if allocated (mode 53) */
+        if (dev->ring_rx0.desc) {
+            mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        }
 
         /* Dummy RX rings 4, 5, 7 */
         mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
@@ -3327,11 +3334,13 @@ static void mt7927_mode43_vendor_order(struct mt7927_dev *dev, int mode)
         mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
         dev->ring_evt.tail = 0;
 
-        /* HOST RX ring 0 (MCU event) */
-        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        /* HOST RX ring 0 (MCU event) - only if allocated (mode 53) */
+        if (dev->ring_rx0.desc) {
+            mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        }
 
         /* Dummy RX rings 4, 5, 7 */
         mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
@@ -4206,11 +4215,13 @@ static int mt7927_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(dev->ring_evt.qid), 0);
         mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
         dev->ring_evt.tail = 0;
-        /* HOST RX ring 0 (MCU event) */
-        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        /* HOST RX ring 0 (MCU event) - only if allocated (mode 53) */
+        if (dev->ring_rx0.desc) {
+            mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        }
         /* Dummy RX rings 4, 5, 7 */
         mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
         mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(4), dev->ring_rx4.ndesc);
@@ -4380,11 +4391,13 @@ skip_mode52_fwdl:
         mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
         dev->ring_evt.tail = 0;
 
-        /* HOST RX ring 0 (MCU event) */
-        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
-        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        /* HOST RX ring 0 (MCU event) - only if allocated (mode 53) */
+        if (dev->ring_rx0.desc) {
+            mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(0), lower_32_bits(dev->ring_rx0.desc_dma));
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(0), dev->ring_rx0.ndesc);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(0), 0);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(0), dev->ring_rx0.head);
+        }
 
         /* Dummy RX rings 4, 5, 7 */
         mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
