@@ -78,6 +78,21 @@
 #define MT_WAKEPU_TOP                       0xe01A0   /* BAR0 offset for WAKEPU_TOP */
 #define MT_WAKEPU_WF                        0xe01A4   /* BAR0 offset for WAKEPU_WF */
 
+/* ToggleWfsysRst registers (Ghidra RE of mtkwecx.sys v5603998)
+ * chip 0x7c001600, bus2chip: {0x7c000000, 0xf0000, 0x10000} */
+#define MT_CONN_HIF_SLP_PROT                0xf1600   /* Sleep protection enable */
+#define MT_CONN_HIF_STATUS1                 0xf1620   /* HIF status 1 */
+#define MT_CONN_HIF_STATUS2                 0xf1630   /* HIF status 2 */
+/* chip 0x81023f00/0x81023008, bus2chip: {0x81020000, 0xc0000, 0x10000} */
+#define MT_PRE_RESET_MCU_REG1               0xc3f00   /* Pre-reset MCU register */
+#define MT_PRE_RESET_MCU_REG2               0xc3008   /* Pre-reset MCU register */
+/* chip 0x7c060010, bus2chip: {0x7c060000, 0xe0000, 0x10000} */
+#define MT_CONN_INFRA_WFSYS_SW_RST          0xe0010   /* CONN_INFRA WFSYS SW reset */
+/* chip 0x70028610, bus2chip: {0x70020000, 0x1f0000, 0x10000} */
+#define MT_CB_INFRA_RGU_DEBUG               0x1f8610  /* CB_INFRA_RGU debug reg */
+/* chip 0x7c026060, bus2chip: {0x7c020000, 0xd0000, 0x10000} */
+#define MT_DMASHDL_ENABLE                   0xd6060   /* DMASHDL enable (PostFwDownloadInit) */
+
 /* CB_INFRA_MISC0 - PCIe address remap (coda/mt6639/cb_infra_misc0.h) */
 /* chip addr 0x70026000, bus2chip: {0x70020000, 0x1f0000, 0x10000} */
 #define MT_CB_INFRA_MISC0_PCIE_REMAP_WF    0x1f6554  /* BAR0 offset */
@@ -260,6 +275,9 @@
 #define DL_MODE_WORKING_PDA_CR4     BIT(4)
 #define DL_CONFIG_ENCRY_MODE_SEL    BIT(6)
 #define DL_MODE_NEED_RSP            BIT(31)
+#define FW_FEATURE_SET_ENCRYPT      BIT(0)
+#define FW_FEATURE_SET_KEY_IDX      GENMASK(2, 1)
+#define FW_FEATURE_ENCRY_MODE       BIT(4)
 #define FW_FEATURE_OVERRIDE_ADDR    BIT(5)
 #define FW_FEATURE_NON_DL           BIT(6)
 #define FW_START_OVERRIDE           BIT(0)
@@ -490,9 +508,9 @@ static bool use_emi_slpprot = true;
 module_param(use_emi_slpprot, bool, 0644);
 MODULE_PARM_DESC(use_emi_slpprot, "Enable EMI sleep protection via L1 remap (upstream does this before WFSYS reset)");
 
-static int mcu_rx_qidx = 2;
+static int mcu_rx_qidx = MT_TX_MCU_PORT_RX_Q0;  /* 0x20 = MCU command port */
 module_param(mcu_rx_qidx, int, 0644);
-MODULE_PARM_DESC(mcu_rx_qidx, "CONNAC3 TXD Q_IDX for MCU commands (ROM bootloader configures MCU DMA RX2/RX3, default=2)");
+MODULE_PARM_DESC(mcu_rx_qidx, "TXD Q_IDX for MCU commands (0x20=MCU port, matches mt7925+Windows)");
 
 static u32 mcif_remap_reg = 0x000d1034;
 static u32 mcif_remap_val = 0x18051803;
@@ -500,6 +518,10 @@ module_param(mcif_remap_reg, uint, 0644);
 MODULE_PARM_DESC(mcif_remap_reg, "MCIF remap register BAR0 offset (default 0xd1034 = PCIE2AP_REMAP_WF_1_BA)");
 module_param(mcif_remap_val, uint, 0644);
 MODULE_PARM_DESC(mcif_remap_val, "MCIF remap value (default 0x18051803 from vendor mt6639.c)");
+
+static int reinit_mode;
+module_param(reinit_mode, int, 0644);
+MODULE_PARM_DESC(reinit_mode, "Experiment mode (40=CB_INFRA_RGU post-FWDL diagnostics + NIC_CAP test)");
 
 /*
  * Windows MT6639 reverse evidence (docs/reverse/mtkwecx_mt6639_fw_dma_reverse.md):
@@ -608,8 +630,15 @@ static void mt7927_dma_disable(struct mt7927_dev *dev)
              mt7927_rr(dev, MT_WPDMA_GLO_CFG),
              mt7927_rr(dev, MT_WFDMA0_RST));
 
+    /* Vendor asicConnac3xWfdmaControl(FALSE): clears DMA_EN, chain_en,
+     * omit_tx_info, omit_rx_info, omit_rx_info_pfet2.
+     * Clearing chain_en is CRITICAL: without it, WFDMA dispatch can use
+     * stale prefetch state when we reconfigure rings + prefetch entries.
+     */
     val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
-    val &= ~(MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN);
+    val &= ~(MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN |
+             MT_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
+             MT_GLO_CFG_OMIT_TX_INFO | MT_GLO_CFG_OMIT_RX_INFO_PFET2);
     mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
     wmb();
 
@@ -905,11 +934,12 @@ static int mt7927_mcu_send_cmd(struct mt7927_dev *dev, u8 cid,
     txd = buf;
     memcpy((u8 *)buf + sizeof(*txd), payload, plen);
 
-    /* CONNAC3X: Q_IDX routes to MCU DMA RX ring.
-     * ROM bootloader only configures MCU DMA RX2/RX3 (RX0/RX1 have BASE=0).
-     * Vendor used Q_IDX=0 but that routes to unconfigured RX0 → data lost.
-     * Use mcu_rx_qidx (default=2) to target configured MCU DMA RX2.
-     * CONNAC2 (mt7925): Q_IDX=0x20 (MT_TX_MCU_PORT_RX_Q0)
+    /* Q_IDX in TXD routes through WFDMA dispatch to MCU DMA.
+     * Q_IDX=0x20 (MT_TX_MCU_PORT_RX_Q0) = MCU command port.
+     * Both upstream mt7925 and Windows MT6639 use Q_IDX=0x20 for MCU cmds.
+     * Q_IDX=2 is a raw ring index that does NOT go through MCU dispatch.
+     * The WFDMA dispatch for Q_IDX=0x20 routes to MCU DMA RX2/RX3
+     * (which the ROM bootloader configures for FWDL commands).
      */
     val = FIELD_PREP(MT_TXD0_TX_BYTES, len) |
           FIELD_PREP(MT_TXD0_PKT_FMT, MT_TX_TYPE_CMD) |
@@ -1173,6 +1203,17 @@ static u32 mt7927_ram_dl_mode(u8 feature_set)
     if (feature_set & FW_FEATURE_NON_DL)
         return mode;
 
+    /* Encryption flags - matches upstream mt76_connac_mcu_gen_dl_mode() */
+    if (feature_set & FW_FEATURE_SET_ENCRYPT) {
+        mode |= DL_MODE_ENCRYPT;
+        mode |= DL_MODE_RESET_SEC_IV;
+    }
+    /* MT7925/MT6639 uses ENCRY_MODE for AES-CBC vs scramble selection */
+    if (feature_set & FW_FEATURE_ENCRY_MODE)
+        mode |= DL_CONFIG_ENCRY_MODE_SEL;
+    mode |= FIELD_PREP(DL_MODE_KEY_IDX,
+                       FIELD_GET(FW_FEATURE_SET_KEY_IDX, feature_set));
+
     return mode;
 }
 
@@ -1182,7 +1223,7 @@ static int mt7927_load_ram(struct mt7927_dev *dev)
     const struct firmware *fw;
     u32 override = 0, option = 0;
     int ret, i, offset = 0;
-    u32 max_len = 0x800;
+    u32 max_len = 4096; /* upstream uses 4096 for PCIe */
 
     ret = request_firmware(&fw, fw_ram, &dev->pdev->dev);
     if (ret)
@@ -1204,6 +1245,10 @@ static int mt7927_load_ram(struct mt7927_dev *dev)
         len = le32_to_cpu(region->len);
         addr = le32_to_cpu(region->addr);
         mode = mt7927_ram_dl_mode(region->feature_set);
+
+        dev_info(&dev->pdev->dev,
+                 "RAM region %d: addr=0x%08x len=0x%x feature=0x%02x mode=0x%08x\n",
+                 i, addr, len, region->feature_set, mode);
 
         if (region->feature_set & FW_FEATURE_NON_DL)
             goto next;
@@ -1767,7 +1812,23 @@ static int mt7927_dma_init(struct mt7927_dev *dev)
          * Order: RX4-7 → TX16 → TX0-3 → TX15
          * Depths: RX4-6=0x8, RX7=0x4, TX0-1=0x10, others=0x4
          * base_ptr increments: depth_8→+0x0080, depth_4→+0x0040, depth_16→+0x0100
+         *
+         * CRITICAL: Must disable chain_en BEFORE writing prefetch entries.
+         * Vendor asicConnac3xWfdmaControl(FALSE) clears chain_en, omit bits,
+         * and DMA_EN. Without this, WFDMA dispatch can silently fail because
+         * the prefetch engine uses stale internal state while we rewrite entries.
          */
+        {
+            u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+            glo &= ~(MT_WFDMA_GLO_CFG_TX_DMA_EN |
+                      MT_WFDMA_GLO_CFG_RX_DMA_EN |
+                      MT_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
+                      MT_GLO_CFG_OMIT_TX_INFO |
+                      MT_GLO_CFG_OMIT_RX_INFO_PFET2);
+            mt7927_wr_verify(dev, MT_WPDMA_GLO_CFG, glo,
+                             "glo_cfg_prefetch_prep");
+        }
+
         mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(4),
                          PREFETCH(0x0000, 0x8), "rx4_ext");
         mt7927_wr_verify(dev, MT_WFDMA_RX_RING_EXT_CTRL(5),
@@ -2084,6 +2145,1513 @@ static int mt7927_dma_init(struct mt7927_dev *dev)
     return 0;
 }
 
+/*
+ * Mode 40: Full Windows-equivalent post-FWDL sequence.
+ *
+ * After FW boots (fw_sync=0x3), this performs:
+ *   A. Full 16-step ToggleWfsysRst (CB_INFRA_RGU, from Ghidra RE)
+ *   B. Re-download firmware after reset
+ *   C. DMASHDL enable (BAR0+0xd6060 |= 0x10101)
+ *   D. TXD-format-corrected NIC_CAPABILITY MCU command (Q_IDX=0x20, no LONG_FORMAT)
+ *   E. Comprehensive diagnostic register dump
+ *
+ * Reference: docs/references/ghidra_post_fw_init.md
+ */
+
+/*
+ * mt7927_mode40_toggle_wfsys_rst — Full 16-step ToggleWfsysRst from Windows driver.
+ *
+ * Ghidra RE of AsicConnac3xToggleWfsysRst (mtkwecx.sys v5603998 @ 0x1401cb360).
+ * Step 1 (CONN_INFRA wakeup at 0x7c011100) is SKIPPED — needs L1 remap and
+ * BAR0 offset unknown. Sleep protection clear should suffice.
+ *
+ * Returns 0 on success, -ETIMEDOUT on poll failure.
+ */
+static int mt7927_mode40_toggle_wfsys_rst(struct mt7927_dev *dev)
+{
+    u32 val;
+    int i;
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: === ToggleWfsysRst START (full 16-step) ===\n");
+
+    /* Step 1: SKIP — CONN_INFRA wakeup at 0x7c011100 needs L1 remap */
+
+    /* Step 2a: Clear sleep protection (0x7c001600 AND ~0xF) */
+    val = mt7927_rr(dev, MT_CONN_HIF_SLP_PROT);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step2a SLP_PROT before=0x%08x\n", val);
+    mt7927_wr(dev, MT_CONN_HIF_SLP_PROT, val & ~0xF);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step2a SLP_PROT after=0x%08x\n",
+             mt7927_rr(dev, MT_CONN_HIF_SLP_PROT));
+
+    /* Step 2b: Clear HIF status 1 (0x7c001620, clear low 2 bits if set) */
+    val = mt7927_rr(dev, MT_CONN_HIF_STATUS1);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step2b HIF_STATUS1=0x%08x\n", val);
+    if (val & 0x3) {
+        mt7927_wr(dev, MT_CONN_HIF_STATUS1, val & 0x3);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: step2b HIF_STATUS1 cleared, now=0x%08x\n",
+                 mt7927_rr(dev, MT_CONN_HIF_STATUS1));
+    }
+
+    /* Step 2c: Clear HIF status 2 (0x7c001630, clear low 2 bits if set) */
+    val = mt7927_rr(dev, MT_CONN_HIF_STATUS2);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step2c HIF_STATUS2=0x%08x\n", val);
+    if (val & 0x3) {
+        mt7927_wr(dev, MT_CONN_HIF_STATUS2, val & 0x3);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: step2c HIF_STATUS2 cleared, now=0x%08x\n",
+                 mt7927_rr(dev, MT_CONN_HIF_STATUS2));
+    }
+
+    /* Step 3: (driver own check — skipped, we already have ownership) */
+
+    /* Step 4: Pre-reset MCU register 1 (0x81023f00 = 0xc0000100) */
+    mt7927_wr(dev, MT_PRE_RESET_MCU_REG1, 0xc0000100);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step4 PRE_RESET_REG1(0x%05x) = 0xc0000100, readback=0x%08x\n",
+             MT_PRE_RESET_MCU_REG1,
+             mt7927_rr(dev, MT_PRE_RESET_MCU_REG1));
+
+    /* Step 5: Pre-reset MCU register 2 (0x81023008 = 0) */
+    mt7927_wr(dev, MT_PRE_RESET_MCU_REG2, 0);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step5 PRE_RESET_REG2(0x%05x) = 0, readback=0x%08x\n",
+             MT_PRE_RESET_MCU_REG2,
+             mt7927_rr(dev, MT_PRE_RESET_MCU_REG2));
+
+    /* Step 6: Read current CB_INFRA_RGU state */
+    val = mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step6 CB_INFRA_RGU before assert=0x%08x\n", val);
+
+    /* Step 7: (abort check — not applicable in our driver) */
+
+    /* Step 8: ASSERT WFSYS RESET — set BIT(4) */
+    val |= MT_WF_SUBSYS_RST_BIT;
+    mt7927_wr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST, val);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step8 ASSERT reset, wrote=0x%08x\n", val);
+
+    /* Step 9: Sleep 1ms */
+    msleep(1);
+
+    /* Step 10: Verify BIT(4) still set (up to 5 retries) */
+    for (i = 0; i < 5; i++) {
+        val = mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST);
+        if (val & MT_WF_SUBSYS_RST_BIT)
+            break;
+        dev_warn(&dev->pdev->dev,
+                 "[MT7927] MODE40: step10 BIT(4) cleared! retry %d, val=0x%08x\n",
+                 i, val);
+        val |= MT_WF_SUBSYS_RST_BIT;
+        mt7927_wr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST, val);
+        udelay(100);
+    }
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step10 verify BIT(4): val=0x%08x (retries=%d)\n",
+             mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST), i);
+
+    /* Step 11: Sleep 20ms — wait for reset completion */
+    msleep(20);
+
+    /* Step 12: DEASSERT WFSYS RESET — clear BIT(4) */
+    val = mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST);
+    val &= ~MT_WF_SUBSYS_RST_BIT;
+    mt7927_wr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST, val);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step12 DEASSERT reset, wrote=0x%08x\n", val);
+
+    /* Step 13: Sleep 200us */
+    udelay(200);
+
+    /* Step 14: Poll ROMCODE_INDEX == 0x1D1E (500 iterations, 100us each, 50ms timeout) */
+    for (i = 0; i < 500; i++) {
+        val = mt7927_rr(dev, MT_ROMCODE_INDEX);
+        if (val == MT_MCU_IDLE_VALUE) {
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE40: step14 ROMCODE_INDEX=0x%04x (MCU_IDLE) after %d iterations\n",
+                     val, i);
+            break;
+        }
+        udelay(100);
+    }
+    if (val != MT_MCU_IDLE_VALUE) {
+        dev_err(&dev->pdev->dev,
+                "[MT7927] MODE40: step14 ROMCODE_INDEX TIMEOUT! last=0x%08x (expect 0x1D1E)\n",
+                val);
+        /* Debug: read CB_INFRA_RGU and debug reg on failure */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: step14 debug: RGU=0x%08x RGU_DBG=0x%08x\n",
+                 mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST),
+                 mt7927_rr(dev, MT_CB_INFRA_RGU_DEBUG));
+        return -ETIMEDOUT;
+    }
+
+    /* Step 15: Assert CONN_INFRA reset — write BIT(0) to 0x7c060010 */
+    mt7927_wr(dev, MT_CONN_INFRA_WFSYS_SW_RST, BIT(0));
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step15 CONN_INFRA assert BIT(0), reg=0x%08x\n",
+             mt7927_rr(dev, MT_CONN_INFRA_WFSYS_SW_RST));
+
+    /* Step 16a: Poll BIT(2) set at 0x7c060010 (up to 50 iterations) */
+    for (i = 0; i < 50; i++) {
+        val = mt7927_rr(dev, MT_CONN_INFRA_WFSYS_SW_RST);
+        if (val & BIT(2)) {
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE40: step16a CONN_INFRA BIT(2) set after %d iterations, val=0x%08x\n",
+                     i, val);
+            break;
+        }
+        udelay(100);
+    }
+    if (!(val & BIT(2)))
+        dev_warn(&dev->pdev->dev,
+                 "[MT7927] MODE40: step16a CONN_INFRA BIT(2) timeout! val=0x%08x\n", val);
+
+    /* Step 16b: Deassert CONN_INFRA reset — write BIT(1) to 0x7c060010 */
+    mt7927_wr(dev, MT_CONN_INFRA_WFSYS_SW_RST, BIT(1));
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: step16b CONN_INFRA deassert BIT(1), reg=0x%08x\n",
+             mt7927_rr(dev, MT_CONN_INFRA_WFSYS_SW_RST));
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: === ToggleWfsysRst COMPLETE ===\n");
+
+    return 0;
+}
+
+/*
+ * mt7927_mode40_send_nic_cap — Send NIC_CAPABILITY MCU command with
+ * Windows-correct TXD format (Q_IDX=0x20, no LONG_FORMAT, legacy 0x40 header).
+ *
+ * Ghidra RE: PostFwDownloadInit sub2 — class=0x8a, target=0xed, empty payload.
+ * TXD[0] = total_len | 0x41000000  (Q_IDX=0x20<<25 | PKT_FMT=2<<23)
+ * TXD[1] = 0x4000                  (HDR_FORMAT_V3=1, NO BIT(31) LONG_FORMAT)
+ * Header: class at +0x24, type=0xa0 at +0x25, seq at +0x27
+ *
+ * Returns 0 on success, negative on error.
+ */
+static int mt7927_mode40_send_nic_cap(struct mt7927_dev *dev)
+{
+    struct mt76_connac2_mcu_txd *txd;
+    dma_addr_t dma;
+    void *buf;
+    size_t len = sizeof(*txd);  /* 0x40 bytes, no payload for NIC_CAP */
+    int ret;
+
+    buf = dma_alloc_coherent(&dev->pdev->dev, len, &dma, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    memset(buf, 0, len);
+    txd = buf;
+
+    /* TXD[0]: Windows uses 0x41000000 = (Q_IDX=0x20 << 25) | (PKT_FMT=2 << 23)
+     * Q_IDX=0x20 = MT_TX_MCU_PORT_RX_Q0, routes to MCU command RX ring.
+     * Total length includes the 0x40 TXD header (no payload for NIC_CAP).
+     */
+    txd->txd[0] = cpu_to_le32(len | 0x41000000);
+
+    /* TXD[1]: Windows = 0x4000 (HDR_FORMAT_V3=1 only, NO BIT(31) LONG_FORMAT)
+     * This is critical — setting BIT(31) causes FW to misparse the command.
+     */
+    txd->txd[1] = cpu_to_le32(0x4000);
+
+    /* Legacy header at +0x20..+0x3f (inside mt76_connac2_mcu_txd)
+     *
+     * Ghidra RE of CONNAC3 UniCmd path (FUN_14014866c):
+     *   +0x20: (header_size - 0x20 + payload_len) — for 0x40 hdr, 0 payload = 0x20
+     *   +0x22: class (e.g., 0x8a) as u16
+     *   +0x24: class byte
+     *   +0x25: 0xa0 (MCU_PKT_ID)
+     *   +0x26: param_5 (extra control, 0 for NIC_CAP)
+     *   +0x27: sequence number
+     *   +0x29: subcmd (0 for NIC_CAP)
+     *   +0x2a: 0
+     *   +0x2b: option flags: 2=default | 1=need_ack | 4=need_response
+     *
+     * NIC_CAP uses flags=5 → need_ack(1) | need_response(4) → option = 2|1|4 = 7
+     */
+    txd->len = cpu_to_le16(len - sizeof(txd->txd));  /* 0x20: packet len after TXD */
+    txd->pq_id = cpu_to_le16(0x008a);  /* class ID as u16 (Ghidra: +0x22 = class) */
+    txd->cid = 0x8a;       /* class = NIC_CAPABILITY (target=0xed format) */
+    txd->pkt_type = 0xa0;  /* MCU_PKT_ID */
+    txd->set_query = 0;    /* param_5 / extra control = 0 for NIC_CAP */
+    txd->seq = ++dev->mcu_seq & 0xf;
+    if (!txd->seq)
+        txd->seq = ++dev->mcu_seq & 0xf;
+    txd->uc_d2b0_rev = 0;  /* +0x28: reserved */
+    txd->ext_cid = 0;      /* +0x29: subcmd = 0 for NIC_CAP */
+    txd->s2d_index = 0;    /* +0x2a: zero */
+    txd->ext_cid_ack = 0x07;  /* +0x2b: option = 2(default)|1(need_ack)|4(need_response) */
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: NIC_CAP cmd: len=%zu TXD[0]=0x%08x TXD[1]=0x%08x cid=0x%02x pq_id=0x%04x seq=%u opt=0x%02x\n",
+             len, le32_to_cpu(txd->txd[0]), le32_to_cpu(txd->txd[1]),
+             txd->cid, le16_to_cpu(txd->pq_id), txd->seq, txd->ext_cid_ack);
+    print_hex_dump(KERN_INFO, "[MT7927] MODE40 nic-cap-txd: ", DUMP_PREFIX_OFFSET,
+                   16, 1, buf, len, false);
+
+    ret = mt7927_kick_ring_buf(dev, &dev->ring_wm, dma, len, true);
+    mt7927_trace_mcu_event(dev, "mode40-nic-cap");
+    if (!ret)
+        ret = mt7927_wait_mcu_event(dev, 500);
+
+    dma_free_coherent(&dev->pdev->dev, len, buf, dma);
+    return ret;
+}
+
+/*
+ * mt7927_mode40_post_fwdl — Full post-FWDL sequence modeled on Windows driver.
+ *
+ * Sequence:
+ *   1. Dump pre-reset state (MCU DMA rings, WFSYS status)
+ *   2. Full 16-step ToggleWfsysRst (CB_INFRA_RGU)
+ *   3. Re-initialize DMA rings (reset wipes them)
+ *   4. Re-download firmware (reset puts MCU back to ROM)
+ *   5. DMASHDL enable (BAR0+0xd6060 |= 0x10101) — Windows PostFwDownloadInit step 1
+ *   6. Diagnostic dump (MCU_RX0 BASE is the key metric)
+ *   7. NIC_CAPABILITY MCU command with corrected TXD format
+ */
+static void mt7927_mode40_post_fwdl(struct mt7927_dev *dev)
+{
+    int i, ret;
+    u32 val;
+    u32 mcu_rx0_base;
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] === MODE 40: POST-FWDL WITH FULL WFSYS RESET ===\n");
+
+    /* ---- Phase 0: Pre-reset state dump ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: PRE-RESET STATE:\n");
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:   ROMCODE_INDEX=0x%08x (expect 0x1D1E)\n",
+             mt7927_rr(dev, MT_ROMCODE_INDEX));
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:   fw_sync(CONN_ON_MISC)=0x%08x (expect 0x3)\n",
+             mt7927_rr(dev, MT_CONN_ON_MISC));
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:   CB_INFRA_RGU=0x%08x WFSYS_SW_RST=0x%08x\n",
+             mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST),
+             mt7927_rr(dev, MT_WFSYS_SW_RST));
+
+    /* MCU DMA0 RX rings before reset */
+    for (i = 0; i < 4; i++)
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40:   MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 i,
+                 ioread32(dev->bar0 + 0x02500 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02504 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02508 + (i << 4)),
+                 ioread32(dev->bar0 + 0x0250c + (i << 4)));
+
+    /* ---- Phase 1: Full 16-step ToggleWfsysRst ---- */
+    ret = mt7927_mode40_toggle_wfsys_rst(dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev,
+                "[MT7927] MODE40: ToggleWfsysRst FAILED (%d), aborting\n", ret);
+        goto diag_dump;
+    }
+
+    /* ---- Phase 2: Re-initialize DMA rings (reset wipes all HOST ring BASEs) ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: Re-initializing DMA rings after WFSYS reset...\n");
+
+    /* CLR_OWN to wake MCU after reset */
+    {
+        u32 lpctl;
+
+        /* SET_OWN first (required before CLR_OWN) */
+        mt7927_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN);
+        usleep_range(2000, 3000);
+        lpctl = mt7927_rr(dev, MT_CONN_ON_LPCTL);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: SET_OWN done, LPCTL=0x%08x (OWN_SYNC=%d)\n",
+                 lpctl, !!(lpctl & PCIE_LPCR_HOST_OWN_SYNC));
+
+        /* CLR_OWN */
+        for (i = 0; i < 10; i++) {
+            mt7927_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_CLR_OWN);
+            usleep_range(1000, 2000);
+            lpctl = mt7927_rr(dev, MT_CONN_ON_LPCTL);
+            if (!(lpctl & PCIE_LPCR_HOST_OWN_SYNC))
+                break;
+        }
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: CLR_OWN done, LPCTL=0x%08x retries=%d\n",
+                 lpctl, i);
+    }
+
+    /* Reprogram HOST DMA rings — CLR_OWN side-effect zeroes all BASEs.
+     *
+     * Follow vendor init sequence: disable DMA + chain_en, do logic reset,
+     * reset pointers, write rings, write prefetch, configure GLO_CFG,
+     * then enable DMA.
+     */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: Reprogramming HOST ring BASEs...\n");
+
+    /* Step 1: Disable DMA and clear chain_en (vendor flow) */
+    val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+    val &= ~(MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN |
+             MT_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
+             MT_GLO_CFG_OMIT_TX_INFO | MT_GLO_CFG_OMIT_RX_INFO_PFET2);
+    mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
+    wmb();
+    usleep_range(500, 1000);
+
+    /* Step 2: WFDMA logic reset to clear internal dispatch state */
+    {
+        u32 rst = mt7927_rr(dev, MT_WFDMA0_RST);
+        rst &= ~(MT_WFDMA0_RST_LOGIC_RST | MT_WFDMA0_RST_DMASHDL_RST);
+        mt7927_wr(dev, MT_WFDMA0_RST, rst);
+        rst |= MT_WFDMA0_RST_LOGIC_RST | MT_WFDMA0_RST_DMASHDL_RST;
+        mt7927_wr(dev, MT_WFDMA0_RST, rst);
+        usleep_range(100, 200);
+    }
+
+    /* Step 3: Reset DMA index pointers */
+    mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+    mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+    wmb();
+
+    /* Step 4: Write ring BASEs */
+    /* TX ring WM (q15) */
+    mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_wm.qid),
+              lower_32_bits(dev->ring_wm.desc_dma));
+    mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_wm.qid), dev->ring_wm.ndesc);
+    mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_wm.qid), 0);
+    dev->ring_wm.head = 0;
+
+    /* TX ring FWDL (q16) */
+    mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_fwdl.qid),
+              lower_32_bits(dev->ring_fwdl.desc_dma));
+    mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_fwdl.qid), dev->ring_fwdl.ndesc);
+    mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_fwdl.qid), 0);
+    dev->ring_fwdl.head = 0;
+
+    /* RX ring event */
+    mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(dev->ring_evt.qid),
+              lower_32_bits(dev->ring_evt.desc_dma));
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(dev->ring_evt.qid), dev->ring_evt.ndesc);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(dev->ring_evt.qid), 0);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
+    dev->ring_evt.tail = 0;
+
+    /* Dummy RX rings 4, 5, 7 */
+    mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(4), dev->ring_rx4.ndesc);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(4), dev->ring_rx4.head);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(5), lower_32_bits(dev->ring_rx5.desc_dma));
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(5), dev->ring_rx5.ndesc);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(5), dev->ring_rx5.head);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(7), lower_32_bits(dev->ring_rx7.desc_dma));
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(7), dev->ring_rx7.ndesc);
+    mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(7), dev->ring_rx7.head);
+
+    /* Step 5: Write prefetch entries (chain_en is already cleared) */
+    mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4), PREFETCH(0x0000, 0x8));
+    mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(5), PREFETCH(0x0080, 0x8));
+    mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6), PREFETCH(0x0100, 0x8));
+    mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7), PREFETCH(0x0180, 0x4));
+    mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x01C0, 0x4));
+    mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0200, 0x4));
+
+    /* Step 6: Reset DMA pointers again after prefetch */
+    mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+    mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+
+    /* Step 7: Clear interrupt status */
+    mt7927_wr(dev, MT_WFDMA_HOST_INT_STA, 0xFFFFFFFF);
+
+    /* Step 8: GLO_CFG phase 1 — configure everything, no DMA_EN yet */
+    val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+    val |= MT_WPDMA_GLO_CFG_MT76_SET;
+    val |= MT_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;
+    val |= MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+    val |= BIT(26);  /* ADDR_EXT_EN */
+    val &= ~(MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN);
+    mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
+
+    /* Step 9: Enable interrupts */
+    mt7927_wr(dev, MT_WFDMA_HOST_INT_ENA,
+              HOST_RX_DONE_INT_ENA0 | HOST_RX_DONE_INT_ENA1 |
+              HOST_RX_DONE_INT_ENA(evt_ring_qid) |
+              HOST_TX_DONE_INT_ENA15 | HOST_TX_DONE_INT_ENA16 |
+              HOST_TX_DONE_INT_ENA17);
+    mt7927_wr(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+
+    /* Step 10: DMASHDL bypass for FWDL */
+    val = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+    val |= MT_HIF_DMASHDL_BYPASS_EN;
+    mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, val);
+
+    /* Step 11: GLO_CFG phase 2 — enable DMA */
+    val = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+    val |= MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN;
+    mt7927_wr(dev, MT_WPDMA_GLO_CFG, val);
+
+    /* Step 12: Signal NEED_REINIT */
+    val = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+    val |= MT_WFDMA_NEED_REINIT;
+    mt7927_wr(dev, MT_MCU_WPDMA0_DUMMY_CR, val);
+    wmb();
+    msleep(10);
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: DMA re-init done, GLO_CFG=0x%08x\n",
+             mt7927_rr(dev, MT_WPDMA_GLO_CFG));
+
+    /* ---- Phase 3: Re-download firmware ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: Re-downloading firmware after WFSYS reset...\n");
+    ret = mt7927_mcu_fw_download(dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev,
+                "[MT7927] MODE40: FW re-download FAILED (%d)\n", ret);
+        goto diag_dump;
+    }
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: FW re-download SUCCESS, fw_sync=0x%08x\n",
+             mt7927_rr(dev, MT_CONN_ON_MISC));
+
+    /* ---- Phase 3.5: Clear FWDL bypass residuals (Experiment A) ---- */
+    {
+        u32 glo, dma_sw;
+
+        /* Clear GLO_CFG BIT(9) (FW_DWLD_BYPASS_DMASHDL) */
+        glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: GLO_CFG before bypass clear: 0x%08x\n", glo);
+        glo &= ~MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;  /* Clear BIT(9) */
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG, glo);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: GLO_CFG after bypass clear: 0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG));
+
+        /* Clear DMASHDL_SW_CONTROL BIT(28) (BYPASS) */
+        dma_sw = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: DMASHDL_SW_CONTROL before: 0x%08x\n", dma_sw);
+        dma_sw &= ~MT_HIF_DMASHDL_BYPASS_EN;  /* Clear BIT(28) */
+        mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, dma_sw);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: DMASHDL_SW_CONTROL after: 0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+    }
+
+    /* ---- Phase 3.6: GLO_CFG_EXT1 BIT(28) TX_FCTRL_MODE (Experiment B) ---- */
+    {
+        u32 ext1;
+
+        ext1 = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT1);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: GLO_CFG_EXT1 before: 0x%08x\n", ext1);
+        ext1 |= MT_WPDMA_GLO_CFG_EXT1_WIN;  /* BIT(28) TX_FCTRL_MODE */
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG_EXT1, ext1);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: GLO_CFG_EXT1 after: 0x%08x\n",
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT1));
+    }
+
+    /* ---- Phase 4: DMASHDL enable (PostFwDownloadInit step 1) ---- */
+    {
+        u32 dmashdl_before, dmashdl_after;
+
+        dmashdl_before = mt7927_rr(dev, MT_DMASHDL_ENABLE);
+        mt7927_wr(dev, MT_DMASHDL_ENABLE, dmashdl_before | 0x10101);
+        dmashdl_after = mt7927_rr(dev, MT_DMASHDL_ENABLE);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: DMASHDL(0x%05x): 0x%08x -> 0x%08x (wrote |= 0x10101)\n",
+                 MT_DMASHDL_ENABLE, dmashdl_before, dmashdl_after);
+    }
+
+diag_dump:
+    /* ---- Phase 5: Diagnostic register dump ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: === DIAGNOSTIC DUMP ===\n");
+
+    /* Key metric: MCU_RX0 BASE */
+    mcu_rx0_base = ioread32(dev->bar0 + 0x02500);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40: *** MCU_RX0 BASE=0x%08x *** (%s)\n",
+             mcu_rx0_base,
+             mcu_rx0_base ? "FW configured MCU command ring!" : "STILL ZERO - blocker");
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     MCU_RX1 BASE=0x%08x\n",
+             ioread32(dev->bar0 + 0x02510));
+
+    /* DMASHDL enable register */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     DMASHDL_ENABLE(0x%05x)=0x%08x\n",
+             MT_DMASHDL_ENABLE, mt7927_rr(dev, MT_DMASHDL_ENABLE));
+
+    /* ROMCODE_INDEX */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     ROMCODE_INDEX(0x%05x)=0x%08x (expect 0x1D1E)\n",
+             MT_ROMCODE_INDEX, mt7927_rr(dev, MT_ROMCODE_INDEX));
+
+    /* CONN_INFRA_WFSYS_SW_RST */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     CONN_INFRA_WFSYS_SW_RST(0x%05x)=0x%08x\n",
+             MT_CONN_INFRA_WFSYS_SW_RST, mt7927_rr(dev, MT_CONN_INFRA_WFSYS_SW_RST));
+
+    /* fw_sync */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     fw_sync(CONN_ON_MISC)=0x%08x\n",
+             mt7927_rr(dev, MT_CONN_ON_MISC));
+
+    /* MCU DMA0 control */
+    {
+        u32 mcu_glo = ioread32(dev->bar0 + 0x02208);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40:     MCU_DMA0 GLO_CFG=0x%08x (TX_EN=%d RX_EN=%d)\n",
+                 mcu_glo, !!(mcu_glo & BIT(0)), !!(mcu_glo & BIT(2)));
+    }
+
+    /* All MCU DMA0 RX rings */
+    for (i = 0; i < 4; i++)
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40:     MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 i,
+                 ioread32(dev->bar0 + 0x02500 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02504 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02508 + (i << 4)),
+                 ioread32(dev->bar0 + 0x0250c + (i << 4)));
+
+    /* All MCU DMA0 TX rings */
+    for (i = 0; i < 4; i++)
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40:     MCU_TX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 i,
+                 ioread32(dev->bar0 + 0x02300 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02304 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02308 + (i << 4)),
+                 ioread32(dev->bar0 + 0x0230c + (i << 4)));
+
+    /* CB_INFRA_RGU and debug reg */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     CB_INFRA_RGU=0x%08x RGU_DBG=0x%08x\n",
+             mt7927_rr(dev, MT_CB_INFRA_RGU_WF_SUBSYS_RST),
+             mt7927_rr(dev, MT_CB_INFRA_RGU_DEBUG));
+
+    /* HOST-side WFDMA state */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     HOST GLO_CFG=0x%08x INT_ENA=0x%08x INT_STA=0x%08x\n",
+             mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+             mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA),
+             mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+
+    /* Host RX ring 6 state */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE40:     HOST RXQ%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+             evt_ring_qid,
+             mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(evt_ring_qid)),
+             mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(evt_ring_qid)),
+             mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid)),
+             mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(evt_ring_qid)));
+
+    /* ---- Phase 6: NIC_CAPABILITY with corrected TXD ---- */
+    if (ret) {
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: Skipping NIC_CAPABILITY (earlier step failed)\n");
+    } else if (mcu_rx0_base == 0) {
+        dev_warn(&dev->pdev->dev,
+                 "[MT7927] MODE40: MCU_RX0 BASE still 0 — attempting NIC_CAP anyway with Q_IDX=0x20\n");
+        ret = mt7927_mode40_send_nic_cap(dev);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: NIC_CAPABILITY (Q_IDX=0x20) result=%d\n", ret);
+    } else {
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: MCU_RX0 configured! Sending NIC_CAPABILITY (Q_IDX=0x20)...\n");
+        ret = mt7927_mode40_send_nic_cap(dev);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE40: NIC_CAPABILITY result=%d\n", ret);
+    }
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] === MODE 40: COMPLETE ===\n");
+}
+
+/*
+ * mt7927_mode46_send_nic_cap_fwdl — Send NIC_CAP via FWDL path (Q_IDX=2).
+ *
+ * Q_IDX=2 routes to MCU_RX2 which has valid BASE from ROM bootloader.
+ * This tests if WFDMA will consume the descriptor when MCU_RX has a valid BASE.
+ * Uses ring_fwdl (TX ring 16) instead of ring_wm (TX ring 15).
+ */
+static int mt7927_mode46_send_nic_cap_fwdl(struct mt7927_dev *dev)
+{
+    struct mt76_connac2_mcu_txd *txd;
+    dma_addr_t dma;
+    void *buf;
+    size_t len = sizeof(*txd);
+    int ret;
+
+    buf = dma_alloc_coherent(&dev->pdev->dev, len, &dma, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    memset(buf, 0, len);
+    txd = buf;
+
+    /* TXD[0]: Q_IDX=2 (bits 31-25 = 0b0000010 = 0x04000000), PKT_FMT=2 (0x01000000)
+     * Combined: 0x05000000
+     */
+    txd->txd[0] = cpu_to_le32(len | 0x05000000);
+
+    /* TXD[1]: same as Windows — HDR_FORMAT_V3=1, no LONG_FORMAT */
+    txd->txd[1] = cpu_to_le32(0x4000);
+
+    /* Legacy header — same as mode40 NIC_CAP */
+    txd->len = cpu_to_le16(len - sizeof(txd->txd));
+    txd->pq_id = cpu_to_le16(0x008a);
+    txd->cid = 0x8a;
+    txd->pkt_type = 0xa0;
+    txd->set_query = 0;
+    txd->seq = ++dev->mcu_seq & 0xf;
+    if (!txd->seq)
+        txd->seq = ++dev->mcu_seq & 0xf;
+    txd->uc_d2b0_rev = 0;
+    txd->ext_cid = 0;
+    txd->s2d_index = 0;
+    txd->ext_cid_ack = 0x07;
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE46: NIC_CAP via FWDL: len=%zu TXD[0]=0x%08x TXD[1]=0x%08x cid=0x%02x seq=%u\n",
+             len, le32_to_cpu(txd->txd[0]), le32_to_cpu(txd->txd[1]),
+             txd->cid, txd->seq);
+    print_hex_dump(KERN_INFO, "[MT7927] MODE46 nic-cap-txd: ", DUMP_PREFIX_OFFSET,
+                   16, 1, buf, len, false);
+
+    /* Send via FWDL ring (TX ring 16) since Q_IDX=2 goes to MCU_RX2 */
+    ret = mt7927_kick_ring_buf(dev, &dev->ring_fwdl, dma, len, true);
+    mt7927_trace_mcu_event(dev, "mode46-nic-cap");
+    if (!ret)
+        ret = mt7927_wait_mcu_event(dev, 500);
+
+    dma_free_coherent(&dev->pdev->dev, len, buf, dma);
+    return ret;
+}
+
+/*
+ * mt7927_mode43_vendor_order — Vendor init order experiment.
+ *
+ * Key insight: Vendor does CLR_OWN → ring setup → WFSYS_RST → FWDL → MCU cmd.
+ * WFSYS reset (CB_INFRA_RGU) does NOT affect WFDMA HOST rings because WFDMA
+ * lives in CONN_INFRA, not WFSYS. So HOST rings should survive WFSYS reset.
+ *
+ * Mode 43: After ToggleWfsysRst, do NOT do CLR_OWN (which wipes HOST rings).
+ *   Instead, verify rings survived, re-download FW, clear FWDL bypasses,
+ *   then send NIC_CAP.
+ *
+ * Mode 44: Same as 43 but also clear INT_STA and kick MCU via HOST2MCU_SW_INT_SET
+ *   before NIC_CAP.
+ */
+static void mt7927_mode43_vendor_order(struct mt7927_dev *dev, int mode)
+{
+    int i, ret;
+    u32 val;
+    u32 mcu_rx0_base;
+    bool rings_ok = true;
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] === MODE %d: VENDOR INIT ORDER (skip CLR_OWN after WFSYS reset) ===\n",
+             mode);
+
+    /* ---- Phase 0: Pre-reset state dump ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: PRE-RESET STATE:\n", mode);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:   ROMCODE_INDEX=0x%08x fw_sync=0x%08x\n",
+             mode,
+             mt7927_rr(dev, MT_ROMCODE_INDEX),
+             mt7927_rr(dev, MT_CONN_ON_MISC));
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:   GLO_CFG=0x%08x INT_STA=0x%08x INT_ENA=0x%08x\n",
+             mode,
+             mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+             mt7927_rr(dev, MT_WFDMA_HOST_INT_STA),
+             mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA));
+
+    /* Save HOST ring BASEs before reset for comparison */
+    {
+        u32 tx15_base = mt7927_rr(dev, MT_WPDMA_TX_RING_BASE(15));
+        u32 tx16_base = mt7927_rr(dev, MT_WPDMA_TX_RING_BASE(16));
+        u32 rx6_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(evt_ring_qid));
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:   PRE-RESET HOST rings: TX15_BASE=0x%08x TX16_BASE=0x%08x RX%d_BASE=0x%08x\n",
+                 mode, tx15_base, tx16_base, evt_ring_qid, rx6_base);
+    }
+
+    /* MCU DMA0 RX rings before reset */
+    for (i = 0; i < 4; i++)
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:   MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 mode, i,
+                 ioread32(dev->bar0 + 0x02500 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02504 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02508 + (i << 4)),
+                 ioread32(dev->bar0 + 0x0250c + (i << 4)));
+
+    /* ---- Phase 1: Full 16-step ToggleWfsysRst (NO CLR_OWN after!) ---- */
+    ret = mt7927_mode40_toggle_wfsys_rst(dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev,
+                "[MT7927] MODE%d: ToggleWfsysRst FAILED (%d), aborting\n", mode, ret);
+        goto diag_dump;
+    }
+
+    /* ---- Phase 2: Verify HOST rings survived WFSYS reset ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: Verifying HOST rings survived WFSYS reset (NO CLR_OWN)...\n",
+             mode);
+    {
+        u32 tx15_base = mt7927_rr(dev, MT_WPDMA_TX_RING_BASE(15));
+        u32 tx16_base = mt7927_rr(dev, MT_WPDMA_TX_RING_BASE(16));
+        u32 rx6_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(evt_ring_qid));
+        u32 rx4_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(4));
+        u32 rx5_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(5));
+        u32 rx7_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(7));
+        u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:   POST-RESET HOST rings: TX15=0x%08x TX16=0x%08x RX%d=0x%08x\n",
+                 mode, tx15_base, tx16_base, evt_ring_qid, rx6_base);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:   POST-RESET HOST rings: RX4=0x%08x RX5=0x%08x RX7=0x%08x\n",
+                 mode, rx4_base, rx5_base, rx7_base);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:   POST-RESET: GLO_CFG=0x%08x INT_ENA=0x%08x\n",
+                 mode, glo, int_ena);
+
+        /* Check if rings were wiped */
+        if (tx15_base == 0 || tx16_base == 0 || rx6_base == 0) {
+            dev_warn(&dev->pdev->dev,
+                     "[MT7927] MODE%d: WARNING: HOST ring BASEs zeroed by WFSYS reset! Will reprogram.\n",
+                     mode);
+            rings_ok = false;
+        } else {
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE%d: HOST rings survived WFSYS reset! No reprogram needed.\n",
+                     mode);
+        }
+    }
+
+    /* ---- Phase 2b: If rings were wiped, reprogram them ---- */
+    if (!rings_ok) {
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: Reprogramming HOST rings (WFSYS reset DID wipe them)...\n",
+                 mode);
+
+        /* Reset DMA pointers */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+
+        /* TX ring WM (q15) */
+        mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_wm.qid),
+                  lower_32_bits(dev->ring_wm.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_wm.qid), dev->ring_wm.ndesc);
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_wm.qid), 0);
+        dev->ring_wm.head = 0;
+
+        /* TX ring FWDL (q16) */
+        mt7927_wr(dev, MT_WPDMA_TX_RING_BASE(dev->ring_fwdl.qid),
+                  lower_32_bits(dev->ring_fwdl.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CNT(dev->ring_fwdl.qid), dev->ring_fwdl.ndesc);
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_fwdl.qid), 0);
+        dev->ring_fwdl.head = 0;
+
+        /* RX ring event */
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(dev->ring_evt.qid),
+                  lower_32_bits(dev->ring_evt.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(dev->ring_evt.qid), dev->ring_evt.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_DIDX(dev->ring_evt.qid), 0);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(dev->ring_evt.qid), dev->ring_evt.head);
+        dev->ring_evt.tail = 0;
+
+        /* Dummy RX rings 4, 5, 7 */
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(4), lower_32_bits(dev->ring_rx4.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(4), dev->ring_rx4.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(4), dev->ring_rx4.head);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(5), lower_32_bits(dev->ring_rx5.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(5), dev->ring_rx5.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(5), dev->ring_rx5.head);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_BASE(7), lower_32_bits(dev->ring_rx7.desc_dma));
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CNT(7), dev->ring_rx7.ndesc);
+        mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(7), dev->ring_rx7.head);
+
+        /* Prefetch entries */
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4), PREFETCH(0x0000, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(5), PREFETCH(0x0080, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6), PREFETCH(0x0100, 0x8));
+        mt7927_wr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7), PREFETCH(0x0180, 0x4));
+        mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x01C0, 0x4));
+        mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0200, 0x4));
+
+        /* Reset pointers again after prefetch */
+        mt7927_wr(dev, MT_WPDMA_RST_DTX_PTR, 0xFFFFFFFF);
+        mt7927_wr(dev, MT_WPDMA_RST_DRX_PTR, 0xFFFFFFFF);
+        wmb();
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: Ring reprogram done.\n", mode);
+    } else {
+        /* Rings survived — just reset head/tail pointers for our tracking */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: Resetting software head/tail pointers...\n", mode);
+        dev->ring_wm.head = 0;
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_wm.qid), 0);
+        dev->ring_fwdl.head = 0;
+        mt7927_wr(dev, MT_WPDMA_TX_RING_CIDX(dev->ring_fwdl.qid), 0);
+        dev->ring_evt.tail = 0;
+    }
+
+    /* ---- Phase 2c: Ensure DMA is properly configured for FWDL ---- */
+    {
+        u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+
+        /* Make sure TX/RX DMA are enabled with FWDL bypass */
+        glo |= MT_WPDMA_GLO_CFG_MT76_SET;
+        glo |= MT_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;
+        glo |= MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+        glo |= BIT(26);  /* ADDR_EXT_EN */
+        glo |= MT_WFDMA_GLO_CFG_TX_DMA_EN | MT_WFDMA_GLO_CFG_RX_DMA_EN;
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG, glo);
+
+        /* Enable DMASHDL bypass for FWDL */
+        val = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+        val |= MT_HIF_DMASHDL_BYPASS_EN;
+        mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, val);
+
+        /* Enable interrupts */
+        mt7927_wr(dev, MT_WFDMA_HOST_INT_ENA,
+                  HOST_RX_DONE_INT_ENA0 | HOST_RX_DONE_INT_ENA1 |
+                  HOST_RX_DONE_INT_ENA(evt_ring_qid) |
+                  HOST_TX_DONE_INT_ENA15 | HOST_TX_DONE_INT_ENA16 |
+                  HOST_TX_DONE_INT_ENA17);
+        mt7927_wr(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+
+        /* Signal NEED_REINIT */
+        val = mt7927_rr(dev, MT_MCU_WPDMA0_DUMMY_CR);
+        val |= MT_WFDMA_NEED_REINIT;
+        mt7927_wr(dev, MT_MCU_WPDMA0_DUMMY_CR, val);
+        wmb();
+        msleep(10);
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: DMA config for FWDL: GLO_CFG=0x%08x DMASHDL_SW=0x%08x\n",
+                 mode,
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+    }
+
+    /* ---- Phase 3: Re-download firmware ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: Re-downloading firmware after WFSYS reset...\n", mode);
+    ret = mt7927_mcu_fw_download(dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev,
+                "[MT7927] MODE%d: FW re-download FAILED (%d)\n", mode, ret);
+        goto diag_dump;
+    }
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: FW re-download SUCCESS, fw_sync=0x%08x\n",
+             mode, mt7927_rr(dev, MT_CONN_ON_MISC));
+
+    /* ---- Phase 4: Clear FWDL bypasses, enable DMASHDL, set GLO_CFG_EXT1 ---- */
+    {
+        u32 glo, dma_sw, ext1;
+
+        /* Clear GLO_CFG BIT(9) (FW_DWLD_BYPASS_DMASHDL) */
+        glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: GLO_CFG before bypass clear: 0x%08x\n", mode, glo);
+        glo &= ~MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG, glo);
+
+        /* Clear DMASHDL_SW_CONTROL BIT(28) (BYPASS) */
+        dma_sw = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+        dma_sw &= ~MT_HIF_DMASHDL_BYPASS_EN;
+        mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, dma_sw);
+
+        /* Set GLO_CFG_EXT1 BIT(28) (TX_FCTRL_MODE) */
+        ext1 = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT1);
+        ext1 |= MT_WPDMA_GLO_CFG_EXT1_WIN;
+        mt7927_wr(dev, MT_WPDMA_GLO_CFG_EXT1, ext1);
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: After bypass clear: GLO_CFG=0x%08x DMASHDL_SW=0x%08x EXT1=0x%08x\n",
+                 mode,
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL),
+                 mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT1));
+    }
+
+    /* ---- Phase 4b: DMASHDL enable (PostFwDownloadInit step 1) ---- */
+    {
+        u32 dmashdl_before = mt7927_rr(dev, MT_DMASHDL_ENABLE);
+        mt7927_wr(dev, MT_DMASHDL_ENABLE, dmashdl_before | 0x10101);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: DMASHDL(0x%05x): 0x%08x -> 0x%08x\n",
+                 mode, MT_DMASHDL_ENABLE, dmashdl_before,
+                 mt7927_rr(dev, MT_DMASHDL_ENABLE));
+    }
+
+    /* ---- Phase 4c: Clear INT_STA (both modes) ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: INT_STA before clear: 0x%08x\n",
+             mode, mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+    mt7927_wr(dev, MT_WFDMA_HOST_INT_STA, 0xFFFFFFFF);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: INT_STA after clear: 0x%08x\n",
+             mode, mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+
+    /* ---- Phase 4d: Mode 44 extra — kick MCU via HOST2MCU_SW_INT_SET ---- */
+    if (mode == 44) {
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE44: Kicking MCU via HOST2MCU_SW_INT_SET BIT(0)...\n");
+        mt7927_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));
+        msleep(10);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE44: MCU_CMD after kick: 0x%08x INT_STA: 0x%08x\n",
+                 mt7927_rr(dev, MT_MCU_CMD_REG),
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+    }
+
+    /* ---- Phase 4e: Poll WFSYS_SW_INIT_DONE ---- */
+    {
+        u32 sw_rst;
+
+        for (i = 0; i < 50; i++) {
+            sw_rst = mt7927_rr(dev, MT_WFSYS_SW_RST);
+            if (sw_rst & WFSYS_SW_INIT_DONE) {
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE%d: WFSYS_SW_INIT_DONE set after %d polls, val=0x%08x\n",
+                         mode, i, sw_rst);
+                break;
+            }
+            msleep(10);
+        }
+        if (!(sw_rst & WFSYS_SW_INIT_DONE))
+            dev_warn(&dev->pdev->dev,
+                     "[MT7927] MODE%d: WFSYS_SW_INIT_DONE still 0 after 500ms, val=0x%08x\n",
+                     mode, sw_rst);
+    }
+
+    /* ---- Phase 4f: Mode 45 — consume pending RX ring 6 events + DMASHDL dump ---- */
+    if (mode == 45) {
+        struct mt7927_ring *ring = &dev->ring_evt;
+        u32 rx6_cidx, rx6_didx, rx6_base, rx6_cnt;
+        u32 dmashdl_status, dmashdl_sw, dmashdl_opt;
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: === DRAIN PENDING RX RING 6 EVENTS ===\n");
+
+        /* Dump RX ring 6 state */
+        rx6_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(evt_ring_qid));
+        rx6_cnt  = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(evt_ring_qid));
+        rx6_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid));
+        rx6_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(evt_ring_qid));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: RX%d BASE=0x%08x CNT=0x%x CIDX=0x%x DIDX=0x%x tail=%u\n",
+                 evt_ring_qid, rx6_base, rx6_cnt, rx6_cidx, rx6_didx, ring->tail);
+
+        /* Check for unconsumed events (DIDX != tail means HW wrote data) */
+        while (ring->tail != rx6_didx) {
+            struct mt76_desc *d = &ring->desc[ring->tail];
+            u32 ctrl = le32_to_cpu(d->ctrl);
+            u32 *evt_data = ring->buf[ring->tail];
+
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE45: Consuming RX%d[%u]: ctrl=0x%08x (DMA_DONE=%d len=%u)\n",
+                     evt_ring_qid, ring->tail, ctrl,
+                     !!(ctrl & MT_DMA_CTL_DMA_DONE),
+                     (ctrl >> 16) & 0x3FFF);
+
+            /* Dump first 64 bytes of event data */
+            if (evt_data) {
+                print_hex_dump(KERN_INFO,
+                               "[MT7927] MODE45 rx-evt: ",
+                               DUMP_PREFIX_OFFSET, 16, 1,
+                               evt_data, min_t(u32, 64, ring->buf_size), false);
+            }
+
+            /* Reset descriptor for reuse */
+            d->ctrl = cpu_to_le32(FIELD_PREP(MT_DMA_CTL_SD_LEN0, ring->buf_size));
+
+            /* Advance tail */
+            ring->tail = (ring->tail + 1) % ring->ndesc;
+        }
+
+        /* Advance CIDX to match new tail (return consumed buffers to HW) */
+        if (rx6_cidx != ring->tail) {
+            u16 new_cidx = (ring->tail == 0) ? (ring->ndesc - 1) : (ring->tail - 1);
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid), new_cidx);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE45: Advanced RX%d CIDX: 0x%x -> 0x%x (tail=%u)\n",
+                     evt_ring_qid, rx6_cidx, new_cidx, ring->tail);
+        } else {
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE45: No pending events on RX%d (CIDX==tail)\n",
+                     evt_ring_qid);
+        }
+
+        /* Clear INT_STA */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: INT_STA before clear: 0x%08x\n",
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+        mt7927_wr(dev, MT_WFDMA_HOST_INT_STA, 0xFFFFFFFF);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: INT_STA after clear: 0x%08x\n",
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+
+        /* DMASHDL status dump for back-pressure info */
+        dmashdl_status = mt7927_rr(dev, MT_HIF_DMASHDL_STATUS_RD);
+        dmashdl_sw = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+        dmashdl_opt = mt7927_rr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: DMASHDL STATUS_RD=0x%08x SW_CONTROL=0x%08x OPT_CTRL=0x%08x\n",
+                 dmashdl_status, dmashdl_sw, dmashdl_opt);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: DMASHDL PAGE=0x%08x REFILL=0x%08x PKT_MAX=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_PAGE_SETTING),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_REFILL_CONTROL),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE));
+        /* Group quotas */
+        for (i = 0; i < 4; i++)
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE45: DMASHDL GROUP%d=0x%08x\n",
+                     i, mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(i)));
+        /* Queue maps */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: DMASHDL QMAP0=0x%08x QMAP1=0x%08x QMAP2=0x%08x QMAP3=0x%08x\n",
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP1),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP2),
+                 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP3));
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE45: === DRAIN COMPLETE ===\n");
+    }
+
+diag_dump:
+    /* ---- Phase 5: Diagnostic register dump ---- */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: === DIAGNOSTIC DUMP ===\n", mode);
+
+    mcu_rx0_base = ioread32(dev->bar0 + 0x02500);
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d: *** MCU_RX0 BASE=0x%08x *** (%s)\n",
+             mode, mcu_rx0_base,
+             mcu_rx0_base ? "FW configured MCU command ring!" : "STILL ZERO - blocker");
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:     MCU_RX1 BASE=0x%08x\n",
+             mode, ioread32(dev->bar0 + 0x02510));
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:     ROMCODE_INDEX=0x%08x fw_sync=0x%08x\n",
+             mode, mt7927_rr(dev, MT_ROMCODE_INDEX),
+             mt7927_rr(dev, MT_CONN_ON_MISC));
+
+    /* MCU DMA0 control */
+    {
+        u32 mcu_glo = ioread32(dev->bar0 + 0x02208);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:     MCU_DMA0 GLO_CFG=0x%08x (TX_EN=%d RX_EN=%d)\n",
+                 mode, mcu_glo, !!(mcu_glo & BIT(0)), !!(mcu_glo & BIT(2)));
+    }
+
+    /* All MCU DMA0 RX rings */
+    for (i = 0; i < 4; i++)
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d:     MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                 mode, i,
+                 ioread32(dev->bar0 + 0x02500 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02504 + (i << 4)),
+                 ioread32(dev->bar0 + 0x02508 + (i << 4)),
+                 ioread32(dev->bar0 + 0x0250c + (i << 4)));
+
+    /* HOST-side WFDMA state */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:     HOST GLO_CFG=0x%08x INT_ENA=0x%08x INT_STA=0x%08x\n",
+             mode,
+             mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+             mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA),
+             mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+
+    /* Host RX ring 6 state */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:     HOST RXQ%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+             mode, evt_ring_qid,
+             mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(evt_ring_qid)),
+             mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(evt_ring_qid)),
+             mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid)),
+             mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(evt_ring_qid)));
+
+    /* Host TX ring 15 state (WM command ring) */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:     HOST TXQ15: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+             mode,
+             mt7927_rr(dev, MT_WPDMA_TX_RING_BASE(15)),
+             mt7927_rr(dev, MT_WPDMA_TX_RING_CNT(15)),
+             mt7927_rr(dev, MT_WPDMA_TX_RING_CIDX(15)),
+             mt7927_rr(dev, MT_WPDMA_TX_RING_DIDX(15)));
+
+    /* WFSYS_SW_INIT_DONE */
+    dev_info(&dev->pdev->dev,
+             "[MT7927] MODE%d:     WFSYS_SW_RST(0x%05x)=0x%08x (INIT_DONE=%d)\n",
+             mode, MT_WFSYS_SW_RST, mt7927_rr(dev, MT_WFSYS_SW_RST),
+             !!(mt7927_rr(dev, MT_WFSYS_SW_RST) & WFSYS_SW_INIT_DONE));
+
+    /* ---- Phase 6a: Mode 47 — ACK MCU_CMD=0x8000 before NIC_CAP ---- */
+    if (mode == 47 && !ret) {
+        u32 mcu_cmd, mcu_rx0_after;
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: === ACK MCU_CMD BEFORE NIC_CAP ===\n");
+
+        /* Read MCU_CMD_REG (MCU2HOST_SW_INT_STA at 0xd41f0) */
+        mcu_cmd = mt7927_rr(dev, MT_MCU_CMD_REG);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: MCU_CMD_REG=0x%08x before ACK\n", mcu_cmd);
+
+        /* ACK by writing the value back (W1C — write-1-to-clear) */
+        if (mcu_cmd) {
+            mt7927_wr(dev, MT_MCU_CMD_REG, mcu_cmd);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE47: Wrote 0x%08x to MCU_CMD_REG (ACK)\n", mcu_cmd);
+        }
+
+        /* Also try MCU2HOST_SW_INT_ENA area — read nearby regs */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: MCU2HOST_SW_INT_ENA(0xd41f4)=0x%08x\n",
+                 mt7927_rr(dev, MT_MCU2HOST_SW_INT_ENA));
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: HOST2MCU_SW_INT_SET(0xd4108)=0x%08x\n",
+                 mt7927_rr(dev, MT_HOST2MCU_SW_INT_SET));
+
+        /* Wait for FW to react */
+        msleep(50);
+
+        /* Re-read MCU_CMD — did FW set new bits? */
+        mcu_cmd = mt7927_rr(dev, MT_MCU_CMD_REG);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: MCU_CMD_REG=0x%08x after ACK + 50ms\n", mcu_cmd);
+
+        /* Re-read MCU_RX0 BASE — did FW configure it after ACK? */
+        mcu_rx0_after = ioread32(dev->bar0 + 0x02500);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: MCU_RX0 BASE=0x%08x after ACK (%s)\n",
+                 mcu_rx0_after,
+                 mcu_rx0_after ? "*** FW CONFIGURED MCU_RX0! ***" : "still zero");
+
+        /* If MCU_RX0 still 0, try longer wait */
+        if (mcu_rx0_after == 0) {
+            msleep(200);
+            mcu_rx0_after = ioread32(dev->bar0 + 0x02500);
+            mcu_cmd = mt7927_rr(dev, MT_MCU_CMD_REG);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE47: After 250ms total: MCU_RX0=0x%08x MCU_CMD=0x%08x\n",
+                     mcu_rx0_after, mcu_cmd);
+        }
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE47: === ACK COMPLETE ===\n");
+    }
+
+    /* ---- Phase 6a2: Mode 49 — Read FWDL-phase HOST RX ring 6 events ---- */
+    if (mode == 49 && !ret) {
+        struct mt7927_ring *ring = &dev->ring_evt;
+        u32 rx6_cidx, rx6_didx, rx6_base, rx6_cnt;
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE49: === READ HOST RX RING 6 EVENTS (FWDL phase) ===\n");
+
+        /* Dump RX ring 6 hardware state */
+        rx6_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(evt_ring_qid));
+        rx6_cnt  = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(evt_ring_qid));
+        rx6_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid));
+        rx6_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(evt_ring_qid));
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE49: RX%d BASE=0x%08x CNT=0x%x CIDX=0x%x DIDX=0x%x (ring tail=%u)\n",
+                 evt_ring_qid, rx6_base, rx6_cnt, rx6_cidx, rx6_didx, ring->tail);
+
+        /* Check for unconsumed events (DIDX > CIDX means HW wrote data) */
+        if (rx6_didx != rx6_cidx) {
+            u32 pending = (rx6_didx >= rx6_cidx) ?
+                          (rx6_didx - rx6_cidx) :
+                          (ring->ndesc - rx6_cidx + rx6_didx);
+
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE49: Found %u pending event(s) in RX%d (DIDX=0x%x > CIDX=0x%x)\n",
+                     pending, evt_ring_qid, rx6_didx, rx6_cidx);
+
+            /* Read descriptors from CIDX to DIDX */
+            u16 idx = rx6_cidx;
+            u32 count = 0;
+
+            while (idx != rx6_didx && count < pending) {
+                struct mt76_desc *d = &ring->desc[idx];
+                u32 buf0 = le32_to_cpu(d->buf0);
+                u32 ctrl = le32_to_cpu(d->ctrl);
+                u32 buf1 = le32_to_cpu(d->buf1);
+                u32 info = le32_to_cpu(d->info);
+                u32 pkt_len = (ctrl >> 16) & 0x3FFF;
+                void *evt_data = ring->buf[idx];
+
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE49: === RX%d descriptor[%u] ===\n",
+                         evt_ring_qid, idx);
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE49:   buf0=0x%08x ctrl=0x%08x buf1=0x%08x info=0x%08x\n",
+                         buf0, ctrl, buf1, info);
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE49:   DMA_DONE=%d pkt_len=%u\n",
+                         !!(ctrl & MT_DMA_CTL_DMA_DONE), pkt_len);
+
+                /* Dump event data buffer (first 128 bytes) */
+                if (evt_data && pkt_len > 0) {
+                    u32 dump_len = min_t(u32, 128, pkt_len);
+                    dev_info(&dev->pdev->dev,
+                             "[MT7927] MODE49:   Event data (%u bytes, dumping %u):\n",
+                             pkt_len, dump_len);
+                    print_hex_dump(KERN_INFO,
+                                   "[MT7927] MODE49:     ",
+                                   DUMP_PREFIX_OFFSET, 16, 1,
+                                   evt_data, dump_len, false);
+                } else {
+                    dev_info(&dev->pdev->dev,
+                             "[MT7927] MODE49:   (no event data or len=0)\n");
+                }
+
+                /* Advance to next descriptor */
+                idx = (idx + 1) % ring->ndesc;
+                count++;
+            }
+
+            /* Consume events by advancing CIDX to DIDX */
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE49: Consuming %u event(s): advancing CIDX 0x%x -> 0x%x\n",
+                     count, rx6_cidx, rx6_didx);
+
+            mt7927_wr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid), rx6_didx);
+
+            /* Update ring tail to match */
+            ring->tail = rx6_didx;
+
+            /* Verify update */
+            u32 new_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(evt_ring_qid));
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE49: RX%d CIDX after update=0x%x (requested 0x%x) tail=%u\n",
+                     evt_ring_qid, new_cidx, rx6_didx, ring->tail);
+        } else {
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE49: No pending events (CIDX=DIDX=0x%x)\n", rx6_cidx);
+        }
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE49: === READ COMPLETE ===\n");
+    }
+
+    /* ---- Phase 6b: NIC_CAPABILITY ---- */
+    if (ret) {
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: Skipping NIC_CAPABILITY (earlier step failed)\n", mode);
+    } else if (mode == 46) {
+        /* Mode 46: NIC_CAP via FWDL path (Q_IDX=2, TX ring 16) */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE46: Sending NIC_CAPABILITY via FWDL ring (Q_IDX=2)...\n");
+
+        /* Need DMASHDL bypass for FWDL ring */
+        {
+            u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+            glo |= MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+            mt7927_wr(dev, MT_WPDMA_GLO_CFG, glo);
+            val = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+            val |= MT_HIF_DMASHDL_BYPASS_EN;
+            mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, val);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE46: Re-enabled FWDL bypass for Q_IDX=2: GLO=0x%08x DMASHDL_SW=0x%08x\n",
+                     mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+                     mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+        }
+
+        ret = mt7927_mode46_send_nic_cap_fwdl(dev);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE46: NIC_CAPABILITY (Q_IDX=2) result=%d\n", ret);
+
+        /* Also try standard Q_IDX=0x20 on ring 15 for comparison */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE46: Also sending via ring 15 (Q_IDX=0x20) for comparison...\n");
+        {
+            int ret2 = mt7927_mode40_send_nic_cap(dev);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE46: NIC_CAP (Q_IDX=0x20) result=%d\n", ret2);
+        }
+    } else if (mode == 48) {
+        /* Mode 48: NIC_CAP via ring 15 (Q_IDX=0x20) with DMASHDL bypass + enhanced diagnostics */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: Sending NIC_CAPABILITY via ring 15 (Q_IDX=0x20) with bypass + diagnostics...\n");
+
+        /* Ensure DMASHDL bypass is enabled (needed for ring 15) */
+        {
+            u32 glo = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+            glo |= MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL;
+            mt7927_wr(dev, MT_WPDMA_GLO_CFG, glo);
+            val = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+            val |= MT_HIF_DMASHDL_BYPASS_EN;
+            mt7927_wr(dev, MT_HIF_DMASHDL_SW_CONTROL, val);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48: DMASHDL bypass enabled: GLO=0x%08x DMASHDL_SW=0x%08x\n",
+                     mt7927_rr(dev, MT_WPDMA_GLO_CFG),
+                     mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL));
+        }
+
+        /* Dump baseline state */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: === BASELINE STATE (before NIC_CAP) ===\n");
+        {
+            int i;
+            /* HOST RX rings 0-7 */
+            for (i = 0; i < 8; i++) {
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE48:   HOST_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                         i,
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(i)),
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(i)),
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(i)),
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(i)));
+            }
+            /* MCU RX rings 0-3 (offset 0x540, 0x550, 0x560, 0x570) */
+            for (i = 0; i < 4; i++) {
+                u32 base_ofs = 0x540 + (i << 4);
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE48:   MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x\n",
+                         i,
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs),
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs + 4),
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs + 8),
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs + 12));
+            }
+        }
+
+        /* Send NIC_CAPABILITY */
+        ret = mt7927_mode40_send_nic_cap(dev);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: NIC_CAP (Q_IDX=0x20, ring 15) send result=%d\n", ret);
+
+        /* Enhanced diagnostics after send */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: === ENHANCED DIAGNOSTICS (after send) ===\n");
+
+        /* Kick MCU via HOST2MCU_SW_INT_SET */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: Kicking MCU via HOST2MCU_SW_INT_SET BIT(0)...\n");
+        mt7927_wr(dev, MT_HOST2MCU_SW_INT_SET, BIT(0));
+
+        /* Wait for MCU to process */
+        msleep(100);
+
+        /* Dump all HOST RX ring states */
+        {
+            int i;
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48: === HOST RX RING STATE (after 100ms) ===\n");
+            for (i = 0; i < 8; i++) {
+                u32 didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(i));
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE48:   HOST_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x%s\n",
+                         i,
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(i)),
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(i)),
+                         mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(i)),
+                         didx,
+                         (i == 6 || i == 7) ? " <-- MCU EVENT CANDIDATE" : "");
+            }
+        }
+
+        /* Dump MCU RX ring states */
+        {
+            int i;
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48: === MCU RX RING STATE (after 100ms) ===\n");
+            for (i = 0; i < 4; i++) {
+                u32 base_ofs = 0x540 + (i << 4);
+                dev_info(&dev->pdev->dev,
+                         "[MT7927] MODE48:   MCU_RX%d: BASE=0x%08x CNT=0x%08x CIDX=0x%08x DIDX=0x%08x%s\n",
+                         i,
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs),
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs + 4),
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs + 8),
+                         ioread32(dev->bar0 + 0xd4000 + base_ofs + 12),
+                         (i == 0) ? " <-- BLOCKER (should be non-zero)" : "");
+            }
+        }
+
+        /* Dump MCU2HOST_SW_INT_STA */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: MCU2HOST_SW_INT_STA(MCU_CMD_REG 0xd41f0)=0x%08x\n",
+                 mt7927_rr(dev, MT_MCU_CMD_REG));
+
+        /* Dump INT_STA */
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: WFDMA_HOST_INT_STA=0x%08x\n",
+                 mt7927_rr(dev, MT_WFDMA_HOST_INT_STA));
+
+        /* Wait and check for DIDX changes on HOST RX ring 6/7 */
+        {
+            u32 ring6_didx_before = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+            u32 ring7_didx_before = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48: Waiting for HOST RX ring 6/7 DIDX changes...\n");
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48:   Ring 6 DIDX baseline=0x%08x\n", ring6_didx_before);
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48:   Ring 7 DIDX baseline=0x%08x\n", ring7_didx_before);
+
+            msleep(500);
+
+            u32 ring6_didx_after = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+            u32 ring7_didx_after = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48: After 500ms:\n");
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48:   Ring 6 DIDX=0x%08x %s\n",
+                     ring6_didx_after,
+                     (ring6_didx_after != ring6_didx_before) ? "CHANGED!" : "(no change)");
+            dev_info(&dev->pdev->dev,
+                     "[MT7927] MODE48:   Ring 7 DIDX=0x%08x %s\n",
+                     ring7_didx_after,
+                     (ring7_didx_after != ring7_didx_before) ? "CHANGED!" : "(no change)");
+        }
+
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE48: === DIAGNOSTICS COMPLETE ===\n");
+    } else {
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: Sending NIC_CAPABILITY (Q_IDX=0x20)...\n", mode);
+        ret = mt7927_mode40_send_nic_cap(dev);
+        dev_info(&dev->pdev->dev,
+                 "[MT7927] MODE%d: NIC_CAPABILITY result=%d\n", mode, ret);
+    }
+
+    dev_info(&dev->pdev->dev,
+             "[MT7927] === MODE %d: COMPLETE ===\n", mode);
+}
+
 static int mt7927_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
     struct mt7927_dev *dev;
@@ -2188,6 +3756,12 @@ static int mt7927_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         dev_warn(&pdev->dev, "Firmware flow incomplete (ret=%d), device kept bound\n", ret);
     else
         dev_info(&pdev->dev, "MT7927 firmware flow done\n");
+
+    /* Post-FWDL experiment modes */
+    if (reinit_mode == 40)
+        mt7927_mode40_post_fwdl(dev);
+    else if (reinit_mode >= 43 && reinit_mode <= 49)
+        mt7927_mode43_vendor_order(dev, reinit_mode);
 
     return 0;
 
