@@ -1,0 +1,3 @@
+# MT7927 PCIe WiFi Driver - Kbuild file
+obj-m += mt7927.o
+mt7927-y := mt7927_pci.o mt7927_mac.o mt7927_dma.o

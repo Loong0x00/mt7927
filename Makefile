@@ -8,10 +8,9 @@ PWD := $(shell pwd)
 # Default target
 all: driver tests tools
 
-# Driver module (when ready)
+# Driver module
 driver:
-	@echo "Driver not yet implemented - in development"
-	@# $(MAKE) -C $(KDIR) M=$(PWD)/src modules
+	$(MAKE) -C $(KDIR) M=$(PWD)/src modules
 
 # Test modules
 tests:
@@ -24,7 +23,7 @@ tools:
 # Clean everything
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/tests clean
-	@# $(MAKE) -C $(KDIR) M=$(PWD)/src clean
+	$(MAKE) -C $(KDIR) M=$(PWD)/src clean
 	find . -name "*.log" -type f -delete
 	find . -name "*.o.cmd" -type f -delete
 	find . -name ".*.cmd" -type f -delete
