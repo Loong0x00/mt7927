@@ -1,215 +1,178 @@
 # MT7927 WiFi 7 Linux Driver Project
 
-## 🎉 Major Breakthrough: MT7927 = MT7925 + 320MHz
+## Original Author's Work
 
-We've discovered that the MT7927 is architecturally identical to the MT7925 (which has full Linux support since kernel 6.7) except for 320MHz channel width capability. This means we can adapt the existing mt7925 driver rather than writing one from scratch!
+This project was originally started by [ehausig](https://github.com/ehausig/mt7927), who successfully implemented PCIe device binding and basic firmware loading. The original author put the project on hold after reaching the DMA transfer stage. Much of the initial reverse engineering work and driver structure came from their efforts.
 
-## Current Status: ON-HOLD INDEFINITELY 🚧
+## Current Development Status
 
-**Working**: Custom driver successfully binds to MT7927 hardware and loads firmware  
-**Next Step**: Implement DMA firmware transfer to activate the chip  
+**CRITICAL DISCOVERY**: MT7927 is actually the MT6639 mobile chip in a PCIe package, NOT part of the MT76 WiFi chip family. MediaTek has never published a Linux WiFi driver for it. We are writing one from scratch based on reverse engineering Windows drivers and studying MediaTek's Android MT6639 reference code.
 
-I have other projects that I am working on, so I probably won't continue work on this one. I'm sharing my work in case anyone finds it useful.
+### What's Working ✅
+- **PCIe enumeration and BAR mapping**: Device detection and memory mapping successful
+- **DMA ring initialization**: WFDMA rings configured and operational
+- **Firmware download**: Complete fw_sync=0x3 achieved, firmware boots successfully
+- **CLR_OWN/SET_OWN handshake**: Proper device ownership control implemented
+- **Windows driver reverse engineering**: Full PostFwDownloadInit sequence documented
+
+### Current Blocker ❌
+**Post-boot MCU command communication fails**: After successful firmware boot, the first MCU command (NIC_CAPABILITY) times out with -110 error. Root cause is that firmware never configures MCU_RX0 DMA ring (BASE remains 0x00000000), preventing host-to-MCU message delivery. 52+ initialization experiments have been conducted to solve this issue.
+
+### Key Technical Findings
+- **MT6639 architecture**: PCI ID 14c3:6639, requires different init sequence than mt7925
+- **PCIe FLR is fatal**: Device enters D3cold state and never recovers
+- **CLR_OWN side effects**: ROM resets ALL WFDMA rings, requires full reprogramming
+- **TXD format**: Must use Q_IDX=0x20 (MT_TX_MCU_PORT_RX_Q0), NO BIT(31) LONG_FORMAT flag
+- **PostFwDownloadInit**: 9 MCU commands with specific DMASHDL configuration (reverse engineered from Windows driver v5603998)
 
 ## Quick Start
 
 ### Prerequisites
 ```bash
-# Check kernel version (need 6.7+ for mt7925 base)
-uname -r  # Should show 6.7 or higher
-
-# Verify MT7927 device is present
-lspci -nn | grep 14c3:7927  # Should show your device
+# Verify MT7927/MT6639 device is present
+lspci -nn | grep 14c3:6639  # Should show MT7927 (note: PCI ID is 6639, not 7927)
 ```
 
 ### Install Firmware
 ```bash
-# Download MT7925 firmware (compatible with MT7927!)
-mkdir -p ~/mt7927_firmware
-cd ~/mt7927_firmware
-
-wget https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin
-wget https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin
-
-# Install firmware
+# MT7927 uses MT7925 firmware files (confirmed working for firmware download phase)
 sudo mkdir -p /lib/firmware/mediatek/mt7925
-sudo cp *.bin /lib/firmware/mediatek/mt7925/
-sudo update-initramfs -u
+
+# Download firmware (or copy from existing installation)
+# Files needed: WIFI_MT7925_PATCH_MCU_1_1_hdr.bin, WIFI_RAM_CODE_MT7925_1_1.bin
 ```
 
 ### Build and Load Driver
 ```bash
 # Clone and build
-git clone https://github.com/[your-username]/mt7927-linux-driver
-cd mt7927-linux-driver
+git clone https://github.com/Loong0x00/mt7927
+cd mt7927
 make clean && make tests
 
-# Load the driver
-sudo insmod tests/04_risky_ops/mt7927_init.ko
+# Load the test driver (current development version)
+sudo insmod tests/04_risky_ops/mt7927_init_dma.ko
 
 # Check status
-sudo dmesg | tail -20
-lspci -k | grep -A 3 "14c3:7927"  # Should show "Kernel driver in use: mt7927_init"
+sudo dmesg | tail -50
+lspci -k | grep -A 3 "14c3:6639"
 ```
 
 ## Technical Details
 
 ### Hardware Information
-- **Chip**: MediaTek MT7927 WiFi 7 (802.11be)
-- **PCI ID**: 14c3:7927 (vendor: MediaTek, device: MT7927)
-- **Architecture**: Same as MT7925 except supports 320MHz channels
-- **Current State**: FW_STATUS: 0xffff10f1 (waiting for DMA firmware transfer)
+- **Chip**: MediaTek MT7927 = MT6639 mobile chip in PCIe package
+- **PCI ID**: 14c3:6639 (NOT 7927!)
+- **Architecture**: Different from MT76 family (mt7921/mt7925), uses MT6639 mobile chipset design
+- **Bluetooth**: Works via USB (btusb/btmtk), WiFi is PCIe (completely separate subsystems)
 
-### Key Discoveries
-1. **MT7925 firmware is compatible** - No need to wait for MediaTek
-2. **Driver binding works** - Custom driver successfully claims device
-3. **Clear path forward** - Just need to implement DMA transfer mechanism
+### Current Challenge: MCU Command Communication
+After successful firmware boot (fw_sync=0x3), the driver encounters a blocker when sending the first MCU command:
+- **Problem**: MCU_RX0 DMA ring BASE stays at 0x00000000 (never configured by firmware)
+- **Symptom**: NIC_CAPABILITY command times out (-110 error)
+- **Hypothesis**: Firmware expects HOST RX ring 0 to be allocated before it configures MCU_RX0
+- **Status**: Testing MODE 53 with HOST RX ring 0 pre-allocation
 
-### What's Working ✅
-- PCI enumeration and BAR mapping
-- Driver successfully binds to device
-- Firmware files load into kernel memory
-- All hardware registers accessible
-- Chip is stable and responsive
-
-### What's Not Working Yet ❌
-- DMA firmware transfer to chip (main blocker)
-- Memory activation at 0x000000
-- WiFi network interface creation
-
-### Why It's Not Working (Root Cause)
-The firmware loads into kernel memory but isn't transferred to the chip via DMA. We need to:
-1. Set up DMA descriptors properly
-2. Copy firmware with correct headers to DMA buffer
-3. Trigger MCU to read from DMA buffer
-4. Wait for firmware acknowledgment
+### Eliminated Approaches (52+ modes tested)
+- R2A FSM manipulation
+- NEED_REINIT flag variations
+- Post-boot CLR_OWN sequences
+- Direct MCU_RX0 register writes
+- WFSYS/CONN_INFRA reset attempts
+- Full vendor DMASHDL configuration
+- Various Q_IDX and TXD format combinations
 
 ## Project Structure
 ```
-mt7927-linux-driver/
-├── README.md                        # This file (main documentation)
-├── Makefile                         # Build system
-├── tests/
-│   ├── 04_risky_ops/
-│   │   ├── mt7927_wrapper.c        # ✅ Basic driver (binds successfully)
-│   │   ├── mt7927_init.c           # 🚧 Current driver (loads firmware)
-│   │   └── test_mt7925_firmware.c  # ✅ Firmware compatibility test
-│   └── Kbuild                       # Kernel build config
-└── src/                             # Future production driver location
+mt7927/
+├── README.md                               # This file
+├── Makefile                                # Build system
+├── tests/04_risky_ops/
+│   └── mt7927_init_dma.c                  # Main development driver (single file)
+├── docs/                                   # Development logs and research notes
+│   ├── session_status_2026-02-15.md       # Latest status summary
+│   ├── references/                         # Windows driver RE analysis
+│   └── win_v5705275_*.md                  # Detailed reverse engineering docs (14 files)
+├── mt6639/                                 # Android reference code (Motorola)
+└── mt76/mt7925/                           # Upstream mt7925 driver (reference only)
 ```
 
 ## Development Roadmap
 
-### Phase 1: Get It Working (CURRENT)
-- [x] Bind driver to device
-- [x] Load firmware files
-- [ ] **Implement DMA transfer** ← Current focus
-- [ ] Activate chip memory
-- [ ] Create network interface
+### Current Phase: MCU Communication
+- [x] PCIe device enumeration
+- [x] DMA ring initialization
+- [x] Firmware download (fw_sync=0x3)
+- [x] Windows driver reverse engineering
+- [ ] **Solve MCU_RX0 configuration issue** ← Current blocker
+- [ ] Post-boot MCU command sequence
+- [ ] Network interface creation
 
-### Phase 2: Make It Good
-- [ ] Port full mt7925 functionality
-- [ ] Add 320MHz channel support
-- [ ] Integrate with mac80211
-- [ ] Implement WiFi 7 features
+### Future Phases
+- [ ] mac80211 integration
+- [ ] WiFi 7 feature implementation
+- [ ] Upstream submission to linux-wireless
 
-### Phase 3: Make It Official
-- [ ] Clean up code for upstream
-- [ ] Submit to linux-wireless
-- [ ] Get merged into mainline kernel
+## Research References
 
-## How to Contribute
+### Primary Code References
+1. **mt6639/** - Motorola Android MT6639 driver (most relevant architecture match)
+2. **mt76/mt7925/** - Upstream mt7925 driver (similar but different chip family)
+3. **Windows drivers** - Reverse engineered using Ghidra:
+   - DRV_WiFi_MTK_*_V5603998_* (analyzed PostFwDownloadInit sequence)
+   - WiFi_AMD-MediaTek_v5.7.0.5275 (deeper MCU command analysis)
 
-### Immediate Needs
-1. **DMA Implementation** - Study mt7925 source in `drivers/net/wireless/mediatek/mt76/mt7925/`
-2. **Testing** - Try the driver on your MT7927 hardware
-3. **Documentation** - Improve this README with your findings
+### Documentation
+- See `docs/` directory for detailed development logs
+- `docs/win_v5705275_*.md` - 14 files documenting Windows driver RE
+- `docs/session_status_2026-02-15.md` - Latest development status
+- `docs/references/` - Specific technical investigations
 
-### Code References
+## Known Issues & Warnings
 
-#### Key Source Files to Study (in your kernel source)
+### CRITICAL: Dangerous Operations
+- **DO NOT use `pcie_flr()`**: Puts device into D3cold, requires hard reboot
+- **DO NOT use `pci_reset_function()` in probe**: Causes deadlock (device mutex conflict)
+- **CB_INFRA_RGU WF_SUBSYS_RST**: Makes device unrecoverable without reboot - use sparingly
+
+### Device Recovery
 ```bash
-# Main mt7925 driver files (your reference implementation)
-drivers/net/wireless/mediatek/mt76/mt7925/
-├── pci.c         # PCI probe and initialization sequence
-├── mcu.c         # MCU communication and firmware loading
-├── init.c        # Hardware initialization
-└── dma.c         # DMA setup and transfer
-
-# Shared mt76 infrastructure
-drivers/net/wireless/mediatek/mt76/
-├── dma.c         # Generic DMA implementation
-├── mt76_connac_mcu.c  # MCU interface for Connac chips
-└── util.c        # Utility functions
-```
-
-#### Online References
-- **mt7925 on GitHub**: [Linux kernel source](https://github.com/torvalds/linux/tree/master/drivers/net/wireless/mediatek/mt76/mt7925)
-- **mt76 framework**: [OpenWrt repository](https://github.com/openwrt/mt76)
-- **Our working code**: `tests/04_risky_ops/mt7927_init.c`
-
-## Troubleshooting
-
-### Driver Won't Load
-```bash
-# Check for conflicts
-lsmod | grep mt79
-sudo rmmod mt7921e mt7925e  # Remove any conflicting drivers
-
-# Check kernel messages
-sudo dmesg | grep -E "mt7927|0a:00"
-```
-
-### Chip in Error State
-```bash
-# If chip shows 0xffffffff, reset via PCI
-echo 1 | sudo tee /sys/bus/pci/devices/0000:0a:00.0/remove
+# If device becomes unresponsive (0xffffffff reads)
+echo 1 | sudo tee /sys/bus/pci/devices/0000:XX:00.0/remove
 sleep 2
 echo 1 | sudo tee /sys/bus/pci/rescan
+# Replace XX:00.0 with your device's actual PCI address
 ```
 
-### Firmware Not Found
-```bash
-# Verify firmware is installed
-ls -la /lib/firmware/mediatek/mt7925/
-# Should show WIFI_MT7925_PATCH_MCU_1_1_hdr.bin and WIFI_RAM_CODE_MT7925_1_1.bin
-```
+## Development History
 
-## Test Results Summary
-
-### Successful Tests ✅
-- **Hardware Detection**: PCI enumeration works perfectly
-- **Driver Binding**: Custom driver claims device successfully  
-- **Firmware Compatibility**: MT7925 firmware loads without errors
-- **Register Access**: All BAR2 control registers accessible
-- **Chip Stability**: No crashes or lockups during testing
-
-### Pending Implementation 🚧
-- **DMA Transfer**: Firmware not reaching chip memory
-- **Memory Activation**: Main memory at 0x000000 still shows 0x00000000
-- **Network Interface**: Requires successful initialization first
+This driver development has involved:
+- **150+ test boots** across 52+ experimental modes
+- **Complete Windows driver reverse engineering** (2 versions analyzed with Ghidra)
+- **BAR0 address map validation** for MT7927/MT6639 register layout
+- **Firmware encryption research** (DL_MODE_ENCRYPT flags critical for success)
+- **Community research**: Confirmed we have the most advanced MT7927 Linux driver work (GitHub user ehausig's work stalled at same MCU_RX0 issue)
 
 ## FAQ
 
-**Q: Why not just use the mt7925e driver?**  
-A: The mt7925e driver refuses to bind to MT7927's PCI ID (14c3:7927) and adding the ID via new_id fails with "Invalid argument".
+**Q: Is MT7927 the same as MT7925?**
+A: No. MT7927 = MT6639 mobile chip in PCIe package, completely different architecture from MT76 family (mt7921/mt7925).
 
-**Q: Is this safe to test?**  
-A: Yes, we're using proven MT7925 code paths. The worst case is the driver doesn't fully initialize (current state).
+**Q: Why not use the mt7925 driver?**
+A: MT7927 uses PCI ID 14c3:6639 and has different initialization requirements. Simply adding the PCI ID to mt7925 doesn't work.
 
-**Q: Will this support full WiFi 7 320MHz channels?**  
-A: Initially it will work like MT7925 (160MHz). Adding 320MHz support will come after basic functionality works.
+**Q: Does any MT7927 Linux driver exist?**
+A: No. MediaTek never published one. The ehausig/mt7927 GitHub project (the original version of this repo) reached the same MCU_RX0 blocker we're currently debugging.
 
-**Q: When will this be in the mainline kernel?**  
-A: Once we have a working driver, submission typically takes 2-3 kernel cycles (3-6 months).
+**Q: Can this brick my hardware?**
+A: No permanent damage is possible via software. Worst case: device becomes unresponsive until PCI rescan or system reboot.
 
 ## License
 GPL v2 - Intended for upstream Linux kernel submission
 
-## Contact & Support
-- **GitHub Issues**: Report bugs and discuss development
-- **Linux Wireless**: [Mailing list](http://vger.kernel.org/vger-lists.html#linux-wireless) for upstream discussion
+## Credits
+- **Original author**: [ehausig](https://github.com/ehausig/mt7927) - Initial reverse engineering and driver structure
+- **Current development**: [Loong0x00](https://github.com/Loong0x00) - Firmware download implementation, Windows driver RE, MCU communication research
 
 ---
 
-**Status as of 2025-08-18**: Driver successfully binds and loads firmware. Implementing DMA transfer to complete initialization. This is no longer a reverse engineering project - we're adapting proven MT7925 code to support MT7927's PCI ID and eventually its 320MHz capability.
+**Status as of 2026-02-15**: Firmware download working (fw_sync=0x3 achieved). Current focus: solving MCU_RX0 DMA ring configuration to enable post-boot MCU command communication. This is a from-scratch driver development effort based on reverse engineering Windows drivers and studying MediaTek's Android MT6639 reference code.

@@ -148,6 +148,23 @@ debian/stamp-*
 
 # Large reference directories (not our code)
 /ghidra_12.0.3_PUBLIC/
+ghidra_*/
+
+# Windows driver packages (proprietary binaries - legal issues)
+DRV_Bluetooth_MTK_*/
+DRV_WiFi_MTK_*/
+WiFi_AMD-MediaTek_*/
+
+# Third-party driver code (not our code)
+linux-driver-mediatek-mt7927-bluetooth-main/
+linux-mediatek-mt6639-bluetooth-kernel-module-main/
+
+# Windows driver binaries (anywhere in tree)
+*.sys
+*.dll
+*.exe
+*.cat
+*.inf
 
 # Keep important configuration files
 !.gitignore
