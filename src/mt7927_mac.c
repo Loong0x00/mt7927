@@ -528,7 +528,20 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 
 /*
  * Handle MCU event received on RX ring.
- * For now, only handles scan-done; other events are dropped.
+ *
+ * In UniCmd event format (CONNAC3), the event layout is:
+ *   rxd[0..7]: RXD header (32 bytes)
+ *   +0x20: len (2 bytes)
+ *   +0x22: pkt_type_id (2 bytes) — not the event ID!
+ *   +0x24: eid (1 byte) — THIS is the event ID!
+ *   +0x25: seq (1 byte)
+ *   +0x26: option (1 byte)
+ *   ...
+ *   +0x2C: TLV payload
+ *
+ * mt7925 dispatches on rxd->eid, NOT rxd->pkt_type_id.
+ * 来源: mt76/mt7925/mcu.c mt7925_mcu_uni_rx_unsolicited_event()
+ *       mt76/mt76_connac_mcu.h enum MCU_UNI_EVENT_xxx
  */
 static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 {
@@ -539,15 +552,19 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 
 	rxd = (struct mt7927_mcu_rxd *)skb->data;
 
-	/*
-	 * In UniCmd event format, the event CID is at offset 0x22
-	 * (the pkt_type_id field in our struct).
-	 */
-	if (le16_to_cpu(rxd->pkt_type_id) == MCU_UNI_EVENT_SCAN_DONE) {
+	dev_info(&dev->pdev->dev,
+		 "mcu-rx-event: eid=0x%02x ext_eid=0x%02x seq=%u option=0x%02x pkt_type_id=0x%04x len=%u\n",
+		 rxd->eid, rxd->ext_eid, rxd->seq, rxd->option,
+		 le16_to_cpu(rxd->pkt_type_id), le16_to_cpu(rxd->len));
+
+	/* MCU_UNI_EVENT_SCAN_DONE = 0x0e — 匹配 eid 字段
+	 * 来源: mt76/mt76_connac_mcu.h, mt7925/mcu.c line 587 */
+	if (rxd->eid == MCU_UNI_EVENT_SCAN_DONE) {
 		struct cfg80211_scan_info info = {
 			.aborted = false,
 		};
 
+		dev_info(&dev->pdev->dev, "scan_done event received!\n");
 		clear_bit(MT7927_SCANNING, &dev->scan_state);
 		if (dev->hw && dev->hw_init_done)
 			ieee80211_scan_completed(dev->hw, &info);

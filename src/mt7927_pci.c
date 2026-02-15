@@ -574,12 +574,25 @@ static int mt7927_mcu_wait_resp(struct mt7927_dev *dev, int timeout_ms)
 			/* 推进 tail */
 			ring->tail = (ring->tail + 1) % ring->ndesc;
 
-			/* 归还 buffer 到硬件 — 写回新 tail 位置
-			 * 注意: 不能写 idx，那会把 CIDX 从 255 降到 12，
-			 * 导致 DMA 认为 slot 13-255 全部不可用 */
+			/* 归还已处理的 slot 给 DMA — 写 CIDX = tail
+			 * tail 指向下一个待处理位置，告诉 DMA 之前的 slot 可重用
+			 * 参考: mt76/dma.c mt76_dma_kick_queue() 写 q->head
+			 * 不更新 CIDX 会导致 256 事件后 ring 耗尽 */
 			mt7927_wr(dev,
 				  MT_WPDMA_RX_RING_CIDX(ring->qid),
 				  ring->tail);
+
+			/* 清除 INT_STA 中对应 RX ring 的中断状态位
+			 * WFDMA 使用 W1C (Write-1-to-Clear) 语义
+			 * 参考: mt76/mt792x_dma.c mt792x_irq_tasklet()
+			 * 如果不清除，WFDMA 可能不再触发后续 DMA 写入 */
+			{
+				u32 int_sta = mt7927_rr(dev,
+							MT_WFDMA_HOST_INT_STA);
+				if (int_sta)
+					mt7927_wr(dev, MT_WFDMA_HOST_INT_STA,
+						  int_sta);
+			}
 
 			return 0;
 		}
@@ -748,8 +761,14 @@ static int mt7927_mcu_send_unicmd(struct mt7927_dev *dev, u16 cmd_id,
 
 	/* 通过 TX ring 15 发送 */
 	ret = mt7927_kick_ring_buf(dev, &dev->ring_wm, dma, len, true);
-	if (!ret && (option & UNI_CMD_OPT_ACK))
+	if (!ret && (option & UNI_CMD_OPT_ACK)) {
+		/* 暂时禁用 RX6 中断, 防止 NAPI 和轮询同时消费 RX ring 6
+		 * 不禁用会导致 race: NAPI 消费事件后推进 tail,
+		 * 轮询看到 tail 位置没有 DMA_DONE 就超时 */
+		mt7927_wr(dev, MT_WFDMA_INT_ENA_CLR, BIT(14));  /* RX6 int */
 		ret = mt7927_mcu_wait_resp(dev, 200);
+		mt7927_wr(dev, MT_WFDMA_INT_ENA_SET, BIT(14));  /* restore */
+	}
 
 	dma_free_coherent(&dev->pdev->dev, len, buf, dma);
 	return ret;
@@ -1411,27 +1430,14 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 				 "NIC_CAP 失败: %d (继续)\n", ret);
 	}
 
-	/* Step 3: Config 命令 (class=0x02)
+	/* Step 3: Config 命令 (class=0x02) — 已跳过!
 	 * 来源: Windows RE — Data: {1, 0, 0x70000}
-	 * SET 命令用 option=0x06 (UNI+SET, 不等ACK)
-	 * Windows可能不等待这些命令的响应 */
-	dev_info(&dev->pdev->dev, "发送 Config (class=0x02)\n");
-	{
-		__le32 cfg_data[3] = {
-			cpu_to_le32(1),
-			cpu_to_le32(0),
-			cpu_to_le32(0x70000),
-		};
+	 * 诊断发现: 此命令 (CID=0x02=BSS_INFO_UPDATE) 发送后 MCU 不再响应
+	 * 可能原因: payload 格式不匹配 BSS_INFO_UPDATE 的 TLV 格式
+	 * 导致固件 MCU 事件通道中断 */
+	dev_info(&dev->pdev->dev, "跳过 Config (class=0x02) — 诊断发现它破坏 MCU 通道\n");
 
-		ret = mt7927_mcu_send_unicmd(dev, UNI_CMD_ID_CONFIG,
-					      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
-					      cfg_data, sizeof(cfg_data));
-		if (ret)
-			dev_warn(&dev->pdev->dev,
-				 "Config 0x02 失败: %d (继续)\n", ret);
-	}
-
-	/* Step 4: Config 命令 (class=0xc0)
+	/* Step 4: Config 命令 (class=0xc0) — 暂时保留, 验证是否也有问题
 	 * 来源: Windows RE — Data: {0x820cc800, 0x3c200} */
 	dev_info(&dev->pdev->dev, "发送 Config (class=0xc0)\n");
 	{
@@ -1447,7 +1453,6 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 			dev_warn(&dev->pdev->dev,
 				 "Config 0xc0 失败: %d (继续)\n", ret);
 	}
-
 	/* Step 5: DBDC 设置 (class=0x28, MT6639/MT7927 only)
 	 * 来源: Windows RE — MtCmdUpdateDBDCSetting (FUN_1400d3c40)
 	 *   payload = 36 字节 (0x24), 初始调用参数: dbdc_en=1, rfBand=0
@@ -1481,7 +1486,6 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 			dev_warn(&dev->pdev->dev,
 				 "DBDC 0x28 失败: %d (继续)\n", ret);
 	}
-
 	/* Step 6: 1ms 延迟 (Windows: KeStallExecutionProcessor(10)*100) */
 	usleep_range(1000, 2000);
 
@@ -1521,7 +1525,6 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 			dev_warn(&dev->pdev->dev,
 				 "ScanConfig 失败: %d (继续)\n", ret);
 	}
-
 	/* Step 8: SetFWChipConfig (class=0xca)
 	 * 来源: Ghidra RE — AsicConnac3xSetFWChipConfig
 	 *   class=0xca, target=0xed, 配置字符串
@@ -1562,7 +1565,6 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 			dev_warn(&dev->pdev->dev,
 				 "ChipConfig 失败: %d (继续)\n", ret);
 	}
-
 	/* Step 9: SetLogLevelConfig (class=0xca)
 	 * 来源: Ghidra RE — AsicConnac3xSetLogLevelConfig
 	 *   class=0xca, target=0xed, 字符串 "EvtDrvnLogCatLvl"
@@ -1603,7 +1605,6 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 			dev_warn(&dev->pdev->dev,
 				 "LogConfig 失败: %d (继续)\n", ret);
 	}
-
 	/* Step 10: EFUSE_CTRL / EEPROM 模式设置
 	 * 参考: mt76/mt7925/init.c line 110 — mt7925_mcu_set_eeprom(dev)
 	 * 在 PostFwDownloadInit 之后、mac80211 注册之前 */
@@ -2344,6 +2345,17 @@ static int mt7927_mac80211_start(struct ieee80211_hw *hw)
 
 	dev_info(&dev->pdev->dev, "mac80211: start\n");
 
+	/* === DIAG: 测试 MCU 通道是否还活着 === */
+	dev_info(&dev->pdev->dev, "DIAG: 测试 MCU 通道...\n");
+	ret = mt7927_mcu_send_unicmd(dev, UNI_CMD_ID_NIC_CAP,
+				     UNI_CMD_OPT_SET_ACK, NULL, 0);
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "DIAG: MCU 通道已断! NIC_CAP 无响应 ret=%d\n", ret);
+	else
+		dev_info(&dev->pdev->dev,
+			 "DIAG: MCU 通道正常, NIC_CAP 成功\n");
+
 	/* 发送固件必需的扫描前置命令
 	 * 参考: mt76/mt7925/main.c mt7925_start() lines 314-329
 	 * 缺少这些命令，固件会静默丢弃 scan 请求！ */
@@ -2859,6 +2871,20 @@ static int mt7927_pci_probe(struct pci_dev *pdev,
 			 tx15_didx_before, tx15_didx_after,
 			 rx6_didx_before, rx6_didx_after,
 			 dev->ring_rx6.tail);
+		/* 检查所有 RX ring DIDX — 找出 MCU 响应去了哪里 */
+		{
+			int i;
+			for (i = 0; i < 8; i++) {
+				u32 base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(i));
+				u32 cnt = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(i));
+				u32 cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(i));
+				u32 didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(i));
+				if (base || cnt || cidx || didx)
+					dev_info(&pdev->dev,
+						 "诊断A: RX%d BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
+						 i, base, cnt, cidx, didx);
+			}
+		}
 	}
 
 	/* 诊断 dump */

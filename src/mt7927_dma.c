@@ -133,10 +133,11 @@ static struct sk_buff *mt7927_rx_process_one(struct mt7927_dev *dev,
 	desc->ctrl = cpu_to_le32(
 		FIELD_PREP(MT_DMA_CTL_SD_LEN0, ring->buf_size));
 
-	/* Advance tail and update HW CIDX to release slot back to DMA */
+	/* Advance tail — CIDX update is deferred to NAPI poll completion
+	 * to batch-release processed slots back to DMA.
+	 * Per-slot CIDX writes cause issues if done before NAPI completes. */
 	idx = ring->tail;
 	ring->tail = (ring->tail + 1) % ring->ndesc;
-	dma_wr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid), idx);
 
 	return skb;
 }
@@ -188,8 +189,12 @@ irqreturn_t mt7927_irq_handler(int irq, void *dev_instance)
 	if (!intr)
 		return IRQ_NONE;
 
-	/* Disable all interrupts immediately */
+	/* Disable all interrupts immediately to prevent storm */
 	dma_wr(dev, MT_WFDMA_HOST_INT_ENA, 0);
+
+	/* Debug: log interrupt bits (rate-limited via printk_ratelimited) */
+	dev_info_ratelimited(&dev->pdev->dev,
+			     "IRQ: intr=0x%08x\n", intr);
 
 	/* Save interrupt status for tasklet */
 	dev->int_mask = intr;
@@ -230,9 +235,30 @@ void mt7927_irq_tasklet(unsigned long data)
 	if (intr & MT_INT_TX_DONE_ALL)
 		napi_schedule(&dev->tx_napi);
 
-	/* MCU2HOST software interrupt — wake up MCU command waiters */
-	if (intr & MCU2HOST_SW_INT_STA)
+	/* MCU2HOST software interrupt — ACK and schedule NAPI
+	 * 来源: mt792x_dma.c mt792x_irq_tasklet() lines 48-57
+	 * 必须读取并写回 MT_MCU_CMD 寄存器来 ACK，
+	 * 否则固件认为事件未被处理，不会发送后续事件
+	 */
+	if (intr & MCU2HOST_SW_INT_STA) {
+		u32 intr_sw;
+
+		intr_sw = dma_rr(dev, MT_MCU_CMD_REG);
+		/* ACK: 写回清除 */
+		dma_wr(dev, MT_MCU_CMD_REG, intr_sw);
+
+		dev_info_ratelimited(&dev->pdev->dev,
+				     "MCU_CMD: intr_sw=0x%08x\n", intr_sw);
+
+		if (intr_sw & MT_MCU_CMD_WAKE_RX_PCIE) {
+			/* 固件通知有 RX 数据 — 调度数据 NAPI */
+			napi_schedule(&dev->napi_rx_data);
+			/* 也调度 MCU NAPI，因为 MCU 事件也可能通过此路径到达 */
+			napi_schedule(&dev->napi_rx_mcu);
+		}
+
 		wake_up(&dev->mcu_wait);
+	}
 
 	/* Re-enable interrupts */
 	dma_wr(dev, MT_WFDMA_HOST_INT_ENA, MT_WFDMA_INT_MASK_WIN);
@@ -268,6 +294,10 @@ int mt7927_poll_rx_data(struct napi_struct *napi, int budget)
 		done++;
 	}
 
+	/* Release processed slots back to DMA */
+	if (done > 0)
+		dma_wr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid), ring->tail);
+
 	if (done < budget) {
 		napi_complete_done(napi, done);
 		/* Re-enable RX ring 4 interrupt */
@@ -301,10 +331,21 @@ int mt7927_poll_rx_mcu(struct napi_struct *napi, int budget)
 		if (!skb)
 			break;
 
+		dev_info(&dev->pdev->dev,
+			 "rx_mcu: got skb len=%u tail=%u\n",
+			 skb->len, ring->tail);
+
 		/* Dispatch to MCU event handler (implemented in mac.c) */
 		mt7927_queue_rx_skb(dev, MT_RXQ_MCU, skb);
 		done++;
 	}
+
+	/* Release processed slots back to DMA by updating CIDX.
+	 * CIDX = ring->tail means "all slots up to tail are available for DMA".
+	 * Without this, after 256 events the ring is exhausted and DMA stalls.
+	 * 参考: mt76/dma.c mt76_dma_kick_queue() writes q->head to CIDX */
+	if (done > 0)
+		dma_wr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid), ring->tail);
 
 	if (done < budget) {
 		napi_complete_done(napi, done);

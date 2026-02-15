@@ -1059,12 +1059,18 @@ enum tx_frag_idx {
 	MT_TX_FRAG_LAST,
 };
 
-/* RX 包类型 */
-#define PKT_TYPE_NORMAL			0
-#define PKT_TYPE_RX_EVENT		1
-#define PKT_TYPE_NORMAL_MCU		1
+/* RX 包类型 — CONNAC3 值, 来源: mt76/mt76_connac.h enum rx_pkt_type
+ * 注意: 之前错误地用了 CONNAC2 值 (NORMAL=0, RX_EVENT=1)
+ * CONNAC3 的 PKT_TYPE 字段在 RXD[0] bits 31:27 */
+#define PKT_TYPE_TXS			0
+#define PKT_TYPE_TXRXV			1
+#define PKT_TYPE_NORMAL			2
+#define PKT_TYPE_RX_DUP_RFB		3
+#define PKT_TYPE_RX_TMR			4
+#define PKT_TYPE_RETRIEVE		5
 #define PKT_TYPE_TXRX_NOTIFY		6
-#define PKT_TYPE_TXS			7
+#define PKT_TYPE_RX_EVENT		7
+#define PKT_TYPE_NORMAL_MCU		8
 
 /* PHY 类型 */
 enum mt76_phy_type {
