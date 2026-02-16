@@ -1432,11 +1432,13 @@ struct mt7927_mcu_scan_chinfo_event {
 enum {
 	UNI_BSS_INFO_BASIC = 0,
 	UNI_BSS_INFO_RLM = 2,
+	UNI_BSS_INFO_PROTECT = 3,
 	UNI_BSS_INFO_BSS_COLOR = 5,
 	UNI_BSS_INFO_HE = 7,
 	UNI_BSS_INFO_RATE = 11,
 	UNI_BSS_INFO_QBSS = 15,
 	UNI_BSS_INFO_SEC = 16,
+	UNI_BSS_INFO_IFS_TIME = 23,
 	UNI_BSS_INFO_MLD = 26,
 };
 
@@ -1514,16 +1516,22 @@ struct sta_req_hdr {
 	u8 __rsv;
 } __packed;
 
-/* DEV_INFO_ACTIVE TLV (tag=1) */
+/* DEV_INFO command header — MT6639: UNI_CMD_DEVINFO
+ * OwnMacIdx + DbdcIdx 在 header 中, 不在 TLV 里 */
+struct dev_info_hdr {
+	u8 omac_idx;
+	u8 band_idx;     /* 0xFF = BAND_AUTO */
+	u8 __rsv[2];
+} __packed;
+
+/* DEV_INFO_ACTIVE TLV (tag=0) — MT6639: UNI_CMD_DEVINFO_ACTIVE
+ * 注意: band_idx 和 omac_idx 在 header 中, TLV 只有 active + mac */
 struct dev_info_active_tlv {
 	__le16 tag;
 	__le16 len;
 	u8 active;
-	u8 band_idx;
-	u8 omac_idx;
-	u8 __rsv;
+	u8 __pad;
 	u8 omac_addr[ETH_ALEN];
-	u8 pad[2];
 } __packed;
 
 /* BSS_INFO_BASIC TLV (tag=0)
@@ -1571,7 +1579,7 @@ struct bss_rlm_tlv {
 struct bss_rate_tlv {
 	__le16 tag;
 	__le16 len;
-	u8 __rsv1[2];
+	__le16 operational_rate;	/* 所有支持的速率 bitmap (was __rsv1) */
 	__le16 basic_rate;	/* 基本速率 bitmap */
 	__le16 bc_trans;	/* broadcast 传输速率索引 */
 	__le16 mc_trans;	/* multicast 传输速率索引 */
@@ -1583,6 +1591,38 @@ struct bss_rate_tlv {
 
 #define HR_DSSS_ERP_BASIC_RATE	GENMASK(3, 0)	/* 2.4G: 1/2/5.5/11 Mbps */
 #define OFDM_BASIC_RATE		(BIT(6) | BIT(8) | BIT(10))  /* 5G: 6/12/24 Mbps */
+/* 5GHz: all OFDM rates (6/9/12/18/24/36/48/54 Mbps) */
+#define OFDM_RATE_SET		0x3FC0
+/* 2.4GHz: all HR-DSSS + OFDM rates */
+#define ERP_RATE_SET		0x3FFF
+
+/* BSS_INFO_PROTECT TLV (tag=3) — 保护模式
+ * MT6639: nic_uni_cmd_event.h line 350
+ * 初始 auth 阶段 protect_mode=0 (无保护) */
+struct bss_protect_tlv {
+	__le16 tag;
+	__le16 len;
+	__le32 protect_mode;
+} __packed;
+
+/* BSS_INFO_IFS_TIME TLV (tag=0x17) — 帧间距时间
+ * 5GHz 必须用 short slot (9μs), 否则 DIFS 计算错误
+ * MT6639: nic_uni_cmd_event.h line 562 */
+struct bss_ifs_time_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 slot_valid;
+	u8 sifs_valid;
+	u8 rifs_valid;
+	u8 eifs_valid;
+	__le16 slot_time;
+	__le16 sifs_time;
+	__le16 rifs_time;
+	__le16 eifs_time;
+	u8 eifs_cck_valid;
+	u8 pad;
+	__le16 eifs_cck_time;
+} __packed;
 
 /* BSS_INFO_MLD TLV (tag=0x1A) — WiFi 7/CONNAC3 MLD 上下文
  * MT6639 固件要求此 TLV，即使非 MLO 连接也需要
@@ -1657,6 +1697,27 @@ struct sta_rec_hdr_trans {
 	u8 to_ds;
 	u8 dis_rx_hdr_tran;
 	u8 __rsv;
+} __packed;
+
+/* STA_REC_HT_INFO TLV (tag=0x09) — MT6639: UNI_CMD_STAREC_HT_INFO
+ * 告诉固件 STA 的 HT 能力 */
+struct sta_rec_ht_info {
+	__le16 tag;
+	__le16 len;
+	__le16 ht_cap;
+	__le16 ht_ext_cap;
+} __packed;
+
+/* STA_REC_VHT_INFO TLV (tag=0x0A) — MT6639: UNI_CMD_STAREC_VHT_INFO
+ * 告诉固件 STA 的 VHT 能力 */
+struct sta_rec_vht_info {
+	__le16 tag;
+	__le16 len;
+	__le32 vht_cap;
+	__le16 vht_rx_mcs_map;
+	__le16 vht_tx_mcs_map;
+	u8 rts_bw_sig;
+	u8 __rsv[3];
 } __packed;
 
 /* STA_REC_KEY_V3 TLV (tag=0x27) — 密钥安装 */

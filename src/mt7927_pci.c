@@ -2340,21 +2340,26 @@ static int mt7927_mcu_uni_add_dev(struct mt7927_dev *dev,
 				  struct ieee80211_vif *vif, bool enable)
 {
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
+	/* MT6639: UNI_CMD_DEVINFO header + DEVINFO_ACTIVE TLV
+	 * header 包含 OwnMacIdx + DbdcIdx, TLV 只有 active + mac
+	 * 之前 rsv[4] 全零: DbdcIdx=0 (只用 band0), MAC 偏移 2 字节!
+	 * 已修复: header 设正确值, TLV 匹配 MT6639 的 12 字节格式 */
 	struct {
-		u8 rsv[4];
+		struct dev_info_hdr hdr;
 		struct dev_info_active_tlv tlv;
 	} __packed req = {};
+
+	req.hdr.omac_idx = mvif->omac_idx;
+	req.hdr.band_idx = 0xff; /* ENUM_BAND_AUTO — 固件自动选择 DBDC band */
 
 	req.tlv.tag = cpu_to_le16(UNI_DEV_INFO_ACTIVE);
 	req.tlv.len = cpu_to_le16(sizeof(req.tlv));
 	req.tlv.active = enable;
-	req.tlv.band_idx = mvif->band_idx;
-	req.tlv.omac_idx = mvif->omac_idx;
 	memcpy(req.tlv.omac_addr, vif->addr, ETH_ALEN);
 
 	dev_info(&dev->pdev->dev,
-		 "mcu: DEV_INFO active=%d omac=%d band=%d addr=%pM\n",
-		 enable, mvif->omac_idx, mvif->band_idx, vif->addr);
+		 "mcu: DEV_INFO active=%d omac=%d band=AUTO addr=%pM (size=%zu)\n",
+		 enable, mvif->omac_idx, vif->addr, sizeof(req));
 
 	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_DEV_INFO, &req,
 					   sizeof(req));
@@ -2370,6 +2375,8 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 		struct bss_req_hdr hdr;
 		struct mt76_connac_bss_basic_tlv basic;
 		struct bss_rlm_tlv rlm;
+		struct bss_protect_tlv protect;
+		struct bss_ifs_time_tlv ifs_time;
 		struct bss_rate_tlv rate;
 		struct bss_mld_tlv mld;
 	} __packed req = {};
@@ -2452,16 +2459,40 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 		}
 	}
 
+	/* === BSS_PROTECT TLV (tag=3) — 保护模式 ===
+	 * 初始 auth 阶段无保护, protect_mode=0
+	 * MT6639: nic_uni_cmd_event.c nicUniCmdBssInfoProtect() */
+	req.protect.tag = cpu_to_le16(UNI_BSS_INFO_PROTECT);
+	req.protect.len = cpu_to_le16(sizeof(req.protect));
+	req.protect.protect_mode = 0;
+
+	/* === BSS_IFS_TIME TLV (tag=0x17) — 帧间距时间 ===
+	 * 5GHz 必须用 short slot (9μs), 否则 DIFS=56μs (应为 34μs)
+	 * MT6639: nic_uni_cmd_event.c nicUniCmdBssInfoIfsTime() */
+	req.ifs_time.tag = cpu_to_le16(UNI_BSS_INFO_IFS_TIME);
+	req.ifs_time.len = cpu_to_le16(sizeof(req.ifs_time));
+	req.ifs_time.slot_valid = 1;
+	req.ifs_time.sifs_valid = 1;
+	if (chan && chan->band != NL80211_BAND_2GHZ) {
+		req.ifs_time.slot_time = cpu_to_le16(9);   /* short slot: 5GHz/6GHz */
+		req.ifs_time.sifs_time = cpu_to_le16(16);   /* OFDM SIFS */
+	} else {
+		req.ifs_time.slot_time = cpu_to_le16(9);   /* short slot by default */
+		req.ifs_time.sifs_time = cpu_to_le16(10);   /* 2.4GHz SIFS */
+	}
+
 	/* === BSS_RATE TLV (tag=0x0B) — 速率集合 ===
 	 * 告诉固件此 BSS 可用的速率, 缺少时固件可能无法发送管理帧
-	 * 来源: mt7925/mcu.c mt7925_mcu_bss_bmc_tlv() */
+	 * 来源: mt6639/nic/nic_uni_cmd_event.c line 1694 */
 	req.rate.tag = cpu_to_le16(UNI_BSS_INFO_RATE);
 	req.rate.len = cpu_to_le16(sizeof(req.rate));
 	if (chan) {
 		if (chan->band == NL80211_BAND_2GHZ) {
+			req.rate.operational_rate = cpu_to_le16(ERP_RATE_SET);
 			req.rate.basic_rate = cpu_to_le16(HR_DSSS_ERP_BASIC_RATE);
 			req.rate.short_preamble = 1;
 		} else {
+			req.rate.operational_rate = cpu_to_le16(OFDM_RATE_SET);
 			req.rate.basic_rate = cpu_to_le16(OFDM_BASIC_RATE);
 			req.rate.short_preamble = 0;
 		}
@@ -2505,18 +2536,17 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 {
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 	struct mt7927_sta *msta;
-	/* mt7925 在每次 STA_REC 中发送 ~10 个 TLV (PHY/HT/VHT/HE/RA/STATE...)
-	 * 我们发送 5 个:
-	 *   BASIC(0) + RA(1) + STATE(7) + PHY(0x15) + HDR_TRANS(0x2B)
-	 *
-	 * PHY TLV 告诉固件 basic_rate_set 和 phy_type — 缺少它固件
-	 * 不知道该用什么 PHY 模式和速率发帧
-	 * 来源: mt7925/mcu.c mt7925_mcu_sta_phy_tlv() */
+	/* MT6639 发 10 个 TLV, 我们发 7 个:
+	 *   BASIC(0) + RA(1) + STATE(7) + HT(9) + VHT(0xA) + PHY(0x15) + HDR_TRANS(0x2B)
+	 * 新增 HT_INFO + VHT_INFO — 告诉固件 STA 的 HT/VHT 能力
+	 * 缺少这些 TLV 可能导致固件无法正确创建 WTBL */
 	struct {
 		struct sta_req_hdr hdr;
 		struct sta_rec_basic basic;
 		struct sta_rec_ra_info ra;
 		struct sta_rec_state state;
+		struct sta_rec_ht_info ht;
+		struct sta_rec_vht_info vht;
 		struct sta_rec_phy phy;
 		struct sta_rec_hdr_trans hdr_trans;
 	} __packed req = {};
@@ -2532,7 +2562,7 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	req.hdr.wlan_idx_hi = (msta->wcid.idx >> 8) & 0xff;
 	req.hdr.muar_idx = mvif->omac_idx;
 	req.hdr.is_tlv_append = 1;
-	req.hdr.tlv_num = cpu_to_le16(5); /* BASIC + RA + STATE + PHY + HDR_TRANS */
+	req.hdr.tlv_num = cpu_to_le16(7); /* BASIC+RA+STATE+HT+VHT+PHY+HDR_TRANS */
 
 	/* STA_REC_BASIC (tag=0)
 	 * 来源: mt76/mt76_connac_mcu.c mt76_connac_mcu_sta_basic_tlv()
@@ -2541,10 +2571,13 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	 * 删除 STA: DISCONNECT, 无 NEW */
 	req.basic.tag = cpu_to_le16(STA_REC_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
+	/* MT6639 ext_cmd + gl_hook_api: STA_REC always uses CONNECTION_INFRA_STA
+	 * (0x10001) regardless of peer type. UniCmd path differs but ext_cmd
+	 * path is what the firmware expects for WTBL creation. */
 	if (vif->type == NL80211_IFTYPE_STATION)
-		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
-	else
 		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
+	else
+		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
 
 	if (enable) {
 		req.basic.conn_state = conn_state;
@@ -2599,9 +2632,27 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	req.state.flags = 0;
 	req.state.state = 0; /* STA_STATE_1 (auth 前) */
 
-	/* STA_REC_PHY (tag=0x15) — PHY type + basic rate set
-	 * 来源: mt7925/mcu.c mt7925_mcu_sta_phy_tlv()
-	 * 固件需要知道 phy_type 才能选择正确的 PHY 模式发帧 */
+	/* STA_REC_HT_INFO (tag=0x09) — HT 能力
+	 * MT6639: nicUniCmdStaRecTagHtInfo() — 仅当 ht_cap 非零时发送
+	 * 固件需要 HT 能力来创建正确的 WTBL 条目 */
+	req.ht.tag = cpu_to_le16(STA_REC_HT);
+	req.ht.len = cpu_to_le16(sizeof(req.ht));
+	if (sta && sta->deflink.ht_cap.ht_supported)
+		req.ht.ht_cap = cpu_to_le16(sta->deflink.ht_cap.cap);
+
+	/* STA_REC_VHT_INFO (tag=0x0A) — VHT 能力
+	 * MT6639: nicUniCmdStaRecTagVhtInfo() — 仅当 vht_cap 非零时发送
+	 * 5GHz 必需, 2.4GHz 可选 */
+	req.vht.tag = cpu_to_le16(STA_REC_VHT);
+	req.vht.len = cpu_to_le16(sizeof(req.vht));
+	if (sta && sta->deflink.vht_cap.vht_supported) {
+		req.vht.vht_cap = cpu_to_le32(sta->deflink.vht_cap.cap);
+		req.vht.vht_rx_mcs_map = cpu_to_le16(
+			sta->deflink.vht_cap.vht_mcs.rx_mcs_map);
+		req.vht.vht_tx_mcs_map = cpu_to_le16(
+			sta->deflink.vht_cap.vht_mcs.tx_mcs_map);
+	}
+
 	/* STA_REC_PHY (tag=0x15) — PHY type + basic rate set
 	 * MT6639 固件使用自己的 PHY 枚举:
 	 *   HR_DSSS=BIT(0), ERP=BIT(1), OFDM=BIT(2), HT=BIT(3), VHT=BIT(4)
