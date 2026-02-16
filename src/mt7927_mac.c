@@ -101,9 +101,10 @@ static void mt7927_mac_write_txwi_80211(struct mt7927_dev *dev, __le32 *txwi,
 	      FIELD_PREP(MT_TXD1_HDR_FORMAT_V3, MT_HDR_FORMAT_802_11) |
 	      FIELD_PREP(MT_TXD1_HDR_INFO, mac_hdr_len / 2);
 
-	/* 管理帧需要固定速率发送 (基本速率)
-	 * 来源: mt7925/mac.c line 682-684 */
-	if (!ieee80211_is_data(fc))
+	/* MT6639: 管理帧设 FIXED_RATE — nicTxSetPktLowestFixedRate()
+	 * 之前禁用过 (实验 B), 但现在走 CMD ring 路径后应该启用
+	 * FIXED_RATE_IDX=0 由主函数设置, 这里只设 DW1 bit31 */
+	if (ieee80211_is_mgmt(fc))
 		val |= MT_TXD1_FIXED_RATE;
 
 	txwi[1] |= cpu_to_le32(val);
@@ -136,12 +137,20 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	bool is_8023 = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
+	bool is_mgmt = false;
 	u8 p_fmt = MT_TX_TYPE_CT; /* Cut-through: TXD+TXP in coherent, payload separate */
 	u8 q_idx;
 	u16 wlan_idx = wcid ? wcid->idx : 0;
 	u8 omac_idx = 0;
 	u8 band_idx = 0;
 	u32 val;
+
+	/* 检测管理帧 (auth/assoc/probe 等) — 走完全不同的 TX 路径 */
+	if (!is_8023 && skb->len >= 2) {
+		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+
+		is_mgmt = ieee80211_is_mgmt(hdr->frame_control);
+	}
 
 	/* Get VIF info from WCID if available */
 	if (wcid && wcid->sta) {
@@ -154,14 +163,26 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 		}
 	}
 
-	/* Determine queue index */
+	/* Determine queue index and packet format
+	 *
+	 * MT6639: 管理帧走 TC4 → CMD ring 15, PKT_FMT=2(CMD), Q_IDX=0(MCU_Q0)
+	 *   Q_IDX=0 = MCU forwards frame to LMAC for RF transmission
+	 *   Q_IDX=0x20 = MCU processes internally (for UniCmd) — NOT for mgmt!
+	 *   Q_IDX=0x10 = ALTX0/beacon — NOT for auth/assoc!
+	 * 来源: mt6639/nic_tx.c arTcResourceControl[TC4], nic_txd_v3.c
+	 *
+	 * 数据帧: PKT_FMT=0 (CT), Q_IDX from AC mapping, ring 0
+	 */
 	if (beacon) {
 		q_idx = MT_TX_MCU_PORT_RX_Q0;
 		p_fmt = MT_TX_TYPE_FW;
+	} else if (is_mgmt) {
+		/* MT6639: 管理帧 PKT_FMT=2(CMD) + Q_IDX=0(MCU_Q0)
+		 * TXD+frame inline on CMD ring 15, no TXP scatter-gather */
+		p_fmt = MT_TX_TYPE_CMD;
+		q_idx = 0;
 	} else if (!is_8023) {
-		/* 管理帧 (auth/assoc/probe) 必须走 ALTX0 队列
-		 * 来源: mt7925/mac.c line 757-763, qid >= MT_TXQ_PSD → ALTX0 */
-		q_idx = 0x10; /* MT_LMAC_ALTX0 */
+		q_idx = 0x10; /* MT_LMAC_ALTX0 — 非管理帧的 802.11 帧 */
 	} else {
 		q_idx = mt7927_lmac_mapping(skb_get_queue_mapping(skb));
 	}
@@ -186,8 +207,18 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 	else
 		mt7927_mac_write_txwi_80211(dev, txwi, skb, key);
 
-	/* TXD[3]: TX control flags */
-	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 15);
+	/* TXD[2]: REMAINING_LIFE_TIME — MT6639 设 2000ms for mgmt frames
+	 * CONNAC3 单位: 64 TU (2^6 * 1024us ≈ 65.5ms)
+	 * 2000ms ≈ 30 units (2000000 / 1024 / 64 = 30)
+	 * 值 0 = "no lifetime" — 不确定是否等于 "无限" 还是 "立即丢弃"
+	 * MT6639 管理帧: NIC_TX_MGMT_REMAINING_TX_TIME = 2000ms → 30 units */
+	if (!is_8023)
+		txwi[2] |= cpu_to_le32(FIELD_PREP(MT_TXD2_MAX_TX_TIME, 30));
+
+	/* TXD[3]: TX control flags
+	 * MT6639: NIC_TX_MGMT_DEFAULT_RETRY_COUNT_LIMIT = 30 for mgmt
+	 *         NIC_TX_DATA_DEFAULT_RETRY_COUNT_LIMIT = 30 for data */
+	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 30);
 
 	if (key)
 		val |= MT_TXD3_PROTECT_FRAME;
@@ -206,26 +237,54 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 		val |= MT_TXD5_TX_STATUS_HOST;
 	txwi[5] = cpu_to_le32(val);
 
-	/* TXD[6]: MSDU count, DAS, disable MAT */
+	/* TXD[6]: MSDU count, disable MAT
+	 * MT6639: 管理帧只设 DIS_MAT + MSDU_CNT=1, 不设 DAS
+	 * DAS (Destination Address Search) 只用于数据帧 WTBL DA 查找 */
 	val = FIELD_PREP(MT_TXD6_MSDU_CNT, 1) |
-	      MT_TXD6_DAS |
 	      MT_TXD6_DIS_MAT;
+	if (is_8023)
+		val |= MT_TXD6_DAS;
 	txwi[6] = cpu_to_le32(val);
 
-	/* 使用固定速率时: 设置 TX_RATE + 禁用 BA
-	 * 来源: mt7925/mac.c line 817-834
-	 * MT792x_BASIC_RATES_TBL = 11 (基址)
-	 * 5GHz 需要跳过 4 个 CCK 速率 → index 15 (OFDM 6Mbps)
-	 * 2.4GHz 用 index 11 (CCK 1Mbps) */
+	/* 固定速率设置
+	 * MT6639 管理帧: FIXED_RATE_IDX=0, BA_DISABLE
+	 * 数据帧 (mt7925 风格): rate_idx=11(2.4G)/15(5G) */
 	if (txwi[1] & cpu_to_le32(MT_TXD1_FIXED_RATE)) {
-		u8 rate_idx = 11; /* 2.4GHz: CCK 1Mbps */
+		if (is_mgmt) {
+			/* MT6639: FIXED_RATE_IDX=0 — 固件用 STA_REC 配置的速率 */
+			txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, 0));
+		} else {
+			u8 rate_idx = 11; /* 2.4GHz: CCK 1Mbps */
 
-		if (dev->hw && dev->hw->conf.chandef.chan &&
-		    dev->hw->conf.chandef.chan->band != NL80211_BAND_2GHZ)
-			rate_idx = 15; /* 5GHz/6GHz: OFDM 6Mbps */
+			if (dev->hw && dev->hw->conf.chandef.chan &&
+			    dev->hw->conf.chandef.chan->band != NL80211_BAND_2GHZ)
+				rate_idx = 15; /* 5GHz/6GHz: OFDM 6Mbps */
 
-		txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, rate_idx));
+			txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, rate_idx));
+		}
 		txwi[3] |= cpu_to_le32(MT_TXD3_BA_DISABLE);
+	}
+
+	/* DW7: TXD_LENGTH — TXD_LEN_1_PAGE 是 C enum 值 0 (经 Windows RE 验证)
+	 * DW7[31:30]=0 已经是 memset 后的默认值, 不需要显式设置 */
+
+	/* Debug: dump TXD+TXP (64 bytes) + 802.11 header for auth/assoc frames */
+	if (!is_8023 && skb->len >= 24) {
+		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+
+		if (ieee80211_is_auth(hdr->frame_control) ||
+		    ieee80211_is_assoc_req(hdr->frame_control)) {
+			dev_info(&dev->pdev->dev,
+				 "TX-DBG: fc=0x%04x len=%u wlan=%u omac=%u band=%u q=0x%x\n",
+				 le16_to_cpu(hdr->frame_control),
+				 skb->len, wlan_idx, omac_idx, band_idx, q_idx);
+			dev_info(&dev->pdev->dev,
+				 "TX-DBG: DA=%pM SA=%pM BSSID=%pM\n",
+				 hdr->addr1, hdr->addr2, hdr->addr3);
+			/* Dump TXD (32) + TXP (32) = 64 bytes */
+			print_hex_dump(KERN_INFO, "TXD+TXP: ", DUMP_PREFIX_OFFSET,
+				       16, 4, txwi, 64, false);
+		}
 	}
 }
 
@@ -289,19 +348,26 @@ int mt7927_tx_prepare_skb(struct mt7927_dev *dev, struct sk_buff *skb,
 		}
 	}
 
-	/* 2. DMA map payload (skb->data, not prepended with TXD) */
-	payload_dma = dma_map_single(&dev->pdev->dev, skb->data, skb->len,
-				     DMA_TO_DEVICE);
-	if (dma_mapping_error(&dev->pdev->dev, payload_dma)) {
-		spin_lock_irqsave(&dev->tx_token.lock, flags);
-		dev->tx_token.skb[token] = NULL;
-		spin_unlock_irqrestore(&dev->tx_token.lock, flags);
-		return -ENOMEM;
+	/* 2. 诊断实验: 用 coherent buffer 替代 dma_map_single
+	 * 如果 stat 变化，说明问题在 DMA 地址映射 */
+	if (dev->tx_payload_buf && skb->len <= 2048) {
+		memcpy(dev->tx_payload_buf, skb->data, skb->len);
+		payload_dma = dev->tx_payload_dma;
+		/* 标记为 coherent — TXFREE 中不要 dma_unmap */
+		dev->tx_token.dma_addr[token] = 0; /* 0 = skip unmap */
+		dev->tx_token.dma_len[token] = 0;
+	} else {
+		payload_dma = dma_map_single(&dev->pdev->dev, skb->data,
+					     skb->len, DMA_TO_DEVICE);
+		if (dma_mapping_error(&dev->pdev->dev, payload_dma)) {
+			spin_lock_irqsave(&dev->tx_token.lock, flags);
+			dev->tx_token.skb[token] = NULL;
+			spin_unlock_irqrestore(&dev->tx_token.lock, flags);
+			return -ENOMEM;
+		}
+		dev->tx_token.dma_addr[token] = payload_dma;
+		dev->tx_token.dma_len[token] = skb->len;
 	}
-
-	/* Save mapping info for TXFREE cleanup */
-	dev->tx_token.dma_addr[token] = payload_dma;
-	dev->tx_token.dma_len[token] = skb->len;
 
 	/* 3. Compute txwi location in coherent pool */
 	txwi = (__le32 *)(dev->txwi_buf + token * MT7927_TXWI_SIZE);
@@ -383,6 +449,16 @@ void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
 		 msdu_cnt, (unsigned long)FIELD_GET(MT_TXFREE1_VER, hdr1),
 		 skb->len);
 
+	/* Debug: hex dump first 5 DWs (20 bytes) of TXFREE */
+	{
+		int dbg_dw = min_t(int, skb->len / 4, 5);
+		int d;
+		for (d = 0; d < dbg_dw; d++)
+			dev_info(&dev->pdev->dev,
+				 "TXFREE DW%d: 0x%08x\n",
+				 d, le32_to_cpu(data[d]));
+	}
+
 	/* Parse per-MSDU info words starting at DW2.
 	 *
 	 * TXFREE word types:
@@ -410,12 +486,86 @@ void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
 			u8 stat = FIELD_GET(MT_TXFREE_INFO_STAT, info);
 			u8 count = FIELD_GET(MT_TXFREE_INFO_COUNT, info);
 
-			if (stat)
+			if (stat) {
+				/* Hardware diagnostic: read MIB/PLE/PSE registers
+				 * to determine if frame actually went out on air.
+				 *
+				 * Band 0 MIB base: 0x820ed000
+				 * Band 1 MIB base: 0x820fd000 (= Band 0 + 0x10000)
+				 * 5GHz = band_idx 1, 2.4GHz = band_idx 0 */
+				u32 mib0_tx_ok, mib0_tx_fail, mib0_tx_retry;
+				u32 mib1_tx_ok, mib1_tx_fail, mib1_tx_retry;
+				u32 ple_empty, pse_empty;
+				u32 ple_sta0, ple_sta1;
+
+				/* Band 0 MIB (2.4GHz) */
+				mib0_tx_ok    = mt7927_rr_l1(dev, 0x820ed68c); /* TSCR7 SU_TX_OK */
+				mib0_tx_fail  = mt7927_rr_l1(dev, 0x820ed690); /* TSCR8 SU_TX_FAIL */
+				mib0_tx_retry = mt7927_rr_l1(dev, 0x820ed6a0); /* TSCR12 TX_RETRY */
+
+				/* Band 1 MIB (5GHz) — 重要! */
+				mib1_tx_ok    = mt7927_rr_l1(dev, 0x820fd68c);
+				mib1_tx_fail  = mt7927_rr_l1(dev, 0x820fd690);
+				mib1_tx_retry = mt7927_rr_l1(dev, 0x820fd6a0);
+
+				/* PLE/PSE queue status */
+				ple_empty = mt7927_rr_l1(dev, 0x820c0360);
+				pse_empty = mt7927_rr_l1(dev, 0x820c80b0);
+
+				/* PLE station info — TX queued packets */
+				ple_sta0 = mt7927_rr_l1(dev, 0x820c0024);
+				ple_sta1 = mt7927_rr_l1(dev, 0x820c0028);
+
 				dev_info(&dev->pdev->dev,
-					 "TXFREE: hdr stat=%u count=%u wlan=%lu\n",
+					 "TX-FAIL: stat=%u count=%u wlan=%lu\n",
 					 stat, count,
 					 (unsigned long)FIELD_GET(
 						MT_TXFREE_INFO_WLAN_ID, info));
+				dev_info(&dev->pdev->dev,
+					 "  Band0: TX_OK=%u FAIL=%u RETRY=%u\n",
+					 mib0_tx_ok, mib0_tx_fail, mib0_tx_retry);
+				dev_info(&dev->pdev->dev,
+					 "  Band1: TX_OK=%u FAIL=%u RETRY=%u\n",
+					 mib1_tx_ok, mib1_tx_fail, mib1_tx_retry);
+				dev_info(&dev->pdev->dev,
+					 "  PLE_EMPTY=0x%08x PSE_EMPTY=0x%08x\n",
+					 ple_empty, pse_empty);
+				dev_info(&dev->pdev->dev,
+					 "  PLE_STA0=0x%08x PLE_STA1=0x%08x\n",
+					 ple_sta0, ple_sta1);
+
+				/* DMASHDL state: check if BYPASS is still on,
+				 * and read group quotas / queue mapping.
+				 * These are BAR0-accessible (no L1 remap needed). */
+				{
+					u32 dmashdl_sw, dmashdl_opt, dmashdl_grp0;
+					u32 dmashdl_qmap0, dmashdl_status;
+					u32 glo_cfg;
+
+					dmashdl_sw = mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL);
+					dmashdl_opt = mt7927_rr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL);
+					dmashdl_grp0 = mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(0));
+					dmashdl_qmap0 = mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0);
+					dmashdl_status = mt7927_rr(dev, MT_HIF_DMASHDL_STATUS_RD);
+					glo_cfg = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+
+					dev_info(&dev->pdev->dev,
+						 "  DMASHDL: SW=0x%08x (BYPASS=%d) OPT=0x%08x\n",
+						 dmashdl_sw,
+						 !!(dmashdl_sw & MT_HIF_DMASHDL_BYPASS_EN),
+						 dmashdl_opt);
+					dev_info(&dev->pdev->dev,
+						 "  DMASHDL: GRP0=0x%08x QMAP0=0x%08x STATUS=0x%08x\n",
+						 dmashdl_grp0, dmashdl_qmap0,
+						 dmashdl_status);
+					dev_info(&dev->pdev->dev,
+						 "  GLO_CFG=0x%08x (FWDL_BYPASS=%d TX_EN=%d RX_EN=%d)\n",
+						 glo_cfg,
+						 !!(glo_cfg & MT_GLO_CFG_FW_DWLD_BYPASS_DMASHDL),
+						 !!(glo_cfg & MT_WFDMA_GLO_CFG_TX_DMA_EN),
+						 !!(glo_cfg & MT_WFDMA_GLO_CFG_RX_DMA_EN));
+				}
+			}
 			continue;
 		}
 
@@ -802,6 +952,50 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 			/* 通过 scan_work 延迟通知 mac80211, 避免从 NAPI 上下文直接调用 */
 			schedule_delayed_work(&dev->scan_work, 0);
 		}
+	}
+
+	/* ROC_GRANT 事件 (eid=0x27 = MCU_UNI_CMD_ROC)
+	 * 固件确认已切换到 ROC 请求的信道, 唤醒 mgd_prepare_tx() 中的等待
+	 *
+	 * 关键: 从 ROC_GRANT TLV 提取 dbdcband 字段来更新 band_idx!
+	 * MT6639 是 DBDC 芯片, 5GHz 和 2.4GHz 使用不同的 radio (band 0/1).
+	 * 固件通过 ROC_GRANT 返回实际分配的 band, 驱动必须用它来:
+	 *   1. 更新 VIF 的 band_idx
+	 *   2. TXD 的 TGID 字段使用正确的 band
+	 *   3. BSS_INFO 使用正确的 band_idx
+	 * 如果不更新, TXD 会带错误的 TGID → 固件丢弃 TX 帧 (stat=1)
+	 *
+	 * ROC_GRANT TLV layout (mt7925/mt7925.h mt7925_roc_grant_tlv):
+	 *   +0: tag(2) +2: len(2) +4: bss_idx +5: tokenid +6: status
+	 *   +7: primarychannel +8: rfsco +9: rfband +10: channelwidth
+	 *   +11: centerfreqseg1 +12: centerfreqseg2 +13: reqtype
+	 *   +14: dbdcband +15: rsv +16: max_interval(4)
+	 *
+	 * TLV body starts at sizeof(mt76_connac2_mcu_rxd) = 48 bytes from skb start
+	 * (our mt7927_mcu_rxd is 44 bytes, but wire format has 4 extra padding bytes)
+	 */
+	if (rxd->eid == 0x27) {
+		u8 dbdcband = 0xff;
+		u8 status = 0;
+		u8 primary_ch = 0;
+
+		/* Parse ROC_GRANT TLV if event is large enough
+		 * TLV starts at offset 48 (mt76_connac2_mcu_rxd size)
+		 * dbdcband is at TLV offset 14 → skb offset 48+14=62 */
+		if (skb->len >= 48 + 20) { /* 48 hdr + 20 TLV min size */
+			u8 *tlv = skb->data + 48;
+
+			status = tlv[6];
+			primary_ch = tlv[7];
+			dbdcband = tlv[14];
+		}
+
+		dev->roc_grant_band_idx = dbdcband;
+		dev_info(&dev->pdev->dev,
+			 "mcu-evt: ROC_GRANT status=%u ch=%u dbdcband=%u\n",
+			 status, primary_ch, dbdcband);
+		dev->roc_active = true;
+		complete(&dev->roc_complete);
 	}
 
 out:

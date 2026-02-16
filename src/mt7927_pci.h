@@ -234,15 +234,8 @@
 #define MT_HIF_DMASHDL_BASE                  0xd6000
 #define MT_HIF_DMASHDL(ofs)                  (MT_HIF_DMASHDL_BASE + (ofs))
 
-/* DMASHDL 启用寄存器 (PostFwDownloadInit 唯一寄存器写入)
- * BAR0+0xd6060 = bus 0x7c026060
- * 来源: register_playbook.md 行 201-206, 389, analysis_windows_full_init.md 行 245-250
- * ⚠️⚠️ Windows PostFwDownloadInit: val |= 0x10101
- */
-#define MT_DMASHDL_ENABLE                   MT_HIF_DMASHDL(0x0060)  /* bus 0x7c026060 */
-#define MT_DMASHDL_ENABLE_VAL               0x10101  /* BIT(0)|BIT(8)|BIT(16) */
-
-/* 其他 DMASHDL 寄存器 */
+/* DMASHDL 寄存器
+ * 来源: mt6639/include/chips/coda/mt6639/wf_hif_dmashdl_top.h */
 #define MT_HIF_DMASHDL_SW_CONTROL           MT_HIF_DMASHDL(0x04)
 #define MT_HIF_DMASHDL_BYPASS_EN            BIT(28)
 #define MT_HIF_DMASHDL_OPTIONAL_CONTROL     MT_HIF_DMASHDL(0x08)
@@ -419,6 +412,104 @@
 #define MT_WTBL_ITDR1                (MT_WTBLON_TOP_BAR0 + 0x43bc)
 #define MT_WTBL_SPE_IDX_SEL          BIT(6)
 #define MT_BASIC_RATES_TBL           11
+
+/* WTBL UPDATE register (ADM counter clear) */
+#define MT_WTBL_UPDATE               (MT_WTBLON_TOP_BAR0 + 0x4380)
+#define MT_WTBL_UPDATE_WLAN_IDX      GENMASK(11, 0)
+#define MT_WTBL_UPDATE_ADM_COUNT_CLEAR BIT(14)
+#define MT_WTBL_UPDATE_BUSY          BIT(31)
+
+/* ============================================================================
+ * WTBL 直接读取寄存器 (CONNAC3 — 用于诊断 dump)
+ * 来源: mt6639/include/chips/dbg_wtbl_connac3x.h
+ *        mt6639/include/chips/coda/mt6639/wf_wtblon_top.h
+ *        mt6639/include/chips/coda/mt6639/wf_uwtbl_top.h
+ * 地址: 芯片总线地址 (需通过 mt7927_rr_l1 / mt7927_wr_l1 访问)
+ * ============================================================================ */
+
+/* LWTBL (LMAC Wireless Table) — 每条目 36 DW (144字节) */
+#define MT_WIFI_WTBL_BASE            0x820D8000
+#define MT_WF_WTBLON_WDUCR           0x820d4370  /* LWTBL 分组选择 */
+#define MT_WF_WTBLON_WDUCR_GROUP     GENMASK(4, 0)
+#define MT_LWTBL_LEN_IN_DW          36
+
+/* LWTBL 地址计算: BASE | (wlan_idx[6:0] << 8) | (DW[5:0] << 2) */
+#define MT_LWTBL_IDX2ADDR(_idx, _dw) \
+	(MT_WIFI_WTBL_BASE | (((_idx) & 0x7F) << 8) | (((_dw) & 0x3F) << 2))
+
+/* UWTBL (UMAC Wireless Table) — 每条目 10 DW (40字节) */
+#define MT_WIFI_UWTBL_BASE           0x820c4000
+#define MT_WF_UWTBL_WDUCR            0x820c4104  /* UWTBL 分组选择 */
+#define MT_WF_UWTBL_WDUCR_GROUP      GENMASK(5, 0)
+#define MT_WF_UWTBL_WDUCR_TARGET     BIT(31)     /* 1=KEYTBL, 0=UWTBL */
+#define MT_UWTBL_LEN_IN_DW          10
+
+/* UWTBL 地址计算: BASE | 0x2000 | (wlan_idx[6:0] << 6) | (DW[3:0] << 2) */
+#define MT_UWTBL_IDX2ADDR(_idx, _dw) \
+	(MT_WIFI_UWTBL_BASE | 0x2000 | (((_idx) & 0x7F) << 6) | (((_dw) & 0xF) << 2))
+
+/* LWTBL DW2 字段 — STA 能力标志 */
+#define MT_LWTBL_DW2_AID             GENMASK(11, 0)
+#define MT_LWTBL_DW2_QOS             BIT(26)
+#define MT_LWTBL_DW2_HT              BIT(27)
+#define MT_LWTBL_DW2_VHT             BIT(28)
+#define MT_LWTBL_DW2_HE              BIT(29)
+#define MT_LWTBL_DW2_EHT             BIT(30)
+
+/* ============================================================================
+ * MAC 硬件初始化寄存器 (mt7925 mt7925_mac_init / mt792x_mac_init_band)
+ * Bus-to-BAR0 mapping from mt7925/pci.c fixed_map[]
+ * ============================================================================ */
+
+/* MDP (MAC Data Path) — Bus 0x820cc800 → BAR0 0x00e800 */
+#define MT_MDP_BAR0                  0x00e800
+#define MT_MDP_DCR0                  (MT_MDP_BAR0 + 0x000)
+#define MT_MDP_DCR0_DAMSDU_EN        BIT(15)
+#define MT_MDP_DCR1                  (MT_MDP_BAR0 + 0x004)
+#define MT_MDP_DCR1_MAX_RX_LEN       GENMASK(15, 3)
+
+/* Per-band register bases
+ * Band 0: bus 0x820e4000 → BAR0 0x021000 (TMAC)
+ *          bus 0x820e5000 → BAR0 0x021400 (RMAC)
+ *          bus 0x820e7000 → BAR0 0x021e00 (DMA)
+ *          bus 0x820e9000 → BAR0 0x023400 (WTBLOFF)
+ *          bus 0x820ed000 → BAR0 0x024800 (MIB)
+ * Band 1: bus 0x820f4000 → BAR0 0x0a1000 (TMAC)
+ *          bus 0x820f5000 → BAR0 0x0a1400 (RMAC)
+ *          bus 0x820f7000 → BAR0 0x0a1e00 (DMA)
+ *          bus 0x820f9000 → BAR0 0x0a3400 (WTBLOFF)
+ *          bus 0x820fd000 → BAR0 0x0a4800 (MIB) */
+#define MT_TMAC_BAR0(_band)          ((_band) ? 0x0a1000 : 0x021000)
+#define MT_RMAC_BAR0(_band)          ((_band) ? 0x0a1400 : 0x021400)
+#define MT_DMA_BAR0(_band)           ((_band) ? 0x0a1e00 : 0x021e00)
+#define MT_WTBLOFF_BAR0(_band)       ((_band) ? 0x0a3400 : 0x023400)
+#define MT_MIB_BAR0(_band)           ((_band) ? 0x0a4800 : 0x024800)
+
+/* TMAC CTCR0 — TX 定时控制 */
+#define MT_TMAC_CTCR0(_band)         (MT_TMAC_BAR0(_band) + 0x0f4)
+#define MT_TMAC_CTCR0_INS_DDLMT_REFTIME  GENMASK(5, 0)
+#define MT_TMAC_CTCR0_INS_DDLMT_EN       BIT(17)
+#define MT_TMAC_CTCR0_INS_DDLMT_VHT_SMPDU_EN BIT(18)
+
+/* RMAC MIB 时间 */
+#define MT_WF_RMAC_MIB_TIME0(_band)  (MT_RMAC_BAR0(_band) + 0x03c4)
+#define MT_WF_RMAC_MIB_AIRTIME0(_band) (MT_RMAC_BAR0(_band) + 0x0380)
+#define MT_WF_RMAC_MIB_RXTIME_EN    BIT(30)
+
+/* MIB 统计控制 */
+#define MT_MIB_SCR1(_band)           (MT_MIB_BAR0(_band) + 0x004)
+#define MT_MIB_TXDUR_EN              BIT(24)
+#define MT_MIB_RXDUR_EN              BIT(25)
+
+/* DMA DCR0 — per-band DMA 控制 */
+#define MT_DMA_DCR0(_band)           (MT_DMA_BAR0(_band) + 0x000)
+#define MT_DMA_DCR0_MAX_RX_LEN       GENMASK(15, 3)
+#define MT_DMA_DCR0_RXD_G5_EN        BIT(23)
+
+/* WTBLOFF RSCR — RCPI 模式 */
+#define MT_WTBLOFF_TOP_RSCR(_band)   (MT_WTBLOFF_BAR0(_band) + 0x008)
+#define MT_WTBLOFF_TOP_RSCR_RCPI_MODE GENMASK(31, 30)
+#define MT_WTBLOFF_TOP_RSCR_RCPI_PARAM GENMASK(25, 24)
 
 /* ============================================================================
  * TXD/RXD 格式定义 - CONNAC3 格式
@@ -808,8 +899,15 @@ struct mt7927_dev {
 	/* 工作队列 */
 	struct work_struct init_work;		/* 异步初始化 */
 	struct delayed_work scan_work;		/* 扫描工作队列 */
+	struct work_struct mgmt_tx_work;	/* 管理帧 via CMD ring */
+	struct sk_buff_head mgmt_tx_queue;	/* 管理帧发送队列 */
 	wait_queue_head_t mcu_wait;		/* MCU 等待队列 */
 	bool hw_init_done;			/* 硬件初始化完成标志 */
+
+	/* ROC (Remain On Channel) 同步 */
+	struct completion roc_complete;		/* ROC_GRANT 等待 */
+	bool roc_active;			/* ROC 会话活跃中 — 阻止扫描 */
+	u8 roc_grant_band_idx;			/* ROC_GRANT 返回的 dbdcband */
 
 	/* 扫描状态 */
 	u8 scan_seq_num;			/* 扫描序列号 */
@@ -838,6 +936,10 @@ struct mt7927_dev {
 	/* TXD+TXP coherent DMA buffer pool */
 	void *txwi_buf;
 	dma_addr_t txwi_dma;
+
+	/* 诊断: coherent payload buffer (替代 dma_map_single) */
+	void *tx_payload_buf;
+	dma_addr_t tx_payload_dma;
 };
 
 /* ============================================================================
@@ -1343,14 +1445,16 @@ enum {
 	UNI_DEV_INFO_ACTIVE = 1,
 };
 
-/* STA_REC TLV tags */
+/* STA_REC TLV tags — MT6639 firmware UNI_CMD_STAREC tag values
+ * ⚠️ MT6639 tag 值和 mt76/mt7925 不同! 不要用 mt76 的自动枚举值!
+ * 来源: MT6639 Android 驱动 UNI_CMD_STAREC_TAG_xxx */
 enum {
 	STA_REC_BASIC = 0,
 	STA_REC_RA = 1,
-	STA_REC_STATE = 2,
-	STA_REC_HT = 7,
-	STA_REC_VHT = 8,
-	STA_REC_APPS = 9,
+	STA_REC_STATE = 7,	/* STATE_CHANGED — ⚠️ 原来错误地用了 2 (那是 RA_COMMON_INFO!) */
+	STA_REC_HT = 9,	/* HT_BASIC (MT6639, 不是 mt76 的 7) */
+	STA_REC_VHT = 0x0a,	/* VHT_BASIC (MT6639) */
+	STA_REC_APPS = 0x0b,	/* not used */
 	STA_REC_WTBL = 0x0d,
 	STA_REC_PHY = 0x15,
 	STA_REC_HE = 0x17,
@@ -1461,6 +1565,38 @@ struct bss_rlm_tlv {
 	u8 pad[3];
 } __packed;
 
+/* BSS_INFO_RATE TLV (tag=0x0B) — 告诉固件 BSS 的速率集合
+ * 缺少此 TLV 时, 固件可能不知道管理帧用什么速率发送
+ * 来源: mt7925/mcu.h bss_rate_tlv, mt6639 UNI_CMD_BSSINFO_RATE */
+struct bss_rate_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 __rsv1[2];
+	__le16 basic_rate;	/* 基本速率 bitmap */
+	__le16 bc_trans;	/* broadcast 传输速率索引 */
+	__le16 mc_trans;	/* multicast 传输速率索引 */
+	u8 short_preamble;	/* 2.4GHz=1, 5GHz=0 */
+	u8 bc_fixed_rate;	/* broadcast 固定速率索引 */
+	u8 mc_fixed_rate;	/* multicast 固定速率索引 */
+	u8 __rsv2;
+} __packed;
+
+#define HR_DSSS_ERP_BASIC_RATE	GENMASK(3, 0)	/* 2.4G: 1/2/5.5/11 Mbps */
+#define OFDM_BASIC_RATE		(BIT(6) | BIT(8) | BIT(10))  /* 5G: 6/12/24 Mbps */
+
+/* BSS_INFO_MLD TLV (tag=0x1A) — WiFi 7/CONNAC3 MLD 上下文
+ * MT6639 固件要求此 TLV，即使非 MLO 连接也需要
+ * 来源: mt6639/include/nic_uni_cmd_event.h line 606 */
+struct bss_mld_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 group_mld_id;	/* 0xff = MLD_GROUP_NONE (legacy) */
+	u8 own_mld_id;		/* = bss_idx */
+	u8 own_mld_addr[ETH_ALEN];
+	u8 om_remap_idx;	/* 0xff = OM_REMAP_IDX_NONE */
+	u8 rsv[3];
+} __packed;
+
 /* STA_REC_BASIC TLV (tag=0) */
 struct sta_rec_basic {
 	__le16 tag;
@@ -1484,6 +1620,34 @@ struct sta_rec_phy {
 	u8 rcpi;
 	u8 __rsv[2];
 } __packed;
+
+/* STA_REC_STATE TLV (tag=7 = STATE_CHANGED for MT6639)
+ * 来源: mt76/mt76_connac_mcu.c mt76_connac_mcu_sta_tlv()
+ *       MT6639 firmware: UNI_CMD_STAREC_TAG_STATE_CHANGED = 0x07
+ * ⚠️ MT6639 布局: flags 在 state 前面, 共 12 字节
+ *   (mt7925 的 sta_rec_state_v2 是 state 在前 16 字节 — 不同固件接口!) */
+struct sta_rec_state {
+	__le16 tag;
+	__le16 len;
+	__le32 flags;
+	u8 state;		/* STA_STATE_1 = 0 (auth 前) */
+	u8 vht_opmode;
+	u8 action;
+	u8 pad;
+} __packed;
+
+/* STA_REC_RA TLV (tag=1 = STA_REC_RA)
+ * 来源: mt7925/mcu.c mt7925_mcu_sta_rate_ctrl_tlv()
+ * 告诉固件 STA 支持的速率集合 */
+struct sta_rec_ra_info {
+	__le16 tag;
+	__le16 len;
+	__le16 legacy;		/* RA_LEGACY_OFDM | RA_LEGACY_CCK */
+	u8 rx_mcs_bitmask[10];	/* HT MCS bitmap (HT_MCS_MASK_NUM=10) */
+} __packed;
+
+#define RA_LEGACY_CCK		GENMASK(3, 0)
+#define RA_LEGACY_OFDM		GENMASK(13, 6)
 
 /* STA_REC_HDR_TRANS TLV (tag=0x2B) */
 struct sta_rec_hdr_trans {
@@ -1557,6 +1721,11 @@ enum mt76_rxq_id {
 	MT_RXQ_MAIN,		/* 数据 RX */
 	MT_RXQ_MCU,		/* MCU 事件 RX */
 };
+
+/* pci.c — 寄存器读写 */
+u32 mt7927_rr(struct mt7927_dev *dev, u32 reg);
+void mt7927_wr(struct mt7927_dev *dev, u32 reg, u32 val);
+u32 mt7927_rr_l1(struct mt7927_dev *dev, u32 chip_addr);
 
 /* mac.c — TXD 构造 */
 void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,

@@ -558,6 +558,20 @@ int mt7927_dma_init_data_rings(struct mt7927_dev *dev)
 		 (unsigned long)(MT7927_TOKEN_SIZE * MT7927_TXWI_SIZE),
 		 &dev->txwi_dma);
 
+	/* 诊断: 分配 coherent payload buffer (替代 dma_map_single 测试) */
+	dev->tx_payload_buf = dma_alloc_coherent(&dev->pdev->dev, 2048,
+						 &dev->tx_payload_dma,
+						 GFP_KERNEL);
+	if (!dev->tx_payload_buf) {
+		dma_free_coherent(&dev->pdev->dev,
+				  MT7927_TOKEN_SIZE * MT7927_TXWI_SIZE,
+				  dev->txwi_buf, dev->txwi_dma);
+		return -ENOMEM;
+	}
+	dev_info(&dev->pdev->dev,
+		 "TX payload coherent buf: dma=0x%pad\n",
+		 &dev->tx_payload_dma);
+
 	/* Allocate DMA-coherent descriptor ring */
 	ring->desc = dma_alloc_coherent(&dev->pdev->dev,
 					ndesc * sizeof(struct mt76_desc),
