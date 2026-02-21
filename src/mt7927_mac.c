@@ -1147,27 +1147,30 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 	 * Legacy event: eid=0x0f (EVENT_ID_TX_DONE)
 	 *
 	 * TXS_TO_MCU 在 DW5 中设置后, 固件在管理帧发送完成后发此事件.
-	 * UNI_EVENT_TX_DONE TLV layout (after 48-byte rxd header + 4 padding):
-	 *   +0: tag(2) +2: len(2) +4: ucPacketSeq +5: ucStatus
-	 *   +6: u2SequenceNumber(2) +8: ucWlanIndex +9: ucTxCount
-	 *   +10: u2TxRate(2)
-	 * Status: 0=SUCCESS, 1=TX_FAILED, others=various errors
+	 * UNI_EVENT_TX_DONE TLV layout at skb->data + 48:
+	 *   RXD header (48 bytes) then:
+	 *   [tag(2)][len(2)] = TLV header at offset 48 (tag=0x0000, len=0x0020)
+	 *   [ucPacketSeq(1)][ucStatus(1)][u2SeqNum(2)][ucWlanIdx(1)][ucTxCnt(1)][u2TxRate(2)]...
+	 *   at offset 52 (= 48 + 4 = after TLV tag+len)
+	 * Status: 0=SUCCESS, 1=TX_FAILED, 3=MPDU_ERROR
 	 */
 	if (rxd->eid == 0x2D) {
 		/* UNI_EVENT_ID_STATUS_TO_HOST — parse TX_DONE TLV */
-		if (skb->len >= 48 + 4 + 12) { /* hdr + padding + min TLV */
-			u8 *tlv = skb->data + 48 + 4; /* skip hdr + 4-byte padding */
-			u16 tag = le16_to_cpu(*(__le16 *)tlv);
-			u8 pid_val = tlv[4];
-			u8 status = tlv[5];
-			u16 sn = le16_to_cpu(*(__le16 *)(tlv + 6));
-			u8 widx = tlv[8];
-			u8 tx_cnt = tlv[9];
-			u16 tx_rate = le16_to_cpu(*(__le16 *)(tlv + 10));
+		if (skb->len >= 48 + 4 + 8) { /* rxd hdr + TLV hdr + min data */
+			u8 *tlv = skb->data + 48 + 4; /* skip rxd hdr (48) + TLV tag(2)+len(2) */
+			u8 pid_val = tlv[0];   /* ucPacketSeq */
+			u8 status  = tlv[1];   /* ucStatus: 0=OK, 1=FAIL, 3=MPDU_ERR */
+			u16 sn     = le16_to_cpu(*(__le16 *)(tlv + 2)); /* u2SequenceNumber */
+			u8 widx    = tlv[4];   /* ucWlanIndex */
+			u8 tx_cnt  = tlv[5];   /* ucTxCount */
+			u16 tx_rate = le16_to_cpu(*(__le16 *)(tlv + 6)); /* u2TxRate */
 
 			dev_info(&dev->pdev->dev,
-				 "TX_DONE(UNI): tag=%u PID=%u status=%u SN=%u WIDX=%u cnt=%u rate=0x%04x\n",
-				 tag, pid_val, status, sn, widx, tx_cnt, tx_rate);
+				 "TX_DONE(UNI): PID=%u status=%u(%s) SN=%u WIDX=%u cnt=%u rate=0x%04x\n",
+				 pid_val, status,
+				 status == 0 ? "OK" : status == 1 ? "TX_FAIL" :
+				 status == 3 ? "MPDU_ERR" : "UNKNOWN",
+				 sn, widx, tx_cnt, tx_rate);
 		}
 	}
 
