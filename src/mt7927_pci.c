@@ -1605,18 +1605,13 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 		 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP1),
 		 mt7927_rr(dev, MT_HIF_DMASHDL_SCHED_SET0));
 
-	/* Step 1: DMASHDL — 不做完整初始化!
+	/* Step 1: DMASHDL full init (mt6639 格式)
 	 *
-	 * 诊断发现 (Session 17):
-	 *   - 固件启动后自配 DMASHDL: GRP0=0x01ff0010 OPT=0x700c8fff
-	 *   - mt7927_dmashdl_init() (从 MT6639 Android 抄的) 完全覆盖固件值
-	 *   - 特别是: QMAP0 被写成 0x21112000, 覆盖掉 Windows 的 0x10101 bits
-	 *   - Windows PostFwDownloadInit 只做 0xd6060 |= 0x10101, 不做 full init
-	 *
-	 * 修复: 跳过 mt7927_dmashdl_init()，让固件自己的 DMASHDL 配置保持不变。
-	 * Windows 的 0x10101 已在 Step 0 中设置。
+	 * Session 20 bisect 结论: full init 是必需的!
+	 * 跳过 → scan 回归 (0 BSS)。Windows 的 0xd6060 |= 0x10101
+	 * (Step 0) 是额外设置，不替代 full init。
 	 */
-	/* mt7927_dmashdl_init(dev); -- skipped: firmware self-configures DMASHDL */
+	mt7927_dmashdl_init(dev);
 
 	/* 重新启用 WpdmaConfig (固件启动后) */
 	mt7927_wpdma_config(dev, true);
