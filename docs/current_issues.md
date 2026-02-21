@@ -519,10 +519,26 @@ DIAG[TX_AUTH]:    PLE_STA0=0x0000000a PLE_STA1=0x00000005
 | 2. 延迟 BSS 激活 | DEV_INFO 移到 sta_state | 无额外改善 | 否 |
 | 3. 逐命令 PAUSE 快照 | 6 个诊断点 | PLE 全程稳定 0xa | 否 |
 
-**下一步**: MPDU_ERR status=3 cnt=30 — 固件在尝试发帧但 30 次重试全部失败。可能原因:
-- band_idx=255 在初始 BSS_INFO 中 (ROC_GRANT 后变 1, 但可能来不及)
-- BSS_INFO BASIC 字段布局仍有其他错误 (wlan_idx/band_info 位置)
-- 射频链路配置错误 (频率/功率/天线)
+### Test 4: STA_REC state=0 pre-auth (2026-02-22, Session 25)
+
+**改动**: `req.state.state = enable ? 0 : 0` (之前 `enable ? 2 : 0`)
+
+**原理**: Windows 在 auth 前发 state=0，我们发 state=2 可能导致固件状态机混乱。
+
+**结果: 无改善** — MPDU_ERR status=3 cnt=30 完全相同。已回退。
+
+## 四个 A/B 测试总结
+
+| Test | 改动 | 结果 | 保留 |
+|------|------|------|------|
+| 1. conn_state 翻转 | `enable ? 0 : 1` | **突破!** PLE 解除, TX_DONE 恢复 | **是** |
+| 2. 延迟 BSS 激活 | DEV_INFO 移到 sta_state | 无改善 | 否 |
+| 3. 逐命令 PAUSE 快照 | 6 个诊断点 | PLE 全程稳定 0xa | 否 |
+| 4. STA_REC state=0 | auth 前 state=0 | 无改善 | 否 |
+
+**下一步**: MPDU_ERR status=3 cnt=30 — 固件在尝试发帧但 30 次重试全部失败。
+- 需解码 TXS 错误位 (ACK_TIMEOUT/RTS_TIMEOUT/QUEUE_TIMEOUT) 确认失败类型
+- BSS_INFO BASIC 字段逐个测试 (+1F band_info, +7 sco, +1C wlan_idx)
 
 ---
 
