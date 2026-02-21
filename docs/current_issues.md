@@ -477,6 +477,22 @@ PLE_STA0=0x0000000a PLE_STA1=0x00000005
 
 **结论**: conn_state=0 (CONNECTED) 是正确的。PLE STATION_PAUSE 问题由此解除。auth 仍失败需要继续排查。
 
+### Test 2: 延迟 BSS 激活 (2026-02-22, Session 25)
+
+**改动**: 将 `mt7927_mcu_uni_add_dev()` 从 `add_interface` 移到 `sta_state(NOTEXIST→NONE)`
+
+**原理**: add_interface 时 band_idx=255、BSSID 未知，Windows 在 connect 流程才激活。
+
+**结果: 无额外改善**
+
+| 指标 | Test 1 baseline | Test 2 (+延迟激活) |
+|------|-----------------|---------------------|
+| PLE_STA0 | 0x0000000a | 0x0000000a (相同) |
+| TX_DONE | MPDU_ERR status=3 | MPDU_ERR status=3 (相同) |
+| 初始 band_idx | 255 | 255 (相同，ROC_GRANT 后变 1) |
+
+**结论**: 延迟激活时序不是关键瓶颈。add_interface 阶段的 BSS_INFO 会被 ROC_GRANT 后的重发覆盖。已回退此改动。
+
 ---
 
 *文档生成时间: 2026-02-22, 基于 CLAUDE.md + Windows RE 文档 + 源代码分析*
