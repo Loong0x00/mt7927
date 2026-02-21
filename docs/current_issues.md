@@ -493,6 +493,37 @@ PLE_STA0=0x0000000a PLE_STA1=0x00000005
 
 **结论**: 延迟激活时序不是关键瓶颈。add_interface 阶段的 BSS_INFO 会被 ROC_GRANT 后的重发覆盖。已回退此改动。
 
+### Test 3: 逐命令 STATION_PAUSE 快照 (2026-02-22, Session 25)
+
+**改动**: 6 个诊断点读取 PLE_STA0/STA1 (DEV_INFO, PM_DISABLE, BSS_INFO, STA_REC, sta_NONE, TX_AUTH)
+
+**结果: PLE_STA0 全程稳定**
+
+```
+DIAG[DEV_INFO]:   PLE_STA0=0x0000000a PLE_STA1=0x00000005
+DIAG[PM_DISABLE]: PLE_STA0=0x0000000a PLE_STA1=0x00000005
+DIAG[BSS_INFO]:   PLE_STA0=0x0000000a PLE_STA1=0x00000005
+DIAG[STA_REC]:    PLE_STA0=0x0000000a PLE_STA1=0x00000005
+DIAG[sta_NONE]:   PLE_STA0=0x0000000a PLE_STA1=0x00000005
+DIAG[TX_AUTH]:    PLE_STA0=0x0000000a PLE_STA1=0x00000005
+(auth try 1/3, 2/3, 3/3 全部相同)
+```
+
+**结论**: PLE STATION_PAUSE 已被 Test 1 (conn_state=0) 彻底解决。`0x0000000a` 是正常值。MPDU_ERR status=3 的根因不在 PLE PAUSE。已回退诊断代码。
+
+## 三个 A/B 测试总结
+
+| Test | 改动 | 结果 | 保留 |
+|------|------|------|------|
+| 1. conn_state 翻转 | `enable ? 0 : 1` | **突破!** PLE 0xf133ffff→0xa, TX_DONE 恢复 | **是** |
+| 2. 延迟 BSS 激活 | DEV_INFO 移到 sta_state | 无额外改善 | 否 |
+| 3. 逐命令 PAUSE 快照 | 6 个诊断点 | PLE 全程稳定 0xa | 否 |
+
+**下一步**: MPDU_ERR status=3 cnt=30 — 固件在尝试发帧但 30 次重试全部失败。可能原因:
+- band_idx=255 在初始 BSS_INFO 中 (ROC_GRANT 后变 1, 但可能来不及)
+- BSS_INFO BASIC 字段布局仍有其他错误 (wlan_idx/band_info 位置)
+- 射频链路配置错误 (频率/功率/天线)
+
 ---
 
 *文档生成时间: 2026-02-22, 基于 CLAUDE.md + Windows RE 文档 + 源代码分析*
