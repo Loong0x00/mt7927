@@ -2481,10 +2481,10 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	req.basic.band_idx = mvif->band_idx;
 	/* TEST-A: revert to old CONNECTION_INFRA_STA (5d87f81 value, scan worked) */
 	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
-	/* MT6639: MEDIA_STATE_DISCONNECTED=1 when activating BSS
-	 * MEDIA_STATE_CONNECTED=0 when deactivating (opposite of mt7925)
-	 * win-analyst 确认: BSS activate → conn_state=1 */
-	req.basic.conn_state = enable ? 1 : 0;
+	/* TEST-1: conn_state 枚举翻转 (CONNECTED=0, DISCONNECTED=1)
+	 * BSS_INFO 枚举: MEDIA_STATE_CONNECTED=0, MEDIA_STATE_DISCONNECTED=1
+	 * 之前 enable ? 1 : 0 实际上是 enable → DISCONNECTED, 可能让固件认为未连接 */
+	req.basic.conn_state = enable ? 0 : 1;
 	req.basic.wmm_idx = mvif->wmm_idx;
 	req.basic.bmc_tx_wlan_idx = cpu_to_le16(mvif->sta.wcid.idx);
 	/* Windows/MT6639: StaRecIdxOfAP=0xFFFE (NOT_FOUND) during initial BSS activation.
