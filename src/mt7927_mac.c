@@ -177,10 +177,11 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 		q_idx = MT_TX_MCU_PORT_RX_Q0;
 		p_fmt = MT_TX_TYPE_FW;
 	} else if (is_mgmt) {
-		/* MT6639: 管理帧 PKT_FMT=2(CMD) + Q_IDX=0(MCU_Q0)
-		 * TXD+frame inline on CMD ring 15, no TXP scatter-gather */
-		p_fmt = MT_TX_TYPE_CMD;
-		q_idx = 0;
+		/* Ring 0 CT mode experiment: use CT mode to get TXFREE error codes
+		 * Previously used CMD mode (ring 15) or SF mode (ring 2) — both silent.
+		 * CT mode (ring 0) historically returned TXFREE stat=1 (useful for diagnosis) */
+		p_fmt = MT_TX_TYPE_CT;
+		q_idx = 0x10; /* MT_LMAC_ALTX0 — mgmt/high-priority LMAC queue */
 	} else if (!is_8023) {
 		q_idx = 0x10; /* MT_LMAC_ALTX0 — 非管理帧的 802.11 帧 */
 	} else {
@@ -684,23 +685,24 @@ void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
 				u32 ple_empty, pse_empty;
 				u32 ple_sta0, ple_sta1;
 
-				/* Band 0 MIB (2.4GHz) */
-				mib0_tx_ok    = mt7927_rr_l1(dev, 0x820ed68c); /* TSCR7 SU_TX_OK */
-				mib0_tx_fail  = mt7927_rr_l1(dev, 0x820ed690); /* TSCR8 SU_TX_FAIL */
-				mib0_tx_retry = mt7927_rr_l1(dev, 0x820ed6a0); /* TSCR12 TX_RETRY */
+				/* Band 0 MIB: bus2chip 0x820ed000→BAR0 0x24800 */
+				mib0_tx_ok    = mt7927_rr(dev, 0x24e8c); /* TSCR7 SU_TX_OK */
+				mib0_tx_fail  = mt7927_rr(dev, 0x24e90); /* TSCR8 SU_TX_FAIL */
+				mib0_tx_retry = mt7927_rr(dev, 0x24ea0); /* TSCR12 TX_RETRY */
 
-				/* Band 1 MIB (5GHz) — 重要! */
-				mib1_tx_ok    = mt7927_rr_l1(dev, 0x820fd68c);
-				mib1_tx_fail  = mt7927_rr_l1(dev, 0x820fd690);
-				mib1_tx_retry = mt7927_rr_l1(dev, 0x820fd6a0);
+				/* Band 1 MIB: bus2chip 0x820fd000→BAR0 0x2c800 */
+				mib1_tx_ok    = mt7927_rr(dev, 0x2ce8c);
+				mib1_tx_fail  = mt7927_rr(dev, 0x2ce90);
+				mib1_tx_retry = mt7927_rr(dev, 0x2cea0);
 
 				/* PLE/PSE queue status */
-				ple_empty = mt7927_rr_l1(dev, 0x820c0360);
-				pse_empty = mt7927_rr_l1(dev, 0x820c80b0);
+				/* bus2chip: 0x820c0000→BAR0 0x08000 (PLE) */
+				ple_empty = mt7927_rr(dev, 0x08360);  /* PLE_QUEUE_EMPTY */
+				pse_empty = mt7927_rr(dev, 0x0c0b0);  /* PSE_QUEUE_EMPTY */
 
 				/* PLE station info — TX queued packets */
-				ple_sta0 = mt7927_rr_l1(dev, 0x820c0024);
-				ple_sta1 = mt7927_rr_l1(dev, 0x820c0028);
+				ple_sta0 = mt7927_rr(dev, 0x08024);  /* PLE_STA(0) */
+				ple_sta1 = mt7927_rr(dev, 0x08028);  /* PLE_STA(1) */
 
 				dev_info(&dev->pdev->dev,
 					 "TX-FAIL: stat=%u count=%u wlan=%lu\n",

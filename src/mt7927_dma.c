@@ -599,8 +599,8 @@ void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring)
 		dev_info(&dev->pdev->dev,
 			 "POST-TX diag: PLE_EMPTY=0x%08x PSE_EMPTY=0x%08x "
 			 "QMAP0=0x%08x DIDX=%u\n",
-			 mt7927_rr_l1(dev, 0x820c0360),
-			 mt7927_rr_l1(dev, 0x820c80b0),
+			 mt7927_rr(dev, 0x08360),  /* PLE_QUEUE_EMPTY: bus2chip 0x820c0000→BAR0 0x08000 */
+			 mt7927_rr(dev, 0x0c0b0),  /* PSE_QUEUE_EMPTY: bus2chip 0x820c8000→BAR0 0x0c000 */
 			 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0),
 			 dma_rr(dev, MT_WPDMA_TX_RING_DIDX(ring->qid)));
 	}

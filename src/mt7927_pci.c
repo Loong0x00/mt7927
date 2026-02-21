@@ -470,7 +470,7 @@ static void mt7927_reprogram_prefetch(struct mt7927_dev *dev)
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x0140, 0x4));
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0180, 0x10));
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(0), PREFETCH(0x0280, 0x4));
-	/* TX ring 2: Windows 不写 per-ring EXT_CTRL, 只用 packed prefetch */
+	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(2), PREFETCH(0x02c0, 0x4));
 }
 
 /* =====================================================================
@@ -1169,8 +1169,11 @@ static void mt7927_wpdma_config(struct mt7927_dev *dev, bool enable)
 		 * depth=0x4 与 mt7925 一致 (mt7925/pci.c line 232)
 		 * 缺少此配置导致 auth 帧无法通过 DMA 发出 */
 		mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(0), PREFETCH(0x0280, 0x4));
-		/* TX ring 2 (管理帧 SF) — Windows 不写 per-ring EXT_CTRL for ring 2
-		 * 只用 packed prefetch (0xd70f0-0xd70fc), ring 2 不需要单独配置 */
+		/* TX ring 2 (管理帧 SF) — Session 21: 添加 per-ring EXT_CTRL!
+		 * MT6639 soc5_0.c:562 写 0x01c00004, 我们之前跳过了
+		 * Ring 2 缺少 prefetch buffer 可能导致 WFDMA 路由失败
+		 * base=0x02c0 (TX0 之后: 0x0280 + 4*16 = 0x02c0), depth=4 */
+		mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(2), PREFETCH(0x02c0, 0x4));
 
 		/* GLO_CFG: 启用 TX_DMA_EN | RX_DMA_EN + Windows 关键位 (步骤 4)
 		 * 来源: Windows — glo_cfg |= 0x5 + 额外关键位
@@ -1530,19 +1533,20 @@ static void mt7927_dmashdl_init(struct mt7927_dev *dev)
 	/* 6. Slot arbiter: disabled (GROUP_SEQUENCE_ORDER_TYPE[16]=0) */
 	mt7927_rmw(dev, MT_HIF_DMASHDL_PAGE_SETTING, BIT(16), 0);
 
-	/* 7. Optional control: HIF_ACK_CNT_TH=4, HIF_GUP_ACT_MAP=0x0007
-	 * GUP_ACT_MAP: BIT(0)|BIT(1)|BIT(2) = data rings 0,1,2
-	 * 注意: MT6639 Android 用 0x8007 (含 BIT(15) for CMD ring),
-	 * 但我们的 CMD ring 15 MCU 命令用 Q_IDX=0x20 (MCU port),
-	 * 超出 DMASHDL queue 0-31 范围, 会导致 ring 15 DMA 卡死。
-	 * 不把 CMD ring 放入 DMASHDL 管理。 */
-	mt7927_wr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL, 0x00040007);
+	/* 7. Optional control: HIF_ACK_CNT_TH=4, HIF_GUP_ACT_MAP=0x8007
+	 * MT6639 PCIe 参考 (hal_dmashdl_mt6639.h):
+	 *   MT6639_DMASHDL_HIF_GUP_ACT_MAP = 0x8007
+	 * GUP_ACT_MAP [15:0]: BIT(0)|BIT(1)|BIT(2)|BIT(15) = rings 0,1,2 + ring 15
+	 * Ring 15 CMD 流量 (Q_IDX=0x20 MCU TX port) 通过 DMASHDL MCU path 路由
+	 * OPTIONAL_CONTROL = ACK_TH(4) << 16 | GUP_MAP(0x8007) = 0x00048007 */
+	mt7927_wr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL, 0x00048007);
 
-	/* 8. DMASHDL BYPASS 必须保持 ON
-	 * MCU 命令 Q_IDX=0x20 (=32) 超出 DMASHDL 队列范围 (0-31)。
-	 * BYPASS=0 时 DMASHDL 无法处理 Q_IDX=0x20, CMD ring 15 卡死。
-	 * Windows 也使用 BYPASS=1 (已验证 session 15)。
-	 * BYPASS 不影响 DATA TX: 固件仍然接收并处理 ring 0 的帧。 */
+	/* 8. DMASHDL BYPASS 保持 ON (固件自行设置, 不可清除)
+	 * 固件启动后 SW=0x10000000 即 BYPASS_EN=1, 这是固件的主动设置。
+	 * 若清除 BYPASS_EN: ring 15 Q_IDX=0x20(=32) 超出 DMASHDL 队列映射范围(0-31),
+	 * 所有 MCU 命令全部超时 (ring15 未被消费), PostFwDownloadInit 完全失败。
+	 * Windows 同样使用 BYPASS=1 (Session 15 验证)。
+	 * 结论: BYPASS=1 是 MT7927/MT6639 PCIe 的正确配置, 不影响数据 TX。 */
 
 	dev_info(&dev->pdev->dev,
 		 "DMASHDL init: SW=0x%08x GRP0=0x%08x QMAP0=0x%08x OPT=0x%08x\n",
@@ -1562,56 +1566,28 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 
 	dev_info(&dev->pdev->dev, "===== PostFwDownloadInit 开始 =====\n");
 
-	/* Step 0: WFDMA enable — Windows PostFwDownloadInit 的第一步!
-	 * 来源: Ghidra RE AsicConnac3xPostFwDownloadInit (0x1401c9510)
-	 * Windows: readl(0xd6060) |= 0x10101 — 在所有 MCU 命令之前
-	 * 0xd6060 = MT_HIF_DMASHDL_QUEUE_MAP0
-	 * BIT(0) + BIT(8) + BIT(16) = 3 个 enable 位
-	 * 假设: 这些位控制 HOST→FW 数据通道使能，
-	 *        缺失导致 "DMA 消费成功但固件静默" */
+	/* Step 0+1: DMASHDL full init (mt6639 格式) + Windows enable bits
+	 *
+	 * Session 20 bisect: full init 必需 (跳过 → scan 0 BSS)
+	 * Session 21 发现: dmashdl_init() hard-write QUEUE_MAP0=0x21112000
+	 *   覆盖了 Windows 的 |= 0x10101 enable bits!
+	 *   BIT(0)+BIT(8)+BIT(16) 控制 HOST→FW 数据通道使能
+	 *   缺失导致 Ring 2 mgmt 帧 "DMA 消费成功但固件静默"
+	 * 修复: 先 full init，再 OR enable bits (Windows 顺序)
+	 */
+	mt7927_dmashdl_init(dev);
+
+	/* Windows: readl(0xd6060) |= 0x10101 — DMASHDL init 之后! */
 	{
 		u32 dmashdl_qm0 = mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0);
-
-		dev_info(&dev->pdev->dev,
-			 "DMASHDL QUEUE_MAP0 (0xd6060) BEFORE: 0x%08x "
-			 "[BIT0=%u BIT8=%u BIT16=%u]\n",
-			 dmashdl_qm0,
-			 !!(dmashdl_qm0 & BIT(0)),
-			 !!(dmashdl_qm0 & BIT(8)),
-			 !!(dmashdl_qm0 & BIT(16)));
 
 		dmashdl_qm0 |= 0x10101;  /* BIT(0) | BIT(8) | BIT(16) */
 		mt7927_wr(dev, MT_HIF_DMASHDL_QUEUE_MAP0, dmashdl_qm0);
 
 		dev_info(&dev->pdev->dev,
-			 "DMASHDL QUEUE_MAP0 (0xd6060) AFTER:  0x%08x\n",
+			 "DMASHDL QUEUE_MAP0: 0x%08x (enable bits applied)\n",
 			 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0));
 	}
-
-	/* DIAG: 读取固件启动后的 DMASHDL 全部关键寄存器 */
-	dev_info(&dev->pdev->dev,
-		 "DMASHDL FW state: SW=0x%08x OPT=0x%08x PKT_MAX=0x%08x "
-		 "REFILL=0x%08x\n",
-		 mt7927_rr(dev, MT_HIF_DMASHDL_SW_CONTROL),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_OPTIONAL_CONTROL),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_REFILL_CONTROL));
-	dev_info(&dev->pdev->dev,
-		 "DMASHDL FW state: GRP0=0x%08x GRP1=0x%08x "
-		 "QMAP0=0x%08x QMAP1=0x%08x SCHED0=0x%08x\n",
-		 mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(0)),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_GROUP_CONTROL(1)),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP1),
-		 mt7927_rr(dev, MT_HIF_DMASHDL_SCHED_SET0));
-
-	/* Step 1: DMASHDL full init (mt6639 格式)
-	 *
-	 * Session 20 bisect 结论: full init 是必需的!
-	 * 跳过 → scan 回归 (0 BSS)。Windows 的 0xd6060 |= 0x10101
-	 * (Step 0) 是额外设置，不替代 full init。
-	 */
-	mt7927_dmashdl_init(dev);
 
 	/* 重新启用 WpdmaConfig (固件启动后) */
 	mt7927_wpdma_config(dev, true);
@@ -1647,13 +1623,31 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 				 "NIC_CAP 失败: %d (继续)\n", ret);
 	}
 
-	/* Step 3: Config 命令 — 跳过!
-	 * 5d87f81 中明确跳过此命令 ("破坏 MCU 通道")。
-	 * 问题: MT_MCU_CLASS_CONFIG=0x02 与 BSS_INFO CID 冲突!
-	 * Windows inner CID=0x0b, 但在回退 CID 时变成了 0x02,
-	 * 导致固件收到格式错误的 BSS_INFO 命令。
-	 * TODO: 需要单独的 CID (0x0b) 而非 MT_MCU_CLASS_CONFIG。 */
-	dev_info(&dev->pdev->dev, "Config: SKIPPED (CID=0x02 与 BSS_INFO 冲突)\n");
+	/* Step 3: Config 命令 (CID=0x02, option=0x06 fire-and-forget)
+	 * Windows RE (win_re_class02_and_postinit.md): outer=0x02, 12字节 payload
+	 * 之前跳过原因: 用了 option=0x07 (等待响应), 固件不回复导致 MCU 通道阻塞
+	 * 正确做法: option=0x06 fire-and-forget, 固件处理后不发响应
+	 * Payload: {u16=0x0001, u8=0, u8=0, u32=0x00070000, u32=0} */
+	dev_info(&dev->pdev->dev, "发送 Config 命令 (CID=0x02, fire-and-forget)\n");
+	{
+		struct {
+			__le16 field0;	/* = 0x0001 */
+			u8     field2;	/* = 0x00  */
+			u8     pad;	/* = 0x00  */
+			__le32 field4;	/* = 0x00070000 */
+			__le32 field8;	/* = 0x00000000 */
+		} __packed config_payload = {
+			.field0 = cpu_to_le16(0x0001),
+			.field4 = cpu_to_le32(0x00070000),
+		};
+
+		ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_CONFIG,
+					      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+					      &config_payload, sizeof(config_payload));
+		if (ret)
+			dev_warn(&dev->pdev->dev,
+				 "Config 命令失败: %d (继续)\n", ret);
+	}
 
 	/* Step 4: WFDMA_CFG 命令 (inner CID=0x0d, outer tag=0xc0)
 	 * 来源: Windows dispatch table — outer 0xc0 → inner 0x0d
@@ -2447,12 +2441,20 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	struct ieee80211_channel *chan;
 	struct {
 		struct bss_req_hdr hdr;
-		struct mt76_connac_bss_basic_tlv basic;
-		struct bss_rlm_tlv rlm;
-		struct bss_protect_tlv protect;
-		struct bss_ifs_time_tlv ifs_time;
-		struct bss_rate_tlv rate;
-		struct bss_mld_tlv mld;
+		struct mt76_connac_bss_basic_tlv basic; /* tag=0 */
+		struct bss_ra_tlv ra;                   /* tag=1 */
+		struct bss_rlm_tlv rlm;                 /* tag=2 */
+		struct bss_protect_tlv protect;         /* tag=3 */
+		struct bss_color_tlv color;             /* tag=4 */
+		struct bss_he_tlv he;                   /* tag=5 */
+		struct bss_rate_tlv rate;               /* tag=0xB */
+		struct bss_sap_tlv sap;                 /* tag=0xD */
+		struct bss_p2p_tlv p2p;                 /* tag=0xE */
+		struct bss_qbss_tlv qbss;               /* tag=0xF */
+		struct bss_sec_tlv sec;                 /* tag=0x10 */
+		struct bss_ifs_time_tlv ifs_time;       /* tag=0x17 */
+		struct bss_iot_tlv iot;                 /* tag=0x18 */
+		struct bss_mld_tlv mld;                 /* tag=0x1A */
 	} __packed req = {};
 
 	/* Windows RE: PM_DISABLE (tag=0x1B) 在完整 BSS_INFO 之前发送
@@ -2578,6 +2580,59 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 			req.rate.short_preamble = 0;
 		}
 	}
+
+	/* === BSS_RA TLV (tag=1) — 速率适配配置 ===
+	 * 来源: MT6639 UNI_CMD_BSSINFO_RA */
+	req.ra.tag = cpu_to_le16(UNI_BSS_INFO_RA);
+	req.ra.len = cpu_to_le16(sizeof(req.ra));
+	if (chan && chan->band == NL80211_BAND_2GHZ)
+		req.ra.short_preamble = 1;
+
+	/* === BSS_COLOR TLV (tag=4) — HE BSS Color ===
+	 * 初始认证阶段禁用 BSS Color */
+	req.color.tag = cpu_to_le16(UNI_BSS_INFO_BSS_COLOR);
+	req.color.len = cpu_to_le16(sizeof(req.color));
+	req.color.enable = 0;
+	req.color.bss_color = 0;
+
+	/* === BSS_HE TLV (tag=5) — HE 能力配置 ===
+	 * CONNAC3 固件需要此 TLV 以处理 HE BSS
+	 * au2MaxNssMcs=0: 初始阶段不设特定 NSS/MCS 限制 */
+	req.he.tag = cpu_to_le16(UNI_BSS_INFO_HE);
+	req.he.len = cpu_to_le16(sizeof(req.he));
+	req.he.txop_duration_rts_threshold = 0;
+	req.he.default_pe_duration = 0;
+	req.he.er_su_disable = 0;
+
+	/* === BSS_SAP TLV (tag=0x0D) — Soft AP 配置 ===
+	 * STA 模式: 全填 0 (无 SSID 广播) */
+	req.sap.tag = cpu_to_le16(UNI_BSS_INFO_SAP);
+	req.sap.len = cpu_to_le16(sizeof(req.sap));
+
+	/* === BSS_P2P TLV (tag=0x0E) — P2P 配置 ===
+	 * STA 模式: private_data=0 */
+	req.p2p.tag = cpu_to_le16(UNI_BSS_INFO_P2P);
+	req.p2p.len = cpu_to_le16(sizeof(req.p2p));
+
+	/* === BSS_QBSS TLV (tag=0x0F) — QoS BSS 配置 ===
+	 * WPA2 连接通常支持 QoS，设 is_qbss=1 */
+	req.qbss.tag = cpu_to_le16(UNI_BSS_INFO_QBSS);
+	req.qbss.len = cpu_to_le16(sizeof(req.qbss));
+	req.qbss.is_qbss = 1;
+
+	/* === BSS_SEC TLV (tag=0x10) — 安全配置 ===
+	 * Open System Auth 阶段: auth_mode=0, enc=0
+	 * 实际加密配置在 CONNECT 状态时更新 */
+	req.sec.tag = cpu_to_le16(UNI_BSS_INFO_SEC);
+	req.sec.len = cpu_to_le16(sizeof(req.sec));
+	req.sec.auth_mode = 0;   /* AUTH_MODE_OPEN */
+	req.sec.enc_status = 0;  /* ENCRYPT_DISABLED */
+	req.sec.cipher_suit = 0; /* no cipher */
+
+	/* === BSS_STA_IOT TLV (tag=0x18) — IoT AP 兼容 ===
+	 * iot_ap_bmp=0: 不启用特殊 IoT workaround */
+	req.iot.tag = cpu_to_le16(UNI_BSS_INFO_STA_IOT);
+	req.iot.len = cpu_to_le16(sizeof(req.iot));
 
 	/* === BSS_MLD TLV (tag=0x1A) — CONNAC3/WiFi 7 必需 ===
 	 * MT6639 在 BSS_ACTIVATE_CTRL 和 SET_BSS_INFO 中都发送此 TLV
@@ -2711,7 +2766,11 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	req.state.tag = cpu_to_le16(STA_REC_STATE);
 	req.state.len = cpu_to_le16(sizeof(req.state));
 	req.state.flags = 0;
-	req.state.state = 0; /* STA_STATE_1 (auth 前) */
+	/* STA_STATE_3 (value=2) 清除 PLE STATION_PAUSE → TX scheduler 可以分发帧
+	 * STA_STATE_1 (value=0) 设置 STATION_PAUSE → 断开时暂停 TX
+	 * 根因: 之前用 state=0 导致 STATION_PAUSE0 bit1=1, auth帧永远卡在 PLE 无法到达射频
+	 * MT6639 cnmStaRecChangeState(STATE_3) 触发固件清除 STATION_PAUSE */
+	req.state.state = enable ? 2 : 0;
 
 	/* STA_REC_HT_INFO (tag=0x09) — HT 能力
 	 * MT6639: nicUniCmdStaRecTagHtInfo() — 仅当 ht_cap 非零时发送
@@ -2877,17 +2936,13 @@ static inline struct mt7927_dev *mt7927_hw_dev(struct ieee80211_hw *hw)
 }
 
 /*
- * mt7927_mgmt_tx_worker — 管理帧通过 TX Ring 2 (SF mode) 发送
+ * mt7927_mgmt_tx_worker — 管理帧通过 TX Ring 0 (CT mode) 发送 [诊断实验]
  *
- * Windows RE 确认: 管理帧走 HW TX Ring 2，SF (Store-and-Forward) 模式:
- *   TXD(32字节) + 802.11 帧连续放在单个 DMA coherent buffer
- *   PKT_FMT = 0 (SF/CT), Q_IDX = 0
- *   DMA descriptor: buf0=phys_addr, ctrl=len|LAST_SEC0 (DMA_DONE=0=pending)
+ * 实验目的: Ring 2 SF mode 固件完全静默。历史上 Ring 0 CT mode 返回 TXFREE stat=1，
+ * 现在 BSS_INFO/DMASHDL 更完整后，换回 CT mode 看新的错误码。
  *
- * 通过 ring_tx2 (TX ring 2) 提交，用 mt7927_tx_queue_skb_sf() + mt7927_tx_kick()。
- * 在 workqueue 上下文运行 (可以睡眠)。
- *
- * 来源: docs/win_re_full_txd_dma_path.md Section 5 — Ring 2 for Management Frames
+ * CT mode: TXD+TXP 在 coherent pool，payload DMA map 分开，firmware 读 TXP 找 payload。
+ * TXD PKT_FMT=1 (CT), Q_IDX=0x10 (ALTX0/mgmt)
  */
 static void mt7927_mgmt_tx_worker(struct work_struct *work)
 {
@@ -2906,58 +2961,91 @@ static void mt7927_mgmt_tx_worker(struct work_struct *work)
 
 		hdr = (struct ieee80211_hdr *)skb->data;
 		dev_info(&dev->pdev->dev,
-			 "TX mgmt via Ring 2 SF: fc=0x%04x len=%u wcid=%d DA=%pM\n",
+			 "TX mgmt via Ring 0 CT: fc=0x%04x len=%u wcid=%d DA=%pM\n",
 			 le16_to_cpu(hdr->frame_control),
 			 skb->len,
 			 wcid ? wcid->idx : -1,
 			 hdr->addr1);
 
-		/* Check if ring_tx2 is initialized */
-		if (!dev->ring_tx2.desc) {
+		/* Check if ring_tx0 is initialized */
+		if (!dev->ring_tx0.desc) {
 			dev_err(&dev->pdev->dev,
-				"TX mgmt: ring_tx2 not initialized!\n");
+				"TX mgmt: ring_tx0 not initialized!\n");
 			dev_kfree_skb_any(skb);
 			continue;
 		}
 
-		/* Enqueue to Ring 2 via SF mode:
-		 * mt7927_tx_queue_skb_sf() allocates coherent DMA buffer,
-		 * builds TXD via mt7927_mac_write_txwi_mgmt_sf(),
-		 * copies frame after TXD, writes DMA descriptor */
-		ret = mt7927_tx_queue_skb_sf(dev, &dev->ring_tx2, skb, wcid);
+		/* Enqueue to Ring 0 via CT mode:
+		 * mt7927_tx_queue_skb() calls mt7927_tx_prepare_skb() which builds
+		 * TXD (CT mode, PKT_FMT=1, Q_IDX=0x10) + TXP in coherent pool,
+		 * DMA maps payload separately, writes DMA descriptor */
+		ret = mt7927_tx_queue_skb(dev, &dev->ring_tx0, skb, wcid);
 		if (ret) {
 			dev_err(&dev->pdev->dev,
-				"TX mgmt: enqueue to ring_tx2 failed ret=%d\n", ret);
+				"TX mgmt: enqueue to ring_tx0 failed ret=%d\n", ret);
 			dev_kfree_skb_any(skb);
 			continue;
 		}
 
-		/* Kick Ring 2 — write CIDX to trigger DMA */
-		mt7927_tx_kick(dev, &dev->ring_tx2);
+		/* Kick Ring 0 — write CIDX to trigger DMA */
+		mt7927_tx_kick(dev, &dev->ring_tx0);
 
 		dev_info(&dev->pdev->dev,
-			 "TX mgmt: submitted to ring_tx2 OK (head=%u tail=%u)\n",
-			 dev->ring_tx2.head, dev->ring_tx2.tail);
+			 "TX mgmt: submitted to ring_tx0 CT OK (head=%u tail=%u)\n",
+			 dev->ring_tx0.head, dev->ring_tx0.tail);
 
-		/* DIAG: PLE/PSE 固件内部队列状态 — 帧进入固件了吗?
-		 * 等 100ms 给固件处理时间，然后读取队列状态 */
+		/* DIAG: PLE/PSE + MIB TX 诊断
+		 * 等 500ms 给固件足够时间处理+发送，再读寄存器 */
 		{
-			u32 ple_empty, pse_empty, ple_hif, ple_free;
-			u32 dmashdl_qm0;
+			u32 ple_empty, pse_empty, ple_free;
+			/* MIB TX 计数器 (band 1 = 5GHz, auth 使用 band=1)
+			 * MT6639: BN1_WF_MIB_TOP_BASE=0x820fd000 → BAR0+0x0a4800
+			 * TBCR0 (TX_20MHZ_CNT):  MIB_BASE+0x6AC
+			 * BTBCR (TX_BYTE_CNT):   MIB_BASE+0x450 (per WLAN_IDX)
+			 * TRDR0 (TX_OK_MPDU):    MIB_BASE+0x1AC */
+			u32 mib_tbcr0_b0, mib_tbcr0_b1;
+			u32 mib_btbcr_b1, mib_trdr0_b1;
 
-			msleep(100);
+			msleep(500);
 
-			ple_empty = mt7927_rr_l1(dev, 0x820c0360);
-			pse_empty = mt7927_rr_l1(dev, 0x820c80b0);
-			ple_hif   = mt7927_rr_l1(dev, 0x820c000c);
-			ple_free  = mt7927_rr_l1(dev, 0x820c0008);
-			dmashdl_qm0 = mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0);
+			/* PLE_QUEUE_EMPTY: BAR0+0x080b0 (PLE_BASE+0xb0)
+			 * PSE_QUEUE_EMPTY: BAR0+0x0c0b0 (PSE_BASE+0xb0)
+			 * PLE_FREEPG_CNT:  BAR0+0x08100 (PLE_BASE+0x100) */
+			ple_empty = mt7927_rr(dev, 0x080b0);
+			pse_empty = mt7927_rr(dev, 0x0c0b0);
+			ple_free  = mt7927_rr(dev, 0x08100);
+
+			/* MIB TX counters: confirm if auth frame reached PHY */
+			mib_tbcr0_b0 = mt7927_rr(dev, 0x024800 + 0x6ac); /* band0 TX_20MHz_CNT */
+			mib_tbcr0_b1 = mt7927_rr(dev, 0x0a4800 + 0x6ac); /* band1 TX_20MHz_CNT */
+			mib_btbcr_b1 = mt7927_rr(dev, 0x0a4800 + 0x450); /* band1 TX_BYTE_CNT[0] */
+			mib_trdr0_b1 = mt7927_rr(dev, 0x0a4800 + 0x1ac); /* band1 TX_OK_MPDU */
 
 			dev_info(&dev->pdev->dev,
-				 "POST-TX DIAG: PLE_EMPTY=0x%08x PSE_EMPTY=0x%08x "
-				 "PLE_HIF=0x%08x PLE_FREE=0x%08x QMAP0=0x%08x\n",
-				 ple_empty, pse_empty, ple_hif, ple_free,
-				 dmashdl_qm0);
+				 "POST-TX DIAG: PLE_EMPTY=0x%08x PSE_EMPTY=0x%08x PLE_FREE=0x%08x\n",
+				 ple_empty, pse_empty, ple_free);
+			dev_info(&dev->pdev->dev,
+				 "POST-TX MIB: B0_TX20=%u B1_TX20=%u B1_TXBYTE=0x%x B1_TXOK=%u\n",
+				 mib_tbcr0_b0, mib_tbcr0_b1, mib_btbcr_b1, mib_trdr0_b1);
+
+			/* DMASHDL 诊断寄存器 (BAR0 base=0xd6000) */
+			{
+				u32 dmashdl_err   = mt7927_rr(dev, 0xd60dc); /* ERROR_FLAG_CTRL */
+				u32 dmashdl_sta   = mt7927_rr(dev, 0xd6100); /* STATUS_RD: free+ffa */
+				u32 dmashdl_gp0   = mt7927_rr(dev, 0xd6140); /* STATUS_RD_GP0 */
+				u32 dmashdl_pkt0  = mt7927_rr(dev, 0xd6180); /* RD_GROUP_PKT_CNT0 */
+				u32 dmashdl_ctrl  = mt7927_rr(dev, 0xd6018); /* CONTROL_SIGNAL */
+				u32 dmashdl_dbg0  = mt7927_rr(dev, 0xd60c0); /* DEBUG_PORT00 */
+				u32 dmashdl_dbg1  = mt7927_rr(dev, 0xd60c4); /* DEBUG_PORT01 */
+				u32 glo_ext0      = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT0);
+
+				dev_info(&dev->pdev->dev,
+					 "DMASHDL: ERR=0x%08x STA=0x%08x GP0=0x%08x PKT0=0x%08x\n",
+					 dmashdl_err, dmashdl_sta, dmashdl_gp0, dmashdl_pkt0);
+				dev_info(&dev->pdev->dev,
+					 "DMASHDL: CTRL=0x%08x DBG0=0x%08x DBG1=0x%08x EXT0=0x%08x\n",
+					 dmashdl_ctrl, dmashdl_dbg0, dmashdl_dbg1, glo_ext0);
+			}
 		}
 
 		dev_kfree_skb_any(skb);
@@ -3863,6 +3951,7 @@ static int mt7927_pci_probe(struct pci_dev *pdev,
 
 	dev->pdev = pdev;
 	pci_set_drvdata(pdev, dev);
+	dev->tx_mgmt_pid = 1;	/* PID=0 无效 (Windows RE: 有效范围 1-99) */
 
 	/* PCI 初始化 */
 	ret = pci_enable_device(pdev);

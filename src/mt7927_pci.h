@@ -1437,19 +1437,24 @@ struct mt7927_mcu_scan_chinfo_event {
 #define CONN_STATE_CONNECT		1
 #define CONN_STATE_PORT_SECURE		2
 
-/* BSS_INFO_UPDATE TLV tags */
+/* BSS_INFO_UPDATE TLV tags
+ * 来源: MT6639 nic_uni_cmd_event.h ENUM_UNI_CMD_BSSINFO_TAG */
 enum {
 	UNI_BSS_INFO_BASIC = 0,
+	UNI_BSS_INFO_RA = 1,       /* rate adaptation */
 	UNI_BSS_INFO_RLM = 2,
 	UNI_BSS_INFO_PROTECT = 3,
-	UNI_BSS_INFO_BSS_COLOR = 5,
-	UNI_BSS_INFO_HE = 7,
+	UNI_BSS_INFO_BSS_COLOR = 4, /* FIXED: mt6639=4, was wrong 5 */
+	UNI_BSS_INFO_HE = 5,        /* FIXED: mt6639=5, was wrong 7 */
 	UNI_BSS_INFO_RATE = 11,
+	UNI_BSS_INFO_SAP = 13,     /* Soft AP / SSID config (0x0D) */
+	UNI_BSS_INFO_P2P = 14,     /* P2P (0x0E) */
 	UNI_BSS_INFO_QBSS = 15,
 	UNI_BSS_INFO_SEC = 16,
 	UNI_BSS_INFO_IFS_TIME = 23,
+	UNI_BSS_INFO_STA_IOT = 24, /* IoT AP compatibility (0x18) */
 	UNI_BSS_INFO_MLD = 26,
-	UNI_BSS_INFO_PM = 27,  /* Windows RE: PM disable before BSS activate */
+	UNI_BSS_INFO_PM = 27,      /* Windows RE: PM disable before BSS activate */
 };
 
 /* DEV_INFO_UPDATE TLV tags */
@@ -1645,6 +1650,96 @@ struct bss_mld_tlv {
 	u8 own_mld_id;		/* = bss_idx */
 	u8 own_mld_addr[ETH_ALEN];
 	u8 om_remap_idx;	/* 0xff = OM_REMAP_IDX_NONE */
+	u8 rsv[3];
+} __packed;
+
+/* BSS_INFO_RA TLV (tag=1) — 速率适配配置
+ * 来源: MT6639 UNI_CMD_BSSINFO_RA (16B) */
+struct bss_ra_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 short_preamble;    /* 2.4GHz=1, 5GHz=0 */
+	u8 force_short_gi;    /* 0=auto */
+	u8 force_gf;          /* 0=auto */
+	u8 ht_mode;           /* 0=auto */
+	u8 se_off;            /* 0 */
+	u8 antenna_idx;       /* 0 */
+	__le16 max_phy_rate;  /* 0=auto */
+	u8 force_tx_stream;   /* 0=auto */
+	u8 pad[3];
+} __packed;
+
+/* BSS_INFO_BSS_COLOR TLV (tag=4) — HE BSS Color
+ * 来源: MT6639 UNI_CMD_BSSINFO_BSS_COLOR (8B) */
+struct bss_color_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 enable;       /* 0=disabled */
+	u8 bss_color;    /* 0=no color */
+	u8 pad[2];
+} __packed;
+
+/* BSS_INFO_HE TLV (tag=5) — HE 能力配置
+ * 来源: MT6639 UNI_CMD_BSSINFO_HE (16B) */
+struct bss_he_tlv {
+	__le16 tag;
+	__le16 len;
+	__le16 txop_duration_rts_threshold; /* 0=disabled */
+	u8 default_pe_duration;             /* 0=0us */
+	u8 er_su_disable;                   /* 0=enabled */
+	__le16 max_nss_mcs[3];             /* max NSS per MCS group */
+	u8 pad[2];
+} __packed;
+
+/* BSS_INFO_SAP TLV (tag=0x0D) — Soft AP / SSID 配置
+ * STA 模式全填 0；AP 模式填 SSID
+ * 来源: MT6639 UNI_CMD_BSSINFO_SAP (40B) */
+struct bss_sap_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 is_hidden_ssid;
+	u8 pad[2];
+	u8 ssid_len;
+	u8 ssid[32];
+} __packed;
+
+/* BSS_INFO_P2P TLV (tag=0x0E) — P2P 配置
+ * STA 模式填 0
+ * 来源: MT6639 UNI_CMD_BSSINFO_P2P (8B) */
+struct bss_p2p_tlv {
+	__le16 tag;
+	__le16 len;
+	__le32 private_data;
+} __packed;
+
+/* BSS_INFO_QBSS TLV (tag=0x0F) — QoS BSS 配置
+ * 来源: MT6639 UNI_CMD_BSSINFO_QBSS (8B) */
+struct bss_qbss_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 is_qbss;   /* 1=QoS BSS */
+	u8 pad[3];
+} __packed;
+
+/* BSS_INFO_SEC TLV (tag=0x10) — 安全配置
+ * auth_mode: 0=AUTH_MODE_OPEN, 7=WPA2_PSK
+ * enc_status: 0=no enc, 4=AES_CCMP
+ * 来源: MT6639 UNI_CMD_BSSINFO_SEC (8B) */
+struct bss_sec_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 auth_mode;    /* AUTH_MODE_OPEN=0 */
+	u8 enc_status;   /* ENCRYPT_DISABLED=0 */
+	u8 cipher_suit;  /* 0=none */
+	u8 pad;
+} __packed;
+
+/* BSS_INFO_STA_IOT TLV (tag=0x18) — IoT AP 兼容配置
+ * 来源: MT6639 UNI_CMD_BSSINFO_IOT (8B) */
+struct bss_iot_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 iot_ap_bmp;  /* 0=no IoT workaround */
 	u8 rsv[3];
 } __packed;
 
