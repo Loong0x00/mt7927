@@ -94,16 +94,17 @@
  *   BIT(25) = 未确定 (可能 WDT)
  *   BIT(15:12) = 0xF = RX ring 4/5/6/7 完成中断
  */
-/* Windows 中断掩码 + TX ring 0 完成中断 (BIT(4))
- * 原始 Windows: 0x2600f000, 加 BIT(4) 给 TX data ring
+/* Windows 中断掩码 + TX ring 0/2 完成中断 (BIT(4)+BIT(6))
+ * 原始 Windows: 0x2600f000, 加 BIT(4) 给 TX data ring, BIT(6) 给 TX mgmt ring 2
  * 来源: mt76/mt792x_regs.h HOST_TX_DONE_INT_ENA0 = BIT(4) */
-#define MT_WFDMA_INT_MASK_WIN       0x2600f010
+#define MT_WFDMA_INT_MASK_WIN       0x2600f050
 
 /* 中断位定义 */
 #define HOST_RX_DONE_INT_ENA0       BIT(0)
 #define HOST_RX_DONE_INT_ENA1       BIT(1)
 #define HOST_RX_DONE_INT_ENA(n)     BIT(n)   /* RX done for ring n (0-7) */
 #define HOST_TX_DONE_INT_ENA0       BIT(4)   /* TX ring 0 data done */
+#define HOST_TX_DONE_INT_ENA2       BIT(6)   /* TX ring 2 mgmt done */
 #define HOST_TX_DONE_INT_ENA15      BIT(25)
 #define HOST_TX_DONE_INT_ENA16      BIT(26)
 #define HOST_TX_DONE_INT_ENA17      BIT(27)
@@ -603,15 +604,18 @@
 /* PostFwDownloadInit MCU 命令 class
  * 来源: analysis_windows_full_init.md 行 739-747
  */
-#define MT_MCU_CLASS_NIC_CAP        0x8a  /* NIC capability */
-#define MT_MCU_CLASS_CONFIG         0x02  /* Config 命令 */
-#define MT_MCU_CLASS_WFDMA_CFG      0xc0  /* WFDMA 配置 */
+/* UniCmd inner CID 定义 (来源: Windows dispatch table @ VA 0x1402507E0)
+ * 注意: inner CID ≠ legacy outer tag! outer tag 仅用于 dispatch lookup,
+ *       inner CID 写入 UniCmd header offset 0x22 */
+#define MT_MCU_CLASS_NIC_CAP        0x8a  /* NIC capability (outer=0x8a) — 未用, NIC_CAP 走 UNI_CMD_ID_NIC_CAP */
+#define MT_MCU_CLASS_CONFIG         0x0b  /* Config 命令 (outer=0x02, inner=0x0b) */
+#define MT_MCU_CLASS_WFDMA_CFG      0x0d  /* WFDMA 配置 (outer=0xc0, inner=0x0d) */
 #define MT_MCU_CLASS_BUF_DL         0xed  /* Buffer 下载 (可选) */
-#define MT_MCU_CLASS_DBDC           0x28  /* DBDC (仅 MT6639/MT7927) */
-#define MT_MCU_CLASS_SCAN_CFG       0xca  /* Scan/chip/log config */
-#define MT_MCU_CLASS_SET_DOMAIN     0x15  /* SET_DOMAIN_INFO — 信道域信息 */
-#define MT_MCU_CLASS_BAND_CONFIG    0x08  /* BAND_CONFIG — RTS 阈值等 */
-#define MT_MCU_CLASS_EFUSE_CTRL     0x2d  /* EFUSE_CTRL — EEPROM 模式 */
+#define MT_MCU_CLASS_DBDC           0x28  /* DBDC (outer=inner=0x28, MT6639/MT7927) */
+#define MT_MCU_CLASS_SCAN_CFG       0x0e  /* SCAN_CFG (outer=0xca, inner=0x0e) */
+#define MT_MCU_CLASS_SET_DOMAIN     0x03  /* SET_DOMAIN regulatory (outer=0x07, inner=0x03) */
+#define MT_MCU_CLASS_BAND_CONFIG    0x49  /* BAND_CONFIG (outer=0x93, inner=0x49) */
+#define MT_MCU_CLASS_EFUSE_CTRL     0x05  /* EFUSE_CTRL EEPROM (outer=0x58, inner=0x05, handler 0x140144cd0) */
 #define MT_MCU_TARGET               0xed  /* 所有命令使用 target=0xed */
 
 #define MT_MCU_CMD_WAKE_RX_PCIE     BIT(0)
@@ -691,7 +695,7 @@ struct mt7927_mcu_uni_txd {
 
 /* UniCmd IDs (class values from Windows CONNAC3 routing table)
  * 来源: ghidra_post_fw_init.md — CONNAC3 Command Routing Table */
-#define UNI_CMD_ID_NIC_CAP     0x008a   /* NIC capability query (class=0x8a) */
+#define UNI_CMD_ID_NIC_CAP     0x000e   /* NIC capability query — Windows inner CID=0x0e (outer tag=0x8a is dispatch key, NOT the header CID!) */
 #define UNI_CMD_ID_CONFIG      0x0002   /* Config cmd (class=0x02) */
 #define UNI_CMD_ID_CHIP_CONFIG  0x000E
 #define UNI_CMD_ID_POWER_CTRL   0x000F
@@ -909,6 +913,9 @@ struct mt7927_dev {
 	bool roc_active;			/* ROC 会话活跃中 — 阻止扫描 */
 	u8 roc_grant_band_idx;			/* ROC_GRANT 返回的 dbdcband */
 
+	/* TX mgmt PID counter (rotating 1-99, Windows RE verified) */
+	u8 tx_mgmt_pid;
+
 	/* 扫描状态 */
 	u8 scan_seq_num;			/* 扫描序列号 */
 	unsigned long scan_state;		/* BIT(0)=SCANNING */
@@ -919,10 +926,12 @@ struct mt7927_dev {
 	struct napi_struct napi_rx_mcu;		/* RX MCU NAPI */
 	struct napi_struct tx_napi;		/* TX NAPI */
 	struct net_device *napi_dev;		/* NAPI dummy netdev */
+	bool napi_running;			/* NAPI 已启用, UniCmd polling 保护 */
 	u32 int_mask;				/* 中断掩码 */
 
 	/* 数据 TX ring */
 	struct mt7927_ring ring_tx0;		/* TX ring 0 - 数据 */
+	struct mt7927_ring ring_tx2;		/* TX ring 2 - 管理帧 (SF mode) */
 
 	/* TX token management (CT mode) */
 	struct {
@@ -1416,7 +1425,7 @@ struct mt7927_mcu_scan_chinfo_event {
 /* 连接相关 CID */
 #define MCU_UNI_CMD_DEV_INFO		0x01
 #define MCU_UNI_CMD_BSS_INFO		0x02
-#define MCU_UNI_CMD_STA_REC		0x03
+#define MCU_UNI_CMD_STA_REC		0x25	/* Windows inner CID=0x25 (outer tag=0xb1); was 0x03 (WRONG - mt76 convention) */
 
 /* 网络类型 */
 #define NETWORK_INFRA			BIT(16)
@@ -1440,6 +1449,7 @@ enum {
 	UNI_BSS_INFO_SEC = 16,
 	UNI_BSS_INFO_IFS_TIME = 23,
 	UNI_BSS_INFO_MLD = 26,
+	UNI_BSS_INFO_PM = 27,  /* Windows RE: PM disable before BSS activate */
 };
 
 /* DEV_INFO_UPDATE TLV tags */
@@ -1459,8 +1469,9 @@ enum {
 	STA_REC_APPS = 0x0b,	/* not used */
 	STA_REC_WTBL = 0x0d,
 	STA_REC_PHY = 0x15,
-	STA_REC_HE = 0x17,
-	STA_REC_HE_6G = 0x25,
+	STA_REC_HE_6G_CAP = 0x17,	/* HE 6GHz band capabilities */
+	STA_REC_HE_BASIC = 0x19,	/* HE basic capabilities (MT6639/Windows) */
+	STA_REC_REMOVE = 0x25,		/* remove STA_REC entry */
 	STA_REC_KEY_V3 = 0x27,
 	STA_REC_HDR_TRANS = 0x2b,
 	STA_REC_EHT = 0x22,
@@ -1720,6 +1731,20 @@ struct sta_rec_vht_info {
 	u8 __rsv[3];
 } __packed;
 
+/* STA_REC_HE_BASIC TLV (tag=0x19) — HE 基础能力
+ * 来源: MT6639 UNI_CMD_STAREC_HE_BASIC, Windows nicUniCmdUpdateStaRec
+ * MT6639 和 Windows 均发送此 TLV, 固件需要它来配置 WTBL HE 能力 */
+struct sta_rec_he_basic {
+	__le16 tag;		/* STA_REC_HE_BASIC = 0x19 */
+	__le16 len;		/* sizeof = 28 */
+	u8 mac_cap[6];		/* HE MAC capability info */
+	u8 phy_cap[11];		/* HE PHY capability info */
+	u8 pkt_ext;		/* packet extension = 2 (mobile hardcoded) */
+	__le16 rx_mcs_80;	/* RX Max NSS MCS for BW <= 80MHz */
+	__le16 rx_mcs_160;	/* RX Max NSS MCS for BW = 160MHz */
+	__le16 rx_mcs_80p80;	/* RX Max NSS MCS for BW = 80+80MHz */
+} __packed;
+
 /* STA_REC_KEY_V3 TLV (tag=0x27) — 密钥安装 */
 struct sta_rec_sec_uni {
 	__le16 tag;
@@ -1772,6 +1797,8 @@ struct mt7927_mcu_rxd {
 /* TX ring 常量 (数据) */
 #define MT_TXQ_DATA_RING		0
 #define MT_TXQ_DATA_RING_SIZE		256
+#define MT_TXQ_MGMT_RING		2	/* TX ring 2 - management frames (SF mode) */
+#define MT_TXQ_MGMT_RING_SIZE		256
 
 /* ============================================================================
  * 函数声明 (mt7927_mac.c, mt7927_dma.c)
@@ -1793,6 +1820,9 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 			    struct sk_buff *skb, struct mt7927_wcid *wcid,
 			    struct ieee80211_key_conf *key, int pid,
 			    bool beacon);
+void mt7927_mac_write_txwi_mgmt_sf(struct mt7927_dev *dev, __le32 *txwi,
+				    struct sk_buff *skb,
+				    struct mt7927_wcid *wcid);
 int mt7927_tx_prepare_skb(struct mt7927_dev *dev, struct sk_buff *skb,
 			  struct mt7927_wcid *wcid, int *token_out,
 			  dma_addr_t *txwi_dma_out);
@@ -1817,8 +1847,11 @@ int mt7927_poll_tx(struct napi_struct *napi, int budget);
 /* dma.c — TX/RX */
 int mt7927_tx_queue_skb(struct mt7927_dev *dev, struct mt7927_ring *ring,
 			struct sk_buff *skb, struct mt7927_wcid *wcid);
+int mt7927_tx_queue_skb_sf(struct mt7927_dev *dev, struct mt7927_ring *ring,
+			   struct sk_buff *skb, struct mt7927_wcid *wcid);
 void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring);
 void mt7927_tx_complete(struct mt7927_dev *dev, struct mt7927_ring *ring);
+void mt7927_tx_complete_sf(struct mt7927_dev *dev, struct mt7927_ring *ring);
 int mt7927_dma_init_data_rings(struct mt7927_dev *dev);
 void mt7927_rx_refill(struct mt7927_dev *dev, struct mt7927_ring *ring);
 

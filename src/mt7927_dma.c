@@ -82,9 +82,10 @@ static inline void dma_rmw(struct mt7927_dev *dev, u32 reg, u32 clr, u32 set)
 
 /* TX done — reuse header definitions */
 #define MT_INT_TX_DONE_DATA	HOST_TX_DONE_INT_ENA0   /* BIT(4) — TX ring 0 data */
+#define MT_INT_TX_DONE_MGMT	HOST_TX_DONE_INT_ENA2   /* BIT(6) — TX ring 2 mgmt */
 #define MT_INT_TX_DONE_WM	HOST_TX_DONE_INT_ENA15  /* BIT(25) */
 #define MT_INT_TX_DONE_FWDL	HOST_TX_DONE_INT_ENA16  /* BIT(26) */
-#define MT_INT_TX_DONE_ALL	(MT_INT_TX_DONE_DATA | MT_INT_TX_DONE_WM | MT_INT_TX_DONE_FWDL)
+#define MT_INT_TX_DONE_ALL	(MT_INT_TX_DONE_DATA | MT_INT_TX_DONE_MGMT | MT_INT_TX_DONE_WM | MT_INT_TX_DONE_FWDL)
 
 /* ============================================================================
  * RX Processing Helpers
@@ -196,6 +197,10 @@ irqreturn_t mt7927_irq_handler(int irq, void *dev_instance)
 	/* Debug: log interrupt bits (rate-limited via printk_ratelimited) */
 	dev_info_ratelimited(&dev->pdev->dev,
 			     "IRQ: intr=0x%08x\n", intr);
+	/* Specific log for TX ring 2 done (BIT(6)) to track auth TX */
+	if (intr & MT_INT_TX_DONE_MGMT)
+		dev_info(&dev->pdev->dev,
+			 "IRQ: TX_DONE_MGMT (ring2) BIT(6) fired!\n");
 
 	/* Save interrupt status for tasklet */
 	dev->int_mask = intr;
@@ -377,6 +382,10 @@ int mt7927_poll_tx(struct napi_struct *napi, int budget)
 	if (dev->ring_tx0.desc)
 		mt7927_tx_complete(dev, &dev->ring_tx0);
 
+	/* Process mgmt TX ring 2 completions (SF mode) */
+	if (dev->ring_tx2.desc)
+		mt7927_tx_complete_sf(dev, &dev->ring_tx2);
+
 	napi_complete(napi);
 
 	/* Re-enable TX done interrupts */
@@ -450,6 +459,116 @@ int mt7927_tx_queue_skb(struct mt7927_dev *dev, struct mt7927_ring *ring,
 }
 
 /*
+ * mt7927_tx_queue_skb_sf — Enqueue a management frame in SF (Store-and-Forward) mode
+ *
+ * SF mode: TXD (32 bytes) + 802.11 frame are placed contiguously in a single
+ * DMA-coherent buffer. The DMA descriptor points directly to this buffer.
+ * No TXP scatter-gather, no token management needed.
+ *
+ * The skb is freed after DMA submission (synchronous path via workqueue).
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+int mt7927_tx_queue_skb_sf(struct mt7927_dev *dev, struct mt7927_ring *ring,
+			   struct sk_buff *skb, struct mt7927_wcid *wcid)
+{
+	struct mt76_desc *desc;
+	int total_len = MT_TXD_SIZE + skb->len;
+	dma_addr_t dma;
+	void *buf;
+	__le32 *txwi;
+	u32 ctrl;
+	u16 idx;
+
+	/* Check ring full */
+	if (((ring->head + 1) % ring->ndesc) == ring->tail) {
+		dev_dbg(&dev->pdev->dev,
+			"TX ring %d full (head=%u tail=%u)\n",
+			ring->qid, ring->head, ring->tail);
+		return -ENOSPC;
+	}
+
+	/* Allocate coherent DMA buffer for TXD + frame */
+	buf = dma_alloc_coherent(&dev->pdev->dev, total_len, &dma, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	/* Build TXD at start of buffer */
+	txwi = (__le32 *)buf;
+	mt7927_mac_write_txwi_mgmt_sf(dev, txwi, skb, wcid);
+
+	/* Copy 802.11 frame right after TXD */
+	memcpy(buf + MT_TXD_SIZE, skb->data, skb->len);
+
+	idx = ring->head;
+	desc = &ring->desc[idx];
+
+	/* Fill DMA descriptor: buf0 = coherent DMA address of TXD+frame */
+	desc->buf0 = cpu_to_le32(lower_32_bits(dma));
+	desc->buf1 = cpu_to_le32(0);
+	desc->info = cpu_to_le32(0);
+
+	/* ctrl: total length + LAST_SEC0, DMA_DONE=0 (pending) */
+	ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, total_len) |
+	       MT_DMA_CTL_LAST_SEC0;
+	desc->ctrl = cpu_to_le32(ctrl);
+
+	/* Store coherent buffer info for cleanup in ring slot
+	 * buf = coherent virtual addr, buf_dma = coherent DMA addr
+	 * We pack the total_len into the upper bits isn't needed —
+	 * we'll just store the pointer and DMA addr for free later */
+	ring->buf[idx] = buf;
+	ring->buf_dma[idx] = dma;
+
+	/* Advance producer index */
+	ring->head = (ring->head + 1) % ring->ndesc;
+
+	return 0;
+}
+
+/*
+ * mt7927_tx_complete_sf — Process completed TX descriptors for SF mode ring
+ *
+ * In SF mode, the DMA buffer contains TXD+frame in coherent memory.
+ * We need to free the coherent buffer when DMA is done.
+ * The total_len can be extracted from the descriptor's SD_LEN0 field.
+ */
+void mt7927_tx_complete_sf(struct mt7927_dev *dev, struct mt7927_ring *ring)
+{
+	u32 dma_idx;
+
+	if (!ring->desc || !ring->buf)
+		return;
+
+	dma_idx = dma_rr(dev, MT_WPDMA_TX_RING_DIDX(ring->qid));
+
+	while (ring->tail != dma_idx) {
+		struct mt76_desc *desc = &ring->desc[ring->tail];
+		void *buf = ring->buf[ring->tail];
+		dma_addr_t dma = ring->buf_dma[ring->tail];
+
+		if (buf && dma) {
+			u32 ctrl = le32_to_cpu(desc->ctrl);
+			u32 len = FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl);
+
+			if (len == 0)
+				len = MT_TXD_SIZE + 256; /* fallback */
+			dma_free_coherent(&dev->pdev->dev, len, buf, dma);
+		}
+
+		ring->buf[ring->tail] = NULL;
+		ring->buf_dma[ring->tail] = 0;
+
+		desc->buf0 = 0;
+		desc->ctrl = cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+		desc->buf1 = 0;
+		desc->info = 0;
+
+		ring->tail = (ring->tail + 1) % ring->ndesc;
+	}
+}
+
+/*
  * mt7927_tx_kick — Submit queued TX descriptors to hardware
  *
  * After one or more descriptors have been enqueued via mt7927_tx_queue_skb(),
@@ -473,14 +592,30 @@ void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring)
 			 "TX%d kick: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
 			 ring->qid, base, cnt, cidx, didx);
 	}
+
+	/* PLE/PSE 诊断 — 确认帧是否进入固件内部队列 */
+	if (ring->qid == MT_TXQ_MGMT_RING) {
+		msleep(100);
+		dev_info(&dev->pdev->dev,
+			 "POST-TX diag: PLE_EMPTY=0x%08x PSE_EMPTY=0x%08x "
+			 "QMAP0=0x%08x DIDX=%u\n",
+			 mt7927_rr_l1(dev, 0x820c0360),
+			 mt7927_rr_l1(dev, 0x820c80b0),
+			 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0),
+			 dma_rr(dev, MT_WPDMA_TX_RING_DIDX(ring->qid)));
+	}
 }
 
 /*
- * mt7927_tx_complete — Process completed TX descriptors (CT mode)
+ * mt7927_tx_complete — Process completed TX descriptors (CT mode + SF mode)
  *
- * In CT mode, the actual skb cleanup (DMA unmap + kfree) is done
- * by the TXFREE event handler (mt7927_mac_tx_free). This function
- * only advances the ring tail to free descriptor slots.
+ * Handles two types of entries on the same ring:
+ *   CT mode: ring->buf stores token (small integer cast to void*),
+ *            skb freed by TXFREE event handler, we just clear the slot.
+ *   SF mode: ring->buf stores kernel virtual address from dma_alloc_coherent(),
+ *            we must free the coherent buffer here.
+ *
+ * Distinguishing: CT token values are 0-255, SF virtual addresses are >0x10000.
  *
  * Scans from ring->tail up to the hardware's DMA index (DIDX).
  */
@@ -496,8 +631,23 @@ void mt7927_tx_complete(struct mt7927_dev *dev, struct mt7927_ring *ring)
 
 	while (ring->tail != dma_idx) {
 		struct mt76_desc *desc = &ring->desc[ring->tail];
+		void *buf = ring->buf[ring->tail];
+		dma_addr_t dma = ring->buf_dma[ring->tail];
 
-		/* Clear the ring slot (skb freed by TXFREE event) */
+		/* Check if this is an SF mode entry (kernel virtual addr)
+		 * vs CT mode entry (small token integer) */
+		if (buf && (unsigned long)buf > MT7927_TOKEN_SIZE) {
+			/* SF mode: free coherent DMA buffer */
+			u32 ctrl = le32_to_cpu(desc->ctrl);
+			u32 len = FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl);
+
+			if (len == 0)
+				len = MT_TXD_SIZE + 256;
+			if (dma)
+				dma_free_coherent(&dev->pdev->dev, len, buf, dma);
+		}
+
+		/* Clear the ring slot */
 		ring->buf[ring->tail] = NULL;
 		ring->buf_dma[ring->tail] = 0;
 
@@ -599,6 +749,67 @@ int mt7927_dma_init_data_rings(struct mt7927_dev *dev)
 	dev_info(&dev->pdev->dev,
 		 "TX ring %d: ndesc=%u desc_dma=0x%pad\n",
 		 qid, ndesc, &ring->desc_dma);
+
+	/* ============================================================
+	 * Initialize TX Ring 2 — management frames (SF mode)
+	 *
+	 * Windows uses Ring 2 for management frame TX with SF mode.
+	 * Ring 2 registers: BASE=0xd4320, CNT=0xd4324, CIDX=0xd4328
+	 * (matches MT_WPDMA_TX_RING_BASE(2) = MT_WFDMA0(0x0300 + 0x20) = 0xd4320)
+	 * ============================================================ */
+	{
+		struct mt7927_ring *mgmt = &dev->ring_tx2;
+		u16 mgmt_ndesc = MT_TXQ_MGMT_RING_SIZE;
+		u16 mgmt_qid = MT_TXQ_MGMT_RING;
+
+		mgmt->qid = mgmt_qid;
+		mgmt->ndesc = mgmt_ndesc;
+		mgmt->head = 0;
+		mgmt->tail = 0;
+		mgmt->buf_size = 0;
+
+		mgmt->desc = dma_alloc_coherent(&dev->pdev->dev,
+						mgmt_ndesc * sizeof(struct mt76_desc),
+						&mgmt->desc_dma, GFP_KERNEL);
+		if (!mgmt->desc) {
+			dev_warn(&dev->pdev->dev,
+				 "TX ring 2 desc alloc failed\n");
+			goto skip_ring2;
+		}
+
+		mgmt->buf = kcalloc(mgmt_ndesc, sizeof(*mgmt->buf), GFP_KERNEL);
+		mgmt->buf_dma = kcalloc(mgmt_ndesc, sizeof(*mgmt->buf_dma), GFP_KERNEL);
+		if (!mgmt->buf || !mgmt->buf_dma) {
+			kfree(mgmt->buf);
+			kfree(mgmt->buf_dma);
+			mgmt->buf = NULL;
+			mgmt->buf_dma = NULL;
+			dma_free_coherent(&dev->pdev->dev,
+					  mgmt_ndesc * sizeof(struct mt76_desc),
+					  mgmt->desc, mgmt->desc_dma);
+			mgmt->desc = NULL;
+			dev_warn(&dev->pdev->dev,
+				 "TX ring 2 buf alloc failed\n");
+			goto skip_ring2;
+		}
+
+		/* Initialize descriptors: DMA_DONE=1 (idle) */
+		for (i = 0; i < mgmt_ndesc; i++)
+			mgmt->desc[i].ctrl = cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+
+		/* Program WFDMA hardware registers */
+		dma_wr(dev, MT_WPDMA_TX_RING_BASE(mgmt_qid),
+		       lower_32_bits(mgmt->desc_dma));
+		dma_wr(dev, MT_WPDMA_TX_RING_CNT(mgmt_qid), mgmt_ndesc);
+		dma_wr(dev, MT_WPDMA_TX_RING_CIDX(mgmt_qid), 0);
+		dma_wr(dev, MT_WPDMA_TX_RING_DIDX(mgmt_qid), 0);
+
+		dev_info(&dev->pdev->dev,
+			 "TX ring %d (mgmt SF): ndesc=%u desc_dma=0x%pad BASE=0x%08x\n",
+			 mgmt_qid, mgmt_ndesc, &mgmt->desc_dma,
+			 MT_WPDMA_TX_RING_BASE(mgmt_qid));
+	}
+skip_ring2:
 
 	return 0;
 
