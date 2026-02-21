@@ -536,9 +536,20 @@ DIAG[TX_AUTH]:    PLE_STA0=0x0000000a PLE_STA1=0x00000005
 | 3. 逐命令 PAUSE 快照 | 6 个诊断点 | PLE 全程稳定 0xa | 否 |
 | 4. STA_REC state=0 | auth 前 state=0 | 无改善 | 否 |
 
-**下一步**: MPDU_ERR status=3 cnt=30 — 固件在尝试发帧但 30 次重试全部失败。
+### Test 5-7: BSS_INFO BASIC 字段逐个测试 (2026-02-22, Session 25)
+
+| Test | 字段 | 改动 | 结果 |
+|------|------|------|------|
+| 5 | +1F link_idx→band_info | `req.basic.link_idx = mvif->band_idx` | 无改善 |
+| 6 | +7 band_idx→sco=0xFF + +1F | `band_idx=0xFF` + `link_idx=band_idx` | 无改善 |
+| 7 | +1C nonht_basic_phy→wlan_idx | `nonht_basic_phy = wcid.idx` | 无改善 |
+
+**结论**: BSS_INFO BASIC 的三个争议字段 (+7/+1C/+1F) 单独或组合修改均不影响 MPDU_ERR。问题不在 BASIC TLV 字段布局。
+
+**下一步**: MPDU_ERR status=3 cnt=30 根因仍未找到。
 - 需解码 TXS 错误位 (ACK_TIMEOUT/RTS_TIMEOUT/QUEUE_TIMEOUT) 确认失败类型
-- BSS_INFO BASIC 字段逐个测试 (+1F band_info, +7 sco, +1C wlan_idx)
+- 考虑管理帧 TX 路径 (Ring 0 CT vs Ring 2 SF)
+- 考虑射频/信道配置问题
 
 ---
 
