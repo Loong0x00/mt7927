@@ -49,6 +49,42 @@ static inline s8 mt7927_rcpi_to_rssi(u8 rcpi)
 }
 
 /* ============================================================================
+ * TXS 解码辅助函数 — 解析 CONNAC3 TXS 错误位
+ * ============================================================================ */
+
+/*
+ * 解码一条 TXS 记录并打印关键字段:
+ *   ack_to   = BIT(16): 帧已发出但未收到 ACK (帧到达空中但 AP 未响应)
+ *   rts_to   = BIT(17): RTS 超时 (帧可能未离开芯片)
+ *   q_to     = BIT(18): 队列超时 (帧从未发出)
+ *   rate     = [13:0]:  实际使用的发送速率
+ *   band/wcid/pid/ts: 用于关联到具体帧
+ */
+static void mt7927_mac_dump_txs(struct mt7927_dev *dev, const __le32 *txs_data,
+				const char *src)
+{
+	u32 txs0 = le32_to_cpu(txs_data[0]);
+	u32 txs2 = le32_to_cpu(txs_data[2]);
+	u32 txs3 = le32_to_cpu(txs_data[3]);
+	u32 txs4 = le32_to_cpu(txs_data[4]);
+	u8  ack_err = FIELD_GET(MT_TXS0_ACK_ERROR_MASK, txs0);
+	u16 tx_rate = FIELD_GET(MT_TXS0_TX_RATE, txs0);
+	u8  band    = FIELD_GET(MT_TXS2_BAND, txs2);
+	u16 wcid    = FIELD_GET(MT_TXS2_WCID, txs2);
+	u8  pid     = FIELD_GET(MT_TXS3_PID, txs3);
+	u32 ts      = FIELD_GET(MT_TXS4_TIMESTAMP, txs4);
+
+	/* 按 CONNAC3 TXS 格式解码关键错误位和上下文 */
+	dev_info(&dev->pdev->dev,
+		 "%s: ack_err=0x%x ack_to=%u rts_to=%u q_to=%u rate=0x%04x band=%u wcid=%u pid=%u ts=0x%08x\n",
+		 src, ack_err,
+		 !!(txs0 & MT_TXS0_ACK_TIMEOUT),
+		 !!(txs0 & MT_TXS0_RTS_TIMEOUT),
+		 !!(txs0 & MT_TXS0_QUEUE_TIMEOUT),
+		 tx_rate, band, wcid, pid, ts);
+}
+
+/* ============================================================================
  * TX path: TXD construction (CONNAC3 format, 8 DWORDs = 32 bytes)
  * ============================================================================ */
 
@@ -1311,16 +1347,34 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 		return;
 
 	case PKT_TYPE_TXS: {
-		/* TX status report — log for diagnostics */
-		u8 *data = skb->data;
-		u32 dw0 = le32_to_cpu(rxd[0]);
-		u32 dw1 = skb->len >= 8 ? le32_to_cpu(rxd[1]) : 0;
-		u32 dw2 = skb->len >= 12 ? le32_to_cpu(rxd[2]) : 0;
+		/* CONNAC3 TXS: RXD 头 (4 DW) 后跟随若干 TXS 记录, 每条 12 DW.
+		 * 遍历所有记录, 用 mt7927_mac_dump_txs() 解码错误位:
+		 *   ack_to=1 → 帧已发出但未收到 ACK (AP 侧问题)
+		 *   rts_to=1 → RTS 超时 (信道争用失败)
+		 *   q_to=1   → 队列超时 (帧从未离开芯片, 固件或 PLE 问题)
+		 */
+		__le32 *end = (__le32 *)&skb->data[skb->len];
+		__le32 *txs;
+		int txs_cnt = 0;
 
-		dev_info(&dev->pdev->dev,
-			 "TXS: len=%u DW0=0x%08x DW1=0x%08x DW2=0x%08x\n",
-			 skb->len, dw0, dw1, dw2);
-		(void)data;
+		for (txs = rxd + MT_TXS_HDR_SIZE;
+		     txs + MT_TXS_SIZE <= end;
+		     txs += MT_TXS_SIZE) {
+			mt7927_mac_dump_txs(dev, txs, "TXS");
+			txs_cnt++;
+		}
+
+		if (!txs_cnt) {
+			/* 没有完整的 TXS 记录, 打印原始头部用于调试 */
+			u32 dw0 = le32_to_cpu(rxd[0]);
+			u32 dw1 = skb->len >= 8  ? le32_to_cpu(rxd[1]) : 0;
+			u32 dw2 = skb->len >= 12 ? le32_to_cpu(rxd[2]) : 0;
+
+			dev_info(&dev->pdev->dev,
+				 "TXS: len=%u 无有效记录 DW0=0x%08x DW1=0x%08x DW2=0x%08x\n",
+				 skb->len, dw0, dw1, dw2);
+		}
+
 		dev_kfree_skb(skb);
 		return;
 	}
