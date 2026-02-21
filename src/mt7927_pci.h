@@ -608,14 +608,14 @@
  * 注意: inner CID ≠ legacy outer tag! outer tag 仅用于 dispatch lookup,
  *       inner CID 写入 UniCmd header offset 0x22 */
 #define MT_MCU_CLASS_NIC_CAP        0x8a  /* NIC capability (outer=0x8a) — 未用, NIC_CAP 走 UNI_CMD_ID_NIC_CAP */
-#define MT_MCU_CLASS_CONFIG         0x0b  /* Config 命令 (outer=0x02, inner=0x0b) */
-#define MT_MCU_CLASS_WFDMA_CFG      0x0d  /* WFDMA 配置 (outer=0xc0, inner=0x0d) */
+#define MT_MCU_CLASS_CONFIG         0x02  /* Config 命令 (mt7925: 0x02, 验证工作; Windows inner=0x0b 未验证) */
+#define MT_MCU_CLASS_WFDMA_CFG      0xc0  /* WFDMA 配置 (mt7925: 0xc0, 验证工作; Windows inner=0x0d 未验证) */
 #define MT_MCU_CLASS_BUF_DL         0xed  /* Buffer 下载 (可选) */
 #define MT_MCU_CLASS_DBDC           0x28  /* DBDC (outer=inner=0x28, MT6639/MT7927) */
-#define MT_MCU_CLASS_SCAN_CFG       0x0e  /* SCAN_CFG (outer=0xca, inner=0x0e) */
-#define MT_MCU_CLASS_SET_DOMAIN     0x03  /* SET_DOMAIN regulatory (outer=0x07, inner=0x03) */
-#define MT_MCU_CLASS_BAND_CONFIG    0x49  /* BAND_CONFIG (outer=0x93, inner=0x49) */
-#define MT_MCU_CLASS_EFUSE_CTRL     0x05  /* EFUSE_CTRL EEPROM (outer=0x58, inner=0x05, handler 0x140144cd0) */
+#define MT_MCU_CLASS_SCAN_CFG       0xca  /* Scan/chip/log config (mt7925: 0xca, 验证工作; Windows inner=0x0e 未验证) */
+#define MT_MCU_CLASS_SET_DOMAIN     0x15  /* SET_DOMAIN_INFO — 信道域信息 (mt7925: 0x15, 验证工作; Windows inner=0x03 测试失败) */
+#define MT_MCU_CLASS_BAND_CONFIG    0x08  /* BAND_CONFIG — RTS 阈值等 (mt7925: 0x08, 验证工作; Windows inner=0x49 测试失败) */
+#define MT_MCU_CLASS_EFUSE_CTRL     0x2d  /* EFUSE_CTRL — EEPROM 模式 (mt7925: 0x2d; Windows inner=0x05 未验证) */
 #define MT_MCU_TARGET               0xed  /* 所有命令使用 target=0xed */
 
 #define MT_MCU_CMD_WAKE_RX_PCIE     BIT(0)
@@ -695,7 +695,7 @@ struct mt7927_mcu_uni_txd {
 
 /* UniCmd IDs (class values from Windows CONNAC3 routing table)
  * 来源: ghidra_post_fw_init.md — CONNAC3 Command Routing Table */
-#define UNI_CMD_ID_NIC_CAP     0x000e   /* NIC capability query — Windows inner CID=0x0e (outer tag=0x8a is dispatch key, NOT the header CID!) */
+#define UNI_CMD_ID_NIC_CAP     0x008a   /* NIC capability query (mt7925: 0x8a, 验证工作; Windows inner=0x0e 未验证) */
 #define UNI_CMD_ID_CONFIG      0x0002   /* Config cmd (class=0x02) */
 #define UNI_CMD_ID_CHIP_CONFIG  0x000E
 #define UNI_CMD_ID_POWER_CTRL   0x000F
@@ -1425,7 +1425,7 @@ struct mt7927_mcu_scan_chinfo_event {
 /* 连接相关 CID */
 #define MCU_UNI_CMD_DEV_INFO		0x01
 #define MCU_UNI_CMD_BSS_INFO		0x02
-#define MCU_UNI_CMD_STA_REC		0x25	/* Windows inner CID=0x25 (outer tag=0xb1); was 0x03 (WRONG - mt76 convention) */
+#define MCU_UNI_CMD_STA_REC		0x03	/* STA_REC (mt7925: 0x03, 验证工作; Windows inner=0x25 未验证) */
 
 /* 网络类型 */
 #define NETWORK_INFRA			BIT(16)

@@ -1441,7 +1441,37 @@ static int mt7927_fw_download(struct mt7927_dev *dev)
 	return 0;
 }
 
-/* mt7927_mcu_set_eeprom 已删除 — Windows 不发送 EFUSE_CTRL, 格式错误会破坏 RF 配置 */
+/* EFUSE_CTRL / EEPROM (CID=0x2d, tag=0x02)
+ * 来源: mt7925 — 在 5d87f81 中验证工作 (scan 61 BSS)
+ * 删除后 scan 回归, 恢复之 */
+static int mt7927_mcu_set_eeprom(struct mt7927_dev *dev)
+{
+	struct {
+		u8 _rsv[4];
+		__le16 tag;
+		__le16 len;
+		u8 buffer_mode;
+		u8 format;
+		__le16 buf_len;
+	} __packed req = {
+		.tag = cpu_to_le16(0x02),  /* UNI_EFUSE_BUFFER_MODE */
+		.len = cpu_to_le16(sizeof(req) - 4),
+		.buffer_mode = 0,  /* EE_MODE_EFUSE */
+		.format = 1,       /* EE_FORMAT_WHOLE */
+	};
+	int ret;
+
+	dev_info(&dev->pdev->dev, "EFUSE_CTRL: mode=%d format=%d\n",
+		 req.buffer_mode, req.format);
+
+	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_EFUSE_CTRL,
+				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+				      &req, sizeof(req));
+	if (ret)
+		dev_warn(&dev->pdev->dev, "EFUSE_CTRL 失败: %d\n", ret);
+
+	return ret;
+}
 
 /* ------- 7f-2. DMASHDL 完整初始化 -------
  * 参考: mt6639/chips/mt6639/hal_dmashdl_mt6639.c mt6639DmashdlInit()
@@ -1586,9 +1616,7 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 	 * 修复: 跳过 mt7927_dmashdl_init()，让固件自己的 DMASHDL 配置保持不变。
 	 * Windows 的 0x10101 已在 Step 0 中设置。
 	 */
-	/* mt7927_dmashdl_init(dev); — DISABLED: overwrites firmware DMASHDL config */
-	dev_info(&dev->pdev->dev,
-		 "DMASHDL: skipped full init (preserving firmware config)\n");
+	/* mt7927_dmashdl_init(dev); -- skipped: firmware self-configures DMASHDL */
 
 	/* 重新启用 WpdmaConfig (固件启动后) */
 	mt7927_wpdma_config(dev, true);
@@ -1624,31 +1652,13 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 				 "NIC_CAP 失败: %d (继续)\n", ret);
 	}
 
-	/* Step 3: Config 命令 (inner CID=0x0b, outer tag=0x02)
-	 * 来源: Windows dispatch table — outer 0x02 → inner 0x0b
-	 * fire-and-forget (0x06), 不等响应 */
-	dev_info(&dev->pdev->dev, "发送 Config (CID=0x0b, fire-and-forget)\n");
-	{
-		struct {
-			__le16 field0;
-			u8     field2;
-			u8     pad;
-			__le32 field4;
-			__le32 field8;
-		} __packed class02_payload = {
-			.field0 = cpu_to_le16(0x0001),
-			.field2 = 0x00,
-			.pad    = 0x00,
-			.field4 = cpu_to_le32(0x00070000),
-			.field8 = cpu_to_le32(0x00000000),
-		};
-
-		ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_CONFIG,
-					      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
-					      &class02_payload, sizeof(class02_payload));
-		if (ret)
-			dev_warn(&dev->pdev->dev, "Config 0x0b failed: %d (继续)\n", ret);
-	}
+	/* Step 3: Config 命令 — 跳过!
+	 * 5d87f81 中明确跳过此命令 ("破坏 MCU 通道")。
+	 * 问题: MT_MCU_CLASS_CONFIG=0x02 与 BSS_INFO CID 冲突!
+	 * Windows inner CID=0x0b, 但在回退 CID 时变成了 0x02,
+	 * 导致固件收到格式错误的 BSS_INFO 命令。
+	 * TODO: 需要单独的 CID (0x0b) 而非 MT_MCU_CLASS_CONFIG。 */
+	dev_info(&dev->pdev->dev, "Config: SKIPPED (CID=0x02 与 BSS_INFO 冲突)\n");
 
 	/* Step 4: WFDMA_CFG 命令 (inner CID=0x0d, outer tag=0xc0)
 	 * 来源: Windows dispatch table — outer 0xc0 → inner 0x0d
@@ -1819,12 +1829,10 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 			dev_warn(&dev->pdev->dev,
 				 "LogConfig 失败: %d (继续)\n", ret);
 	}
-	/* Step 10: EFUSE_CTRL 已删除
-	 * Windows PostFwDownloadInit 不发送 EFUSE_CTRL (outer=0x58)。
-	 * 之前从 mt7925 抄的 mcu_set_eeprom 格式完全错误 (12B TLV vs 固件期望 68B),
-	 * 用正确 CID=0x05 发送会破坏 RF/EEPROM 配置导致 scan 失败。
-	 * 固件默认从 eFuse 读校准数据，无需显式设置。
-	 * 验证: bisect Test 6 确认删除后 scan 恢复 (22 BSS)。 */
+	/* Step 10: EFUSE_CTRL — 恢复 (CID=0x2d, mt7925 格式)
+	 * 5d87f81 中存在且 scan 工作 (61 BSS), 删除后 scan 回归。
+	 * 注: 用旧 CID=0x2d (mt7925) 有效, 新 CID=0x05 (Windows inner) 会破坏 RF。 */
+	mt7927_mcu_set_eeprom(dev);
 
 	/* 诊断: 检查所有 HOST RX 环的 DIDX 变化 */
 	dev_info(&dev->pdev->dev,
@@ -1846,130 +1854,151 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
  * 7h. 扫描前置 MCU 命令 — 固件不收到这些命令会静默丢弃 scan 请求
  * ===================================================================== */
 
-/* SET_DOMAIN (outer=0x07, inner CID=0x03) — 76-byte firmware payload
- * 来源: Windows RE (docs/win_re_payload_formats_detailed.md Section 1
- *        + docs/win_re_set_domain_channel_data.md)
- * Handler VA: 0x140145d30 builds 76B fw payload from 64B input
- * 固件实际接收 76-byte payload，不是 64-byte Windows-internal input
- *
- * 信道数据: 6 × CMD_SUBBAND_INFO (8 bytes each) = 48 bytes
- *   {ucRegClass, ucBand, ucChannelSpan, ucFirstCh, ucNumCh, dfs_flag, 0, 0}
+/* SET_DOMAIN_INFO (CID=0x15) — 告诉固件合法信道列表
+ * 来源: mt7925 TLV 格式 — 在 5d87f81 中验证工作 (61 BSS)
+ * 注意: Windows RE inner CID=0x03 + 76B 固定格式在 784be1d 中测试失败 (0 BSS)
+ * 保留 mt7925 TLV 格式直到进一步 RE 确认
+ * payload 格式:
+ *   hdr: alpha2[4], bw_2g, bw_5g, bw_6g, pad
+ *   TLV(tag=2): n_2ch, n_5ch, n_6ch, pad
+ *   信道列表: {hw_value(le16), pad(le16), flags(le32)} × N
  */
 static int mt7927_mcu_set_channel_domain(struct mt7927_dev *dev)
 {
 	struct {
-		u8     country_a;       /* [0x00] alpha2[0] */
-		u8     country_b;       /* [0x01] alpha2[1] */
-		u8     _rsv1[4];        /* [0x02..0x05] = 0 */
-		u8     _rsv2;           /* [0x06] explicit zero */
-		u8     _rsv3;           /* [0x07] = 0 */
-		__le32 flags;           /* [0x08..0x0b] = 0x00440027 */
-		u8     desc[4];         /* [0x0c..0x0f] reg desc 0-3 */
-		__le32 desc_4_7;        /* [0x10..0x13] */
-		__le16 desc_8_9;        /* [0x14..0x15] */
-		u8     country_a2;      /* [0x16] alpha2[0] again */
-		u8     desc_b;          /* [0x17] */
-		u8     desc_c;          /* [0x18] */
-		u8     desc_d;          /* [0x19] */
-		u8     country_b2;      /* [0x1a] alpha2[1] again */
-		u8     no_ir;           /* [0x1b] indoor restriction */
-		u8     ch_data1[32];    /* [0x1c..0x3b] subbands 0-3 */
-		u8     ch_data2[16];    /* [0x3c..0x4b] subbands 4-5 */
-	} __packed req = {};
-	int ret;
+		u8 alpha2[4];
+		u8 bw_2g;
+		u8 bw_5g;
+		u8 bw_6g;
+		u8 pad;
+	} __packed hdr;
+	struct {
+		__le16 tag;
+		__le16 len;
+		u8 n_2ch;
+		u8 n_5ch;
+		u8 n_6ch;
+		u8 pad;
+	} __packed n_ch;
+	struct {
+		__le16 hw_value;
+		__le16 pad;
+		__le32 flags;
+	} __packed chan_entry;
 
-	BUILD_BUG_ON(sizeof(req) != 76);
+	int n_2ch = ARRAY_SIZE(mt7927_2ghz_channels);
+	int n_5ch = ARRAY_SIZE(mt7927_5ghz_channels);
+	int total_ch = n_2ch + n_5ch;
+	size_t buf_len = sizeof(hdr) + sizeof(n_ch) +
+			 total_ch * sizeof(chan_entry);
+	u8 *buf, *ptr;
+	int i, ret;
 
-	req.country_a  = 'C';
-	req.country_b  = 'N';
-	req.country_a2 = 'C';
-	req.country_b2 = 'N';
-	req.flags = cpu_to_le32(0x00440027);
+	buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 
-	/* subband[0]: 2.4GHz ch1-13 */
-	req.ch_data1[0]  = 81;  req.ch_data1[1]  = 1;
-	req.ch_data1[2]  = 1;   req.ch_data1[3]  = 1;
-	req.ch_data1[4]  = 13;
+	/* 填充 header */
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.alpha2[0] = 'C';
+	hdr.alpha2[1] = 'N';  /* China domain — 匹配实际使用环境 */
+	hdr.bw_2g = 0;        /* BW_20_40M */
+	hdr.bw_5g = 3;        /* BW_20_40_80_160M */
+	hdr.bw_6g = 3;
 
-	/* subband[1]: 5GHz ch36-48 */
-	req.ch_data1[8]  = 115; req.ch_data1[9]  = 2;
-	req.ch_data1[10] = 4;   req.ch_data1[11] = 36;
-	req.ch_data1[12] = 4;
+	/* 填充 TLV header */
+	memset(&n_ch, 0, sizeof(n_ch));
+	n_ch.tag = cpu_to_le16(2);  /* UNI_CMD_CHANNEL_DOMAIN_SET_DOMAIN_INFO = 2 */
+	n_ch.len = cpu_to_le16(sizeof(n_ch) +
+			       total_ch * sizeof(chan_entry));
+	n_ch.n_2ch = n_2ch;
+	n_ch.n_5ch = n_5ch;
+	n_ch.n_6ch = 0;
 
-	/* subband[2]: 5GHz ch52-64 (DFS) */
-	req.ch_data1[16] = 118; req.ch_data1[17] = 2;
-	req.ch_data1[18] = 4;   req.ch_data1[19] = 52;
-	req.ch_data1[20] = 4;   req.ch_data1[21] = 1;
+	/* 组装 buffer */
+	ptr = buf;
+	memcpy(ptr, &hdr, sizeof(hdr));
+	ptr += sizeof(hdr);
+	memcpy(ptr, &n_ch, sizeof(n_ch));
+	ptr += sizeof(n_ch);
 
-	/* subband[3]: placeholder */
-	req.ch_data1[24] = 121;
+	/* 2.4GHz channels */
+	for (i = 0; i < n_2ch; i++) {
+		memset(&chan_entry, 0, sizeof(chan_entry));
+		chan_entry.hw_value = cpu_to_le16(
+			mt7927_2ghz_channels[i].hw_value);
+		chan_entry.flags = cpu_to_le32(
+			mt7927_2ghz_channels[i].flags);
+		memcpy(ptr, &chan_entry, sizeof(chan_entry));
+		ptr += sizeof(chan_entry);
+	}
 
-	/* subband[4]: 5GHz ch149-165 */
-	req.ch_data2[0]  = 125; req.ch_data2[1]  = 2;
-	req.ch_data2[2]  = 4;   req.ch_data2[3]  = 149;
-	req.ch_data2[4]  = 5;
+	/* 5GHz channels */
+	for (i = 0; i < n_5ch; i++) {
+		memset(&chan_entry, 0, sizeof(chan_entry));
+		chan_entry.hw_value = cpu_to_le16(
+			mt7927_5ghz_channels[i].hw_value);
+		chan_entry.flags = cpu_to_le32(
+			mt7927_5ghz_channels[i].flags);
+		memcpy(ptr, &chan_entry, sizeof(chan_entry));
+		ptr += sizeof(chan_entry);
+	}
 
 	dev_info(&dev->pdev->dev,
-		 "SET_DOMAIN: 76B fw payload, CN, flags=0x%08x\n",
-		 0x00440027);
+		 "SET_DOMAIN_INFO: n_2ch=%d n_5ch=%d total_len=%zu\n",
+		 n_2ch, n_5ch, buf_len);
 
 	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_SET_DOMAIN,
 				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
-				      &req, sizeof(req));
+				      buf, buf_len);
+	kfree(buf);
+
 	if (ret)
-		dev_warn(&dev->pdev->dev, "SET_DOMAIN 失败: %d\n", ret);
+		dev_warn(&dev->pdev->dev,
+			 "SET_DOMAIN_INFO 失败: %d\n", ret);
+
 	return ret;
 }
 
-/* BAND_CONFIG (outer=0x93, inner CID=0x49) — 92-byte 固定格式
- * 来源: Windows RE (docs/win_re_payload_formats_detailed.md Section 2)
- * Handler VA: 0x140146950, nicBandConfig VA: 0x1400d15d0
- * Windows 仅在 band_idx=1 (5GHz) 时发送此命令。
- * 2.4GHz 走不同路径 (未 RE)。
+/* BAND_CONFIG / RTS_THRESHOLD (CID=0x08, tag=0x08)
+ * 来源: mt7925 TLV 格式 — 在 5d87f81 中验证工作
+ * 注意: Windows RE inner CID=0x49 + 92B 固定格式在 784be1d 中测试失败
+ * 保留 mt7925 TLV 格式直到进一步 RE 确认
  */
-static int mt7927_mcu_set_band_config(struct mt7927_dev *dev)
+static int mt7927_mcu_set_rts_thresh(struct mt7927_dev *dev, u32 val)
 {
 	struct {
-		u8  _rsv1[4];     /* [0x00..0x03] = 0 */
-		__le32 flags;     /* [0x04..0x07] = 0x00580000 (LE) */
-		u8  _rsv2;        /* [0x08] = 0 */
-		u8  field_09;     /* [0x09] = 1 (hardcoded) */
-		u8  _rsv3[2];     /* [0x0a..0x0b] = 0 */
-		u8  field_0c;     /* [0x0c] = 2 (hardcoded) */
-		u8  field_0d;     /* [0x0d] = 0 */
-		u8  field_0e;     /* [0x0e] = 0 */
-		u8  _rsv4;        /* [0x0f] = 0 */
-		u8  data[14];     /* [0x10..0x1d] = {0x02, 0x00, ...} */
-		u8  _unused[62];  /* [0x1e..0x5b] = 0 */
+		u8 band_idx;
+		u8 _rsv[3];
+		__le16 tag;
+		__le16 len;
+		__le32 len_thresh;
+		__le32 pkt_thresh;
 	} __packed req = {
-		.flags    = cpu_to_le32(0x00580000),
-		.field_09 = 1,
-		.field_0c = 2,
-		.data     = { 0x02 },  /* data[0]=2, rest zero */
+		.band_idx = 0,
+		.tag = cpu_to_le16(0x08),  /* UNI_BAND_CONFIG_RTS_THRESHOLD */
+		.len = cpu_to_le16(sizeof(req) - 4),
+		.len_thresh = cpu_to_le32(val),
+		.pkt_thresh = cpu_to_le32(0x02),
 	};
 	int ret;
 
-	BUILD_BUG_ON(sizeof(req) != 92);
-
 	dev_info(&dev->pdev->dev,
-		 "BAND_CONFIG: 92B fixed format, flags=0x%08x\n",
-		 0x00580000);
+		 "BAND_CONFIG RTS_THRESH: thresh=0x%x pkt=0x%x\n",
+		 val, 0x02);
 
 	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_BAND_CONFIG,
 				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
 				      &req, sizeof(req));
 	if (ret)
 		dev_warn(&dev->pdev->dev,
-			 "BAND_CONFIG 失败: %d\n", ret);
+			 "BAND_CONFIG RTS 失败: %d\n", ret);
 
 	return ret;
 }
 
-/* mt7927_mcu_set_eeprom 已删除。
- * Windows PostFwDownloadInit 不发送 EFUSE_CTRL (outer=0x58, inner=0x05)。
- * 原函数从 mt7925 抄来，payload 格式完全错误 (12B TLV vs handler 期望 68B)，
- * 用正确 CID 发送会破坏固件 RF/EEPROM 配置导致 scan 失败。
- * bisect 验证: 删除后 scan 恢复 (22 BSS)。 */
+/* 注: EFUSE_CTRL 使用 mt7925 CID=0x2d + TLV 格式，已恢复 (在上方定义)。
+ * Windows inner CID=0x05 会破坏 RF 配置，不要使用。 */
 
 /* =====================================================================
  * 8. 诊断 dump 函数
@@ -2453,9 +2482,8 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	req.basic.omac_idx = mvif->omac_idx;
 	req.basic.hw_bss_idx = mvif->bss_idx;
 	req.basic.band_idx = mvif->band_idx;
-	/* Windows RE: BSS_INFO_BASIC packed_field at TLV value[+4] = 0x00080015 (hardcoded for STA mode)
-	 * NOT CONNECTION_INFRA_STA=0x10001 (MT6639 Android value, wrong format) */
-	req.basic.conn_type = cpu_to_le32(0x00080015);
+	/* TEST-A: revert to old CONNECTION_INFRA_STA (5d87f81 value, scan worked) */
+	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
 	/* MT6639: MEDIA_STATE_DISCONNECTED=1 when activating BSS
 	 * MEDIA_STATE_CONNECTED=0 when deactivating (opposite of mt7925)
 	 * win-analyst 确认: BSS activate → conn_state=1 */
@@ -3125,13 +3153,19 @@ static int mt7927_mac80211_start(struct ieee80211_hw *hw)
 	 * 参考: mt76/mt7925/main.c mt7925_start() lines 314-329
 	 * 缺少这些命令，固件会静默丢弃 scan 请求！ */
 
-	/* 1. SET_DOMAIN — 暂时跳过 (76B/64B 都破坏 scan, bisect 中) */
-	/* ret = mt7927_mcu_set_channel_domain(dev); */
-	dev_info(&dev->pdev->dev, "SET_DOMAIN: SKIPPED (bisect)\n");
+	/* 1. SET_DOMAIN_INFO — 信道域信息 (最关键!) */
+	ret = mt7927_mcu_set_channel_domain(dev);
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "mac80211 start: set_channel_domain 失败: %d (继续)\n",
+			 ret);
 
-	/* 2. BAND_CONFIG — 暂时跳过 (bisect) */
-	/* ret = mt7927_mcu_set_band_config(dev); */
-	dev_info(&dev->pdev->dev, "BAND_CONFIG: SKIPPED (bisect)\n");
+	/* 2. BAND_CONFIG / RTS_THRESHOLD */
+	ret = mt7927_mcu_set_rts_thresh(dev, 0x92b);
+	if (ret)
+		dev_warn(&dev->pdev->dev,
+			 "mac80211 start: set_rts_thresh 失败: %d (继续)\n",
+			 ret);
 
 	return 0;
 }
@@ -3418,9 +3452,9 @@ static int mt7927_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 static int mt7927_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
 				    u32 val)
 {
-	/* BAND_CONFIG 已改为 92B 固定初始化格式 (Windows RE)，
-	 * 不再支持动态 RTS threshold 设置。固件使用默认值。*/
-	return 0;
+	struct mt7927_dev *dev = mt7927_hw_dev(hw);
+
+	return mt7927_mcu_set_rts_thresh(dev, val);
 }
 
 /* =====================================================================
