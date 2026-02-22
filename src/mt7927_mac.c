@@ -199,27 +199,24 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 		}
 	}
 
-	/* Determine queue index and packet format
+	/* ====================================================================
+	 * All frames (mgmt + data): use CONNAC3 FIELD_PREP macros
 	 *
-	 * MT6639: 管理帧走 TC4 → CMD ring 15, PKT_FMT=2(CMD), Q_IDX=0(MCU_Q0)
-	 *   Q_IDX=0 = MCU forwards frame to LMAC for RF transmission
-	 *   Q_IDX=0x20 = MCU processes internally (for UniCmd) — NOT for mgmt!
-	 *   Q_IDX=0x10 = ALTX0/beacon — NOT for auth/assoc!
-	 * 来源: mt6639/nic_tx.c arTcResourceControl[TC4], nic_txd_v3.c
+	 * Session 27: removed is_mgmt raw hex path — it had critical DW1 bugs:
+	 *   - WLAN_IDX only 8 bits (& 0xFF), but CONNAC3 uses 12 bits GENMASK(11,0)
+	 *     → bits[11:8] got polluted by hdr_info → firmware saw WLAN_IDX=0x801
+	 *   - HDR_INFO placed at bits[12:8] instead of GENMASK(20,16)
+	 *   - HDR_FORMAT=3 (802.11_EXT) instead of 2 (802.11)
+	 *   These caused firmware to look up wrong WTBL entry → silent TX drop
 	 *
-	 * 数据帧: PKT_FMT=0 (CT), Q_IDX from AC mapping, ring 0
-	 */
+	 * The data path's mt7927_mac_write_txwi_80211() handles mgmt frames
+	 * correctly: FIXED_RATE, frame type/subtype, hdr_format, hdr_info.
+	 * ==================================================================== */
 	if (beacon) {
 		q_idx = MT_TX_MCU_PORT_RX_Q0;
 		p_fmt = MT_TX_TYPE_FW;
-	} else if (is_mgmt) {
-		/* Ring 0 CT mode experiment: use CT mode to get TXFREE error codes
-		 * Previously used CMD mode (ring 15) or SF mode (ring 2) — both silent.
-		 * CT mode (ring 0) historically returned TXFREE stat=1 (useful for diagnosis) */
-		p_fmt = MT_TX_TYPE_CT;
-		q_idx = 0x10; /* MT_LMAC_ALTX0 — mgmt/high-priority LMAC queue */
 	} else if (!is_8023) {
-		q_idx = 0x10; /* MT_LMAC_ALTX0 — 非管理帧的 802.11 帧 */
+		q_idx = 0x10; /* MT_LMAC_ALTX0 — non-mgmt 802.11 frames */
 	} else {
 		q_idx = mt7927_lmac_mapping(skb_get_queue_mapping(skb));
 	}
@@ -244,110 +241,66 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 	else
 		mt7927_mac_write_txwi_80211(dev, txwi, skb, key);
 
-	/* TXD[2]: REMAINING_LIFE_TIME — MT6639 设 2000ms for mgmt frames
-	 * CONNAC3 单位: 64 TU (2^6 * 1024us ≈ 65.5ms)
-	 * 2000ms ≈ 30 units (2000000 / 1024 / 64 = 30)
-	 * 值 0 = "no lifetime" — 不确定是否等于 "无限" 还是 "立即丢弃"
-	 * MT6639 管理帧: NIC_TX_MGMT_REMAINING_TX_TIME = 2000ms → 30 units */
+	/* TXD[2]: REMAINING_LIFE_TIME */
 	if (!is_8023)
 		txwi[2] |= cpu_to_le32(FIELD_PREP(MT_TXD2_MAX_TX_TIME, 30));
 
-	/* TXD[3]: TX control flags
-	 * MT6639: NIC_TX_MGMT_DEFAULT_RETRY_COUNT_LIMIT = 30 for mgmt
-	 *         NIC_TX_DATA_DEFAULT_RETRY_COUNT_LIMIT = 30 for data */
-	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 30);
+	/* Note: Windows DW2 has 0xA0000000 (BIT(31)+BIT(29)) in raw hex path,
+	 * but in CONNAC3 macros these bits = POWER_OFFSET, NOT FIX_RATE.
+	 * Setting them causes firmware to not return TXFREE (tested).
+	 * FIXED_RATE is in DW1 BIT(31) in CONNAC3 — already set above. */
 
+	/* TXD[3]: TX control flags */
+	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 30);
 	if (key)
 		val |= MT_TXD3_PROTECT_FRAME;
-
 	if (info->flags & IEEE80211_TX_CTL_NO_ACK)
 		val |= MT_TXD3_NO_ACK;
-
 	if (is_multicast_ether_addr(skb->data))
 		val |= MT_TXD3_BCM;
-
 	txwi[3] = cpu_to_le32(val);
 
-	/* TXD[5]: PID and TX status request
-	 *
-	 * MT6639: management frames ALWAYS request TXS_TO_MCU with non-zero PID.
-	 * PID range: 1-127 (0 = no PID → firmware won't report TX status).
-	 * Without this, CMD ring frames have NO feedback mechanism —
-	 * TXFREE only works for CT mode (token-based), not CMD mode.
-	 *
-	 * For data frames, use caller-provided pid with TX_STATUS_HOST.
-	 */
+	/* TXD[5]: PID and TX status request.
+	 * Windows sets 0x600 (TX_STATUS_HOST | TX_STATUS_MCU) for all mgmt frames.
+	 * Without these bits, firmware internally drops the frame (TXFREE stat=1).
+	 * For data frames, only set TX_STATUS_HOST when pid != 0 (for TXS tracking). */
+	val = FIELD_PREP(MT_TXD5_PID, pid);
 	if (is_mgmt) {
-		/* Use a fixed PID for mgmt frames — MT6639 uses rotating 1-127,
-		 * but fixed PID=1 works fine for our diagnostic/auth purpose.
-		 * TXS_TO_MCU: firmware sends TX status via MCU event path (RX ring 4/7) */
-		val = FIELD_PREP(MT_TXD5_PID, 1) | MT_TXD5_TX_STATUS_MCU;
-	} else {
-		val = FIELD_PREP(MT_TXD5_PID, pid);
-		if (pid)
-			val |= MT_TXD5_TX_STATUS_HOST;
+		val |= MT_TXD5_TX_STATUS_HOST | MT_TXD5_TX_STATUS_MCU;
+	} else if (pid) {
+		val |= MT_TXD5_TX_STATUS_HOST;
 	}
 	txwi[5] = cpu_to_le32(val);
 
-	/* TXD[6]: MSDU count, disable MAT
-	 * MT6639: 管理帧只设 DIS_MAT + MSDU_CNT=1, 不设 DAS
-	 * DAS (Destination Address Search) 只用于数据帧 WTBL DA 查找 */
+	/* TXD[6]: MSDU count, disable MAT, fixed rate.
+	 * MSDU_CNT and DIS_MAT are REQUIRED — without them firmware
+	 * silently drops the frame (no TXFREE returned, tested). */
 	val = FIELD_PREP(MT_TXD6_MSDU_CNT, 1) |
 	      MT_TXD6_DIS_MAT;
 	if (is_8023)
 		val |= MT_TXD6_DAS;
 	txwi[6] = cpu_to_le32(val);
 
-	/* 固定速率设置
-	 * MT6639 管理帧: FIXED_RATE_IDX=0, BA_DISABLE
-	 * 数据帧 (mt7925 风格): rate_idx=11(2.4G)/15(5G) */
+	/* Fixed rate for mgmt and any FIXED_RATE frames */
 	if (txwi[1] & cpu_to_le32(MT_TXD1_FIXED_RATE)) {
-		if (is_mgmt) {
-			/* Use rate table index for mgmt frames:
-			 * 2.4GHz: idx=11 (CCK 1Mbps) or idx=15 (OFDM 6Mbps)
-			 * 5GHz: idx=15 (OFDM 6Mbps)
-			 * Rate table programmed in mt7927_mac_init_basic_rates() */
-			u8 rate_idx = 15; /* OFDM 6Mbps (safe for both bands) */
-
-			if (dev->hw && dev->hw->conf.chandef.chan &&
-			    dev->hw->conf.chandef.chan->band == NL80211_BAND_2GHZ)
-				rate_idx = 11; /* 2.4GHz: CCK 1Mbps */
-
-			txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, rate_idx));
-		} else {
-			u8 rate_idx = 11; /* 2.4GHz: CCK 1Mbps */
-
-			if (dev->hw && dev->hw->conf.chandef.chan &&
-			    dev->hw->conf.chandef.chan->band != NL80211_BAND_2GHZ)
-				rate_idx = 15; /* 5GHz/6GHz: OFDM 6Mbps */
-
-			txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, rate_idx));
-		}
+		/* OFDM 6Mbps: rate_idx=11 for both 2.4GHz and 5GHz.
+		 * NOTE: Windows DW6=0x004B0000 includes bit 22 (BW in CONNAC3
+		 * macros → 40MHz) — don't set it, causes firmware hang. */
+		txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, 11));
 		txwi[3] |= cpu_to_le32(MT_TXD3_BA_DISABLE);
 	}
 
-	/* DW7: TXD_LENGTH — MT6639 always sets DW7[31:30]=1 (TXD_LEN_1_PAGE)
-	 * 这告诉固件 TXD 长度是 1 page (32 bytes / 8 DWs)
-	 * 来源: MT6639 驱动 + Windows RE — 必须设置，否则固件无法正确解析 TXD */
-	txwi[7] = cpu_to_le32(FIELD_PREP(MT_TXD7_TXD_LEN, 1));
+	/* DW7: TXD_LEN — only extend for encrypted frames (PN in DW8-DW9).
+	 * TXD_LEN=0: standard 32-byte TXD, TXP starts at offset 32.
+	 * TXD_LEN=1: 48-byte TXD (adds DW8-DW11), TXP at offset 48.
+	 * Auth frames are unencrypted → TXD_LEN must be 0, else firmware
+	 * misparses TXP offset and cannot find payload DMA address.
+	 * (memset already zeroed txwi[7]) */
 
-	/* Debug: dump TXD+TXP (64 bytes) + 802.11 header for auth/assoc frames */
-	if (!is_8023 && skb->len >= 24) {
-		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
-
-		if (ieee80211_is_auth(hdr->frame_control) ||
-		    ieee80211_is_assoc_req(hdr->frame_control)) {
-			dev_info(&dev->pdev->dev,
-				 "TX-DBG: fc=0x%04x len=%u wlan=%u omac=%u band=%u q=0x%x\n",
-				 le16_to_cpu(hdr->frame_control),
-				 skb->len, wlan_idx, omac_idx, band_idx, q_idx);
-			dev_info(&dev->pdev->dev,
-				 "TX-DBG: DA=%pM SA=%pM BSSID=%pM\n",
-				 hdr->addr1, hdr->addr2, hdr->addr3);
-			/* Dump TXD (32) + TXP (32) = 64 bytes */
-			print_hex_dump(KERN_INFO, "TXD+TXP: ", DUMP_PREFIX_OFFSET,
-				       16, 4, txwi, 64, false);
-		}
+	/* Debug: dump unified CT path TXD for management frames */
+	if (is_mgmt) {
+		print_hex_dump(KERN_INFO, "CT-TXD: ", DUMP_PREFIX_OFFSET,
+			       16, 4, txwi, MT_TXD_SIZE, false);
 	}
 }
 
@@ -405,63 +358,41 @@ void mt7927_mac_write_txwi_mgmt_sf(struct mt7927_dev *dev, __le32 *txwi,
 	 * Source: docs/win_re_txd_dw0_dw1_precise.md (Sections 5, 10, 12)
 	 * ==================================================================== */
 
-	/* DW0: Use raw hex value 0x84000000 from Windows RE assembly.
-	 *
-	 * XmitWriteTxDv1 sets:
-	 *   DW0[31]    = 1  (from TxInfo+0x05 = 0x01, bit[0], SHL 0x1f)
-	 *   DW0[30:26] = 1  (from TxInfo+0x04 = 0x01, SHL 0x1a, AND 0x7c000000)
-	 *   DW0[24:23] = 0  (not touched, stays 0 from memset)
-	 *   DW0[15:0]  = TX_BYTES (frame_len + 32)
-	 *
-	 * Result: 0x84000000 | TX_BYTES
-	 *
-	 * Under MT6639 5-bit Q_IDX layout (GENMASK(28,24)):
-	 *   SN_EN[31]=1, PKT_FT[30:29]=0(SF), Q_IDX[28:24]=1
-	 *
-	 * Note: Our mt7927_pci.h uses GENMASK(31,25)/GENMASK(24,23) from mt7925
-	 * which gives nonsensical Q_IDX=66. The raw hex avoids this ambiguity.
-	 * See docs/win_re_txd_dw0_dw1_precise.md Section 12 for full analysis. */
-	txwi[0] = cpu_to_le32(0x84000000 | (skb->len + MT_TXD_SIZE));
+	/* DW0: Q_IDX=8, PKT_FMT=0 (SF mode)
+	 * Windows RE: queue_class=0x04, Q_IDX = 0x04 << 1 = 8
+	 *   FIELD_PREP(GENMASK(31,25), 8) = 0x10000000
+	 * Source: docs/re/win_re_full_txd_dma_path.md Section 4 Step 2
+	 * Previous Q_IDX=0x10 (ALTX0) was wrong queue for mgmt SF mode */
+	txwi[0] = cpu_to_le32(FIELD_PREP(MT_TXD0_Q_IDX, 8) |
+			      (skb->len + MT_TXD_SIZE));
 
-	/* DW1: Windows RE confirmed layout (XmitWriteTxDv1 assembly):
-	 *
-	 *   byte[0] (bits[7:0])  = WLAN_IDX (MOV byte [RBX+4], AL)
-	 *   bits[12:8]           = mac_hdr_len shifted (SHL 8, AND 0x1F00)
-	 *   bit[13]              = 0 (BTR bit13 — band/TGID)
-	 *   bit[14]              = 1 (BTS bit14 — HDR_FORMAT low)
-	 *   bit[15]              = 1 (BTS bit15 — HDR_FORMAT high)
-	 *   bits[23:21]          = TID=7 for mgmt (SHL 0x15, AND 0xE00000)
-	 *   bit[24]              = 0 (BTR — cleared for 802.11)
-	 *   bit[25]              = 1 (BTS — set for 802.11 mode)
-	 *   bits[31:26]          = OWN_MAC (SHL 0x1a)
-	 *
-	 * For auth (WLAN_IDX=0, OWN_MAC=0): DW1 = 0x02E0D800
-	 *
-	 * IMPORTANT: Windows DW1 bit layout differs from MT6639 standard!
-	 * Windows puts HDR_INFO at bits[12:8], standard has it at bits[20:16].
-	 * We use raw bit manipulation matching the Windows assembly exactly. */
-	val = (wlan_idx & 0xFF) |                        /* bits[7:0]: WLAN_IDX */
-	      ((mac_hdr_len & 0x1F) << 8) |              /* bits[12:8]: HDR_INFO */
-	      BIT(14) | BIT(15) |                        /* HDR_FORMAT = 0b11 */
-	      ((7 & 0x7) << 21) |                        /* bits[23:21]: TID=7 for mgmt */
-	      BIT(25) |                                  /* 802.11 mode flag */
-	      ((omac_idx & 0x3F) << 26);                 /* bits[31:26]: OWN_MAC */
-	if (band_idx)
-		val |= BIT(13);                          /* TGID/band */
+	/* DW1: CONNAC3 FIELD_PREP — aligned with unified path (mt7927_mac_write_txwi)
+	 * Key fixes vs old raw bits:
+	 *   - WLAN_IDX: 12-bit GENMASK(11,0), was 8-bit & 0xFF (truncation bug)
+	 *   - TGID (band_idx): GENMASK(13,12), was COMPLETELY MISSING → firmware
+	 *     didn't know which band to TX on → WTBL BAND=0 for 5GHz frames
+	 *   - HDR_FORMAT: 2 (802.11 native), was 3 (extended)
+	 *   - HDR_INFO: GENMASK(20,16) = mac_hdr_len/2, was GENMASK(12,8) raw bytes
+	 *   - FIXED_RATE: BIT(31), consistent with CONNAC3 */
+	val = FIELD_PREP(MT_TXD1_WLAN_IDX, wlan_idx) |
+	      FIELD_PREP(MT_TXD1_OWN_MAC, omac_idx) |
+	      FIELD_PREP(MT_TXD1_TGID, band_idx) |
+	      FIELD_PREP(MT_TXD1_HDR_FORMAT_V3, MT_HDR_FORMAT_802_11) |
+	      FIELD_PREP(MT_TXD1_HDR_INFO, mac_hdr_len / 2) |
+	      MT_TXD1_FIXED_RATE;
 	txwi[1] = cpu_to_le32(val);
 
-	/* DW2: Fixed rate flags + FRAME_TYPE + SUB_TYPE
+	/* DW2: FRAME_TYPE + SUB_TYPE + MAX_TX_TIME
 	 *
-	 * Verified from Ghidra RE (docs/win_re_dw2_dw6_verified.md):
-	 *   XmitWriteTxDv1 fixed-rate block (lines 147-152):
-	 *     param_2[2] |= 0xa0000000  (bit31=FIXED_RATE, bit29=BM)
-	 *   Frame type encoding (lines 104-113):
-	 *     bits[5:4] = FRAME_TYPE, bits[3:0] = SUB_TYPE
-	 *   For auth: DW2 = 0xA000000B
+	 * Windows RE: DW2 |= 0xA0000000 (bit31+bit29) — but in CONNAC3,
+	 * those bits = POWER_OFFSET, NOT FIXED_RATE/BM!
+	 * FIXED_RATE is DW1 BIT(31) in CONNAC3 (already set above).
+	 * Setting 0xA0000000 causes firmware to NOT return TXFREE (tested).
 	 *
-	 * MlmeHardTransmit sets local_7c=1 UNCONDITIONALLY for all mgmt frames,
-	 * so the fixed-rate block ALWAYS executes. */
-	val = 0xA0000000 | ((fc_type & 0x3) << 4) | (fc_stype & 0xF);
+	 * Align with unified CT path (which works): frame_type + MAX_TX_TIME */
+	val = FIELD_PREP(MT_TXD2_FRAME_TYPE, fc_type) |
+	      FIELD_PREP(MT_TXD2_SUB_TYPE, fc_stype) |
+	      FIELD_PREP(MT_TXD2_MAX_TX_TIME, 30);
 	txwi[2] = cpu_to_le32(val);
 
 	/* DW3: REM_TX_COUNT=30 */
@@ -487,12 +418,18 @@ void mt7927_mac_write_txwi_mgmt_sf(struct mt7927_dev *dev, __le32 *txwi,
 	if (dev->tx_mgmt_pid == 0 || dev->tx_mgmt_pid > 99)
 		dev->tx_mgmt_pid = 1;
 
-	/* DW6: OFDM 6Mbps fixed rate
+	/* DW6: OFDM 6Mbps fixed rate + MSDU_CNT + DIS_MAT
 	 *
-	 * Verified from Ghidra RE:
-	 *   Fixed-rate block: param_2[6] = (param_2[6] & 0x7e00ffff) | 0x4b0000
-	 *   0x4B = OFDM 6Mbps (MCS11 + TX_RATE_MODE_OFDM) */
-	txwi[6] = cpu_to_le32(0x004B0000);
+	 * Ghidra RE: fixed-rate block = (param_2[6] & 0x7e00ffff) | 0x4b0000
+	 *   The mask 0x7e00ffff PRESERVES bits[0:15], meaning MSDU_CNT/DIS_MAT
+	 *   were set BEFORE the fixed-rate block and kept.
+	 *
+	 * MSDU_CNT=1 (GENMASK(9,4)) and DIS_MAT (BIT(3)) are REQUIRED:
+	 *   Without them firmware silently drops the frame (no TXFREE returned).
+	 *   This was the Root Cause of Ring 2 SF "DMA consumes but no TXFREE". */
+	txwi[6] = cpu_to_le32(0x004B0000 |
+			      FIELD_PREP(MT_TXD6_MSDU_CNT, 1) |
+			      MT_TXD6_DIS_MAT);
 
 	/* DW7: 0x00000000
 	 *
@@ -713,28 +650,63 @@ void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
 				/* Hardware diagnostic: read MIB/PLE/PSE registers
 				 * to determine if frame actually went out on air.
 				 *
-				 * Band 0 MIB base: 0x820ed000
-				 * Band 1 MIB base: 0x820fd000 (= Band 0 + 0x10000)
-				 * 5GHz = band_idx 1, 2.4GHz = band_idx 0 */
-				u32 mib0_tx_ok, mib0_tx_fail, mib0_tx_retry;
-				u32 mib1_tx_ok, mib1_tx_fail, mib1_tx_retry;
+				 * Band 0 MIB BAR0: 0x024800 (bus 0x820ed000)
+				 * Band 1 MIB BAR0: 0x0a4800 (bus 0x820fd000)
+				 * Offsets from CODA bn0_wf_mib_top.h:
+				 *   TSCR7 (SU_TX_OK): +0x68C
+				 *   TBCR0 (TX_20MHz): +0x6AC
+				 *   RSCR0 (RX_FCS_OK): +0x75C (validation)
+				 *   BTFCR (per-WCID TX_FAIL): +0x5B0 */
+				u32 mib0_tx_ok, mib0_tx20, mib0_rx_ok;
+				u32 mib1_tx_ok, mib1_tx20, mib1_rx_ok;
 				u32 ple_empty, pse_empty;
 				u32 ple_sta0, ple_sta1;
 
-				/* Band 0 MIB: bus2chip 0x820ed000→BAR0 0x24800 */
-				mib0_tx_ok    = mt7927_rr(dev, 0x24e8c); /* TSCR7 SU_TX_OK */
-				mib0_tx_fail  = mt7927_rr(dev, 0x24e90); /* TSCR8 SU_TX_FAIL */
-				mib0_tx_retry = mt7927_rr(dev, 0x24ea0); /* TSCR12 TX_RETRY */
+				/* Band 0 MIB */
+				mib0_tx_ok  = mt7927_rr(dev, MT_MIB_TSCR7(0));
+				mib0_tx20   = mt7927_rr(dev, MT_MIB_TBCR0(0));
+				mib0_rx_ok  = mt7927_rr(dev, MT_MIB_RSCR0(0));
 
-				/* Band 1 MIB: bus2chip 0x820fd000→BAR0 0x2c800 */
-				mib1_tx_ok    = mt7927_rr(dev, 0x2ce8c);
-				mib1_tx_fail  = mt7927_rr(dev, 0x2ce90);
-				mib1_tx_retry = mt7927_rr(dev, 0x2cea0);
+				/* Band 1 MIB */
+				mib1_tx_ok  = mt7927_rr(dev, MT_MIB_TSCR7(1));
+				mib1_tx20   = mt7927_rr(dev, MT_MIB_TBCR0(1));
+				mib1_rx_ok  = mt7927_rr(dev, MT_MIB_RSCR0(1));
 
 				/* PLE/PSE queue status */
 				/* bus2chip: 0x820c0000→BAR0 0x08000 (PLE) */
 				ple_empty = mt7927_rr(dev, 0x08360);  /* PLE_QUEUE_EMPTY */
 				pse_empty = mt7927_rr(dev, 0x0c0b0);  /* PSE_QUEUE_EMPTY */
+
+				/* WTBL WCID 1 via direct BAR0 (0x820D8000→0x038000)
+				 * L1 remap broken for WTBL — returns all zeros */
+				{
+					u32 dw[8];
+					u8 mac[6];
+					int w;
+
+					for (w = 0; w < 8; w++)
+						dw[w] = mt7927_rr(dev, 0x038100 + w * 4);
+
+					/* Decode MAC from DW0/DW1 (little-endian words) */
+					mac[0] = (dw[1] >> 0) & 0xff;
+					mac[1] = (dw[1] >> 8) & 0xff;
+					mac[2] = (dw[1] >> 16) & 0xff;
+					mac[3] = (dw[1] >> 24) & 0xff;
+					mac[4] = (dw[0] >> 0) & 0xff;
+					mac[5] = (dw[0] >> 8) & 0xff;
+
+					dev_info(&dev->pdev->dev,
+						 "  WTBL[1] MAC=%pM BAND=%u MUAR=%u\n",
+						 mac,
+						 (dw[0] >> 26) & 0x3,
+						 (dw[0] >> 16) & 0x3f);
+					dev_info(&dev->pdev->dev,
+						 "  WTBL[1] DW0-3: %08x %08x %08x %08x\n",
+						 dw[0], dw[1], dw[2], dw[3]);
+					dev_info(&dev->pdev->dev,
+						 "  WTBL[1] DW4-7: %08x %08x %08x %08x\n",
+						 dw[4], dw[5], dw[6], dw[7]);
+				}
 
 				/* PLE station info — TX queued packets */
 				ple_sta0 = mt7927_rr(dev, 0x08024);  /* PLE_STA(0) */
@@ -746,17 +718,37 @@ void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
 					 (unsigned long)FIELD_GET(
 						MT_TXFREE_INFO_WLAN_ID, info));
 				dev_info(&dev->pdev->dev,
-					 "  Band0: TX_OK=%u FAIL=%u RETRY=%u\n",
-					 mib0_tx_ok, mib0_tx_fail, mib0_tx_retry);
+					 "  Band0: TX_OK=%u TX20=%u RX_OK=%u\n",
+					 mib0_tx_ok, mib0_tx20, mib0_rx_ok);
 				dev_info(&dev->pdev->dev,
-					 "  Band1: TX_OK=%u FAIL=%u RETRY=%u\n",
-					 mib1_tx_ok, mib1_tx_fail, mib1_tx_retry);
+					 "  Band1: TX_OK=%u TX20=%u RX_OK=%u\n",
+					 mib1_tx_ok, mib1_tx20, mib1_rx_ok);
 				dev_info(&dev->pdev->dev,
 					 "  PLE_EMPTY=0x%08x PSE_EMPTY=0x%08x\n",
 					 ple_empty, pse_empty);
 				dev_info(&dev->pdev->dev,
 					 "  PLE_STA0=0x%08x PLE_STA1=0x%08x\n",
 					 ple_sta0, ple_sta1);
+
+				/* STA_PAUSE diagnostic */
+				{
+					u32 sta_pause0 = mt7927_rr(dev, 0x083e0);
+					u32 sta_pause1 = mt7927_rr(dev, 0x083e4);
+					u32 dis_sta0 = mt7927_rr(dev, 0x08390);
+					u32 dis_sta1 = mt7927_rr(dev, 0x08394);
+					/* Band 1 (5GHz) MIB TX counters (CODA verified) */
+					u32 b1_tx20 = mt7927_rr(dev, MT_MIB_TBCR0(1));
+					u32 b1_tx40 = mt7927_rr(dev, MT_MIB_TBCR1(1));
+					dev_info(&dev->pdev->dev,
+						 "  STA_PAUSE0=0x%08x STA_PAUSE1=0x%08x\n",
+						 sta_pause0, sta_pause1);
+					dev_info(&dev->pdev->dev,
+						 "  DIS_STA0=0x%08x DIS_STA1=0x%08x\n",
+						 dis_sta0, dis_sta1);
+					dev_info(&dev->pdev->dev,
+						 "  B1_TX20=%u B1_TX40=%u\n",
+						 b1_tx20, b1_tx40);
+				}
 
 				/* DMASHDL state: check if BYPASS is still on,
 				 * and read group quotas / queue mapping.

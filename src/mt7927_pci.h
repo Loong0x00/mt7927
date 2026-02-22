@@ -502,6 +502,23 @@
 #define MT_MIB_TXDUR_EN              BIT(24)
 #define MT_MIB_RXDUR_EN              BIT(25)
 
+/* MIB TX 计数器 — offsets from CODA bn0_wf_mib_top.h (MT6639) */
+#define MT_MIB_BTOCR(_band)          (MT_MIB_BAR0(_band) + 0x400) /* per-WCID TX_OK */
+#define MT_MIB_BTBCR(_band)          (MT_MIB_BAR0(_band) + 0x450) /* per-WCID TX_BYTE */
+#define MT_MIB_BTFCR(_band)          (MT_MIB_BAR0(_band) + 0x5B0) /* per-WCID TX_FAIL */
+#define MT_MIB_TSCR7(_band)          (MT_MIB_BAR0(_band) + 0x68C) /* SU_TX_OK total */
+#define MT_MIB_TBCR0(_band)          (MT_MIB_BAR0(_band) + 0x6AC) /* TX_20MHz_CNT */
+#define MT_MIB_TBCR1(_band)          (MT_MIB_BAR0(_band) + 0x6B0) /* TX_40MHz_CNT */
+
+/* MIB RX 计数器 */
+#define MT_MIB_RSCR0(_band)          (MT_MIB_BAR0(_band) + 0x75C) /* RX_FCS_OK */
+#define MT_MIB_RSCR1(_band)          (MT_MIB_BAR0(_band) + 0x760) /* RX_FCS_ERR */
+#define MT_MIB_RSCR26(_band)         (MT_MIB_BAR0(_band) + 0x904) /* RX_MDRDY */
+
+/* MIB misc */
+#define MT_MIB_TRDR0(_band)          (MT_MIB_BAR0(_band) + 0x9B4) /* TRX_AGG_RANGE0 */
+#define MT_MIB_M0SDR6(_band)         (MT_MIB_BAR0(_band) + 0x020) /* M0SDR6 */
+
 /* DMA DCR0 — per-band DMA 控制 */
 #define MT_DMA_DCR0(_band)           (MT_DMA_BAR0(_band) + 0x000)
 #define MT_DMA_DCR0_MAX_RX_LEN       GENMASK(15, 3)
@@ -538,6 +555,10 @@
  *   BIT(24) = 1 (PKT_FMT=2)
  *   Q_IDX = 0x20 (bits [31:27,25] = 0b100000)
  */
+/* LMAC queue indices (CONNAC3, from mt76_connac3_mac.h) */
+#define MT_LMAC_ALTX0               0x10   /* Management frame queue (auth/assoc/probe) */
+#define MT_LMAC_BCN0                0x14   /* Beacon queue */
+
 #define MT_TX_MCU_PORT_RX_Q0        0x20
 #define MT_TX_PORT_IDX_MCU          1
 #define MCU_PQ_ID(p, q)             (((p) << 15) | ((q) << 10))
@@ -1446,7 +1467,9 @@ enum {
 	UNI_BSS_INFO_PROTECT = 3,
 	UNI_BSS_INFO_BSS_COLOR = 4, /* FIXED: mt6639=4, was wrong 5 */
 	UNI_BSS_INFO_HE = 5,        /* FIXED: mt6639=5, was wrong 7 */
+	UNI_BSS_INFO_MBSSID = 6,    /* 11V MBSSID (0x06) */
 	UNI_BSS_INFO_RATE = 11,
+	UNI_BSS_INFO_0C = 12,       /* Unknown flag (0x0C) — Windows 有，功能不明 */
 	UNI_BSS_INFO_SAP = 13,     /* Soft AP / SSID config (0x0D) */
 	UNI_BSS_INFO_P2P = 14,     /* P2P (0x0E) */
 	UNI_BSS_INFO_QBSS = 15,
@@ -1455,6 +1478,7 @@ enum {
 	UNI_BSS_INFO_STA_IOT = 24, /* IoT AP compatibility (0x18) */
 	UNI_BSS_INFO_MLD = 26,
 	UNI_BSS_INFO_PM = 27,      /* Windows RE: PM disable before BSS activate */
+	UNI_BSS_INFO_EHT = 30,     /* EHT/WiFi 7 capability (0x1E) */
 };
 
 /* DEV_INFO_UPDATE TLV tags */
@@ -1474,13 +1498,16 @@ enum {
 	STA_REC_APPS = 0x0b,	/* not used */
 	STA_REC_WTBL = 0x0d,
 	STA_REC_PHY = 0x15,
+	STA_REC_BA_OFFLOAD = 0x16,	/* BA offload — Windows 始终发送 */
 	STA_REC_HE_6G_CAP = 0x17,	/* HE 6GHz band capabilities */
 	STA_REC_HE_BASIC = 0x19,	/* HE basic capabilities (MT6639/Windows) */
 	STA_REC_REMOVE = 0x25,		/* remove STA_REC entry */
 	STA_REC_KEY_V3 = 0x27,
 	STA_REC_HDR_TRANS = 0x2b,
-	STA_REC_EHT = 0x22,
-	STA_REC_MLD = 0x20,
+	STA_REC_MLD_SETUP = 0x20,	/* MLD setup — Windows 始终发送 (即使非 MLO) */
+	STA_REC_EHT_MLD = 0x21,	/* EHT MLD — Windows 始终发送 */
+	STA_REC_EHT = 0x22,		/* EHT capabilities — Windows 始终发送 */
+	STA_REC_UAPSD = 0x24,		/* UAPSD — Windows 始终发送 */
 };
 
 /* WTBL sub-TLV tags (nested inside STA_REC_WTBL) */
@@ -1643,14 +1670,23 @@ struct bss_ifs_time_tlv {
 /* BSS_INFO_MLD TLV (tag=0x1A) — WiFi 7/CONNAC3 MLD 上下文
  * MT6639 固件要求此 TLV，即使非 MLO 连接也需要
  * 来源: mt6639/include/nic_uni_cmd_event.h line 606 */
+/* BSS_INFO_MLD TLV (tag=0x1A) — 必须 20 字节 (0x14)!
+ * Windows RE (0x14014fad0): 20 bytes total
+ * ⚠️ 之前我们只发 16 字节, 导致固件解析后续 TLV 偏移 +4 错位!
+ * 这可能是 PLE_STATION_PAUSE 的根因之一 */
 struct bss_mld_tlv {
 	__le16 tag;
 	__le16 len;
-	u8 group_mld_id;	/* 0xff = MLD_GROUP_NONE (legacy) */
-	u8 own_mld_id;		/* = bss_idx */
-	u8 own_mld_addr[ETH_ALEN];
-	u8 om_remap_idx;	/* 0xff = OM_REMAP_IDX_NONE */
-	u8 rsv[3];
+	u8 link_id;		/* +0x04: link_info[2], 非 MLD 时 = 0xFF */
+	u8 group_mld_id;	/* +0x05: sta_rec[0x908]+0x20, 非 MLD 时 = 0xFF */
+	u8 own_mld_addr[ETH_ALEN]; /* +0x06: MAC 地址 (6 bytes) */
+	u8 band_idx;		/* +0x0C: link_info[3] */
+	u8 omac_idx;		/* +0x0D: sta_rec[0x8fb] */
+	u8 remap_idx;		/* +0x0E: link_info[0xd], 非 MLD 时 = 0xFF */
+	u8 eml_mode;		/* +0x0F: MLD capability */
+	u8 str_opmode;		/* +0x10: link_info[0x10] */
+	u8 link_opmode;		/* +0x11: link_info[1] */
+	u8 pad[2];		/* +0x12: 填充到 20 字节 */
 } __packed;
 
 /* BSS_INFO_RA TLV (tag=1) — 速率适配配置
@@ -1691,16 +1727,17 @@ struct bss_he_tlv {
 	u8 pad[2];
 } __packed;
 
-/* BSS_INFO_SAP TLV (tag=0x0D) — Soft AP / SSID 配置
- * STA 模式全填 0；AP 模式填 SSID
- * 来源: MT6639 UNI_CMD_BSSINFO_SAP (40B) */
+/* BSS_INFO_SAP TLV (tag=0x0D) — STA/AP 信息
+ * Windows RE (0x14014ccf0): num_sta + rate_count + rate_data
+ * STA 模式全填 0
+ * 总大小: 4(tag+len) + 36(payload) = 40B (0x28) */
 struct bss_sap_tlv {
 	__le16 tag;
 	__le16 len;
-	u8 is_hidden_ssid;
-	u8 pad[2];
-	u8 ssid_len;
-	u8 ssid[32];
+	u8 num_sta;		/* +0x04: 关联的 STA 数量 (STA 模式=0) */
+	u8 pad[2];		/* +0x05: 保留 */
+	u8 rate_count;		/* +0x07: 速率列表长度 */
+	u8 rate_data[32];	/* +0x08: 速率列表 (memcpy) */
 } __packed;
 
 /* BSS_INFO_P2P TLV (tag=0x0E) — P2P 配置
@@ -1743,6 +1780,36 @@ struct bss_iot_tlv {
 	u8 rsv[3];
 } __packed;
 
+/* BSS_INFO_MBSSID TLV (tag=0x06) — 11V MBSSID 指示
+ * Windows RE: 0x14014d300, 仅 6 条指令
+ * STA 模式: max_bssid_indicator=0, mbssid_index=0 */
+struct bss_mbssid_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 max_bssid_indicator;
+	u8 mbssid_index;
+	u8 pad[2];
+} __packed;
+
+/* BSS_INFO_0C TLV (tag=0x0C) — 未知安全/WAPI 标志
+ * Windows RE: 0x14014d320, 仅 4 条指令
+ * 推测: WAPI 或 BCN_PROT 标志, STA 模式填 0 */
+struct bss_0c_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 flag;
+	u8 pad[3];
+} __packed;
+
+/* BSS_INFO_EHT TLV (tag=0x1E) — EHT/WiFi 7 能力
+ * Windows RE: 0x14014d150, len=0x10
+ * 初始 auth 全零 */
+struct bss_eht_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 data[12];
+} __packed;
+
 /* STA_REC_BASIC TLV (tag=0) */
 struct sta_rec_basic {
 	__le16 tag;
@@ -1768,18 +1835,18 @@ struct sta_rec_phy {
 } __packed;
 
 /* STA_REC_STATE TLV (tag=7 = STATE_CHANGED for MT6639)
- * 来源: mt76/mt76_connac_mcu.c mt76_connac_mcu_sta_tlv()
- *       MT6639 firmware: UNI_CMD_STAREC_TAG_STATE_CHANGED = 0x07
- * ⚠️ MT6639 布局: flags 在 state 前面, 共 12 字节
- *   (mt7925 的 sta_rec_state_v2 是 state 在前 16 字节 — 不同固件接口!) */
+ * Windows RE (0x14014d730): len=0x10 (16 bytes)!
+ * ⚠️ 之前我们的 struct 只有 12 字节, 导致后续 TLV 全部偏移 4 字节错位!
+ * 与 BSS_INFO MLD TLV 同样的根因模式 */
 struct sta_rec_state {
 	__le16 tag;
 	__le16 len;
-	__le32 flags;
-	u8 state;		/* STA_STATE_1 = 0 (auth 前) */
-	u8 vht_opmode;
-	u8 action;
-	u8 pad;
+	u8 state;		/* +4: STA_STATE_3=2 (connected), 0=disconnected */
+	u8 pad1[3];		/* +5: 对齐到 +8 */
+	__le32 flags;		/* +8: state change flags */
+	u8 action;		/* +C: opmode/action type */
+	u8 pad2;		/* +D: 显式清零 */
+	u8 pad3[2];		/* +E: 填充到 16 字节 */
 } __packed;
 
 /* STA_REC_RA TLV (tag=1 = STA_REC_RA)
@@ -1838,6 +1905,85 @@ struct sta_rec_he_basic {
 	__le16 rx_mcs_80;	/* RX Max NSS MCS for BW <= 80MHz */
 	__le16 rx_mcs_160;	/* RX Max NSS MCS for BW = 160MHz */
 	__le16 rx_mcs_80p80;	/* RX Max NSS MCS for BW = 80+80MHz */
+} __packed;
+
+/* STA_REC_BA_OFFLOAD TLV (tag=0x16) — Block Ack 卸载
+ * Windows RE: 0x14014e5b0, 始终发送 (即使全零)
+ * 固件用此 TLV 管理 BA session 的硬件卸载 */
+struct sta_rec_ba_offload {
+	__le16 tag;		/* 0x0016 */
+	__le16 len;		/* 16 */
+	u8 tx_ba_wsize;		/* TX BA window size (基础) */
+	u8 rx_ba_wsize;		/* RX BA window size (基础) */
+	u8 ba_policy;		/* BA policy */
+	u8 ba_control;		/* BA control flags */
+	__le32 ba_bitmap;	/* BA TID bitmap */
+	__le16 tx_ba_wsize_ext;	/* TX BA window size (VHT/HE 扩展) */
+	__le16 rx_ba_wsize_ext;	/* RX BA window size (VHT/HE 扩展) */
+} __packed;
+
+/* STA_REC_UAPSD TLV (tag=0x24) — UAPSD 省电配置
+ * Windows RE: 0x14014e620, 始终发送 (即使全零)
+ * auth 阶段所有字段为 0 */
+struct sta_rec_uapsd {
+	__le16 tag;		/* 0x0024 */
+	__le16 len;		/* 8 */
+	u8 uapsd_flags;		/* UAPSD trigger/delivery enabled ACs */
+	u8 max_sp_len;		/* Max SP Length */
+	u8 uapsd_ac;		/* UAPSD AC bitmap */
+	u8 pad;
+} __packed;
+
+/* STA_REC_HE_6G_CAP TLV (tag=0x17) — HE 6GHz band capabilities
+ * Windows RE: FUN_14014dae0, 条件发送 (仅当 he_6g_cap != 0)
+ * auth 阶段全零 — 但 tag+len header 必须正确 */
+struct sta_rec_he_6g_cap {
+	__le16 tag;		/* 0x0017 */
+	__le16 len;		/* 8 */
+	__le16 he_6g_cap;	/* HE 6GHz capability info */
+	u8 pad[2];
+} __packed;
+
+/* STA_REC_MLD_SETUP TLV (tag=0x20) — MLD setup
+ * Windows RE: MLD_SETUP_builder (0x14014ddc0), Agent B 独有
+ * 变长 TLV, 含循环 link entries. 非 MLO 模式最小 20B.
+ * auth 阶段全零即可, 但 Windows 始终发送 */
+struct sta_rec_mld_setup {
+	__le16 tag;		/* 0x0020 */
+	__le16 len;		/* 最小 0x14 (20B) */
+	__le32 mld_addr_part;	/* MLD 地址部分 */
+	__le16 aid;		/* AID */
+	__le16 setup_wcid;	/* WCID */
+	__le16 primary_link;	/* primary link ID */
+	__le16 secondary_link;	/* secondary link ID */
+	u8 mld_type;		/* MLD type */
+	u8 pad[3];
+} __packed;
+
+/* STA_REC_EHT_MLD TLV (tag=0x21) — EHT MLD info
+ * Windows RE: EHT_MLD_builder (0x14014e2a0), Agent B
+ * 常量: 0x00100021 → tag=0x0021, len=0x0010 (16B)
+ * auth 阶段全零即可 */
+struct sta_rec_eht_mld {
+	__le16 tag;		/* 0x0021 */
+	__le16 len;		/* 0x0010 (16B) */
+	u8 mld_addr_from_sta;	/* from sta[0xf] */
+	u8 link_info;		/* from sta[0x10] */
+	u8 pad[10];
+} __packed;
+
+/* STA_REC_EHT TLV (tag=0x22) — EHT capabilities
+ * Windows RE: FUN_14014db80, Agent A + B 确认
+ * 常量: 0x280022 → tag=0x0022, len=0x0028 (40B)
+ * offset 0x04 固定 0xFF, 其余从 STA 记录复制
+ * auth 阶段: 0xFF + 全零 */
+struct sta_rec_eht_info {
+	__le16 tag;		/* 0x0022 */
+	__le16 len;		/* 0x0028 (40B) */
+	u8 const_ff;		/* 0xFF (固定) */
+	u8 pad1;
+	__le16 eht_cap;		/* EHT capability u16 */
+	u8 eht_data[32];	/* EHT blocks: 8+8+4+9+3pad = 32 */
 } __packed;
 
 /* STA_REC_KEY_V3 TLV (tag=0x27) — 密钥安装 */
@@ -1947,6 +2093,8 @@ int mt7927_tx_queue_skb_sf(struct mt7927_dev *dev, struct mt7927_ring *ring,
 void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring);
 void mt7927_tx_complete(struct mt7927_dev *dev, struct mt7927_ring *ring);
 void mt7927_tx_complete_sf(struct mt7927_dev *dev, struct mt7927_ring *ring);
+int mt7927_tx_enqueue_mgmt_sf(struct mt7927_dev *dev, struct sk_buff *skb,
+			      struct mt7927_wcid *wcid);
 int mt7927_dma_init_data_rings(struct mt7927_dev *dev);
 void mt7927_rx_refill(struct mt7927_dev *dev, struct mt7927_ring *ring);
 

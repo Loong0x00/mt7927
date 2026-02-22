@@ -237,6 +237,17 @@ void mt7927_irq_tasklet(unsigned long data)
 	if (intr & MT_INT_RX_DONE_MCU)
 		napi_schedule(&dev->napi_rx_mcu);
 
+	/* RX ring 7: auxiliary — may carry management frames (auth/assoc)
+	 * DIAG: check if RX ring 7 has data */
+	if (intr & MT_INT_RX_DONE_AUX) {
+		u32 didx7 = dma_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+		dev_info_ratelimited(&dev->pdev->dev,
+			"RX7 IRQ! DIDX=%u tail=%u\n",
+			didx7, dev->ring_rx7.tail);
+		/* Process RX ring 7 frames using rx_data NAPI for now */
+		napi_schedule(&dev->napi_rx_data);
+	}
+
 	/* TX completion */
 	if (intr & MT_INT_TX_DONE_ALL)
 		napi_schedule(&dev->tx_napi);
@@ -295,6 +306,19 @@ int mt7927_poll_rx_data(struct napi_struct *napi, int budget)
 		if (!skb)
 			break;
 
+		/* DIAG: log frames received on RX ring 4 */
+		{
+			__le32 *rxd = (__le32 *)skb->data;
+			u32 r0 = le32_to_cpu(rxd[0]);
+			u8 pkt_type = FIELD_GET(MT_RXD0_PKT_TYPE, r0);
+			/* If it looks like a normal frame, peek at 802.11 header */
+			if (skb->len > 64) {
+				dev_info_ratelimited(&dev->pdev->dev,
+					"RX4: pkt_type=%u len=%u rxd0=0x%08x\n",
+					pkt_type, skb->len, r0);
+			}
+		}
+
 		/* Dispatch to mac80211 RX processing (implemented in mac.c) */
 		mt7927_queue_rx_skb(dev, MT_RXQ_MAIN, skb);
 		done++;
@@ -304,10 +328,41 @@ int mt7927_poll_rx_data(struct napi_struct *napi, int budget)
 	if (done > 0)
 		dma_wr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid), ring->tail);
 
+	/* DIAG: Also process RX ring 7 (auxiliary) — may carry mgmt frames */
+	{
+		struct mt7927_ring *ring7 = &dev->ring_rx7;
+		int done7 = 0;
+
+		while (done + done7 < budget) {
+			struct sk_buff *skb7;
+
+			skb7 = mt7927_rx_process_one(dev, ring7);
+			if (!skb7)
+				break;
+
+			dev_info(&dev->pdev->dev,
+				"RX7: got frame! len=%u rxd0=0x%08x\n",
+				skb7->len,
+				le32_to_cpu(((__le32 *)skb7->data)[0]));
+
+			mt7927_queue_rx_skb(dev, MT_RXQ_MAIN, skb7);
+			done7++;
+		}
+
+		if (done7 > 0) {
+			dma_wr(dev, MT_WPDMA_RX_RING_CIDX(ring7->qid),
+			       ring7->tail);
+			dev_info(&dev->pdev->dev,
+				"RX7: processed %d frames\n", done7);
+		}
+		done += done7;
+	}
+
 	if (done < budget) {
 		napi_complete_done(napi, done);
-		/* Re-enable RX ring 4 interrupt */
-		dma_rmw(dev, MT_WFDMA_HOST_INT_ENA, 0, MT_INT_RX_DONE_DATA);
+		/* Re-enable RX ring 4 + ring 7 interrupts */
+		dma_rmw(dev, MT_WFDMA_HOST_INT_ENA, 0,
+			MT_INT_RX_DONE_DATA | MT_INT_RX_DONE_AUX);
 	}
 
 	return done;
@@ -569,6 +624,76 @@ void mt7927_tx_complete_sf(struct mt7927_dev *dev, struct mt7927_ring *ring)
 }
 
 /*
+ * mt7927_tx_enqueue_mgmt_sf — Enqueue a management frame on Ring 2 (SF mode)
+ *
+ * SF (Store-and-Forward) mode: TXD + 802.11 frame in a single contiguous
+ * DMA buffer allocated via dma_alloc_coherent(). No TXP or scatter-gather.
+ *
+ * Windows uses Ring 2 SF mode for ALL management frames (auth/assoc/probe).
+ * Ring 0 CT mode is only for data frames.
+ *
+ * @dev: device
+ * @skb: management frame (802.11 payload, no TXD prepended)
+ * @wcid: wireless client ID
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+int mt7927_tx_enqueue_mgmt_sf(struct mt7927_dev *dev, struct sk_buff *skb,
+			       struct mt7927_wcid *wcid)
+{
+	struct mt7927_ring *ring = &dev->ring_tx2;
+	u32 total_len = MT_TXD_SIZE + skb->len;
+	struct mt76_desc *desc;
+	dma_addr_t dma;
+	void *buf;
+	u32 next;
+
+	if (!ring->desc || !ring->buf) {
+		dev_err(&dev->pdev->dev, "Ring 2 not initialized!\n");
+		return -ENODEV;
+	}
+
+	/* Check ring full */
+	next = (ring->head + 1) % ring->ndesc;
+	if (next == ring->tail) {
+		dev_err(&dev->pdev->dev, "Ring 2 full!\n");
+		return -ENOSPC;
+	}
+
+	/* Allocate coherent DMA buffer for TXD + frame */
+	buf = dma_alloc_coherent(&dev->pdev->dev, total_len, &dma, GFP_KERNEL);
+	if (!buf) {
+		dev_err(&dev->pdev->dev, "Ring 2 DMA alloc failed (%u bytes)\n",
+			total_len);
+		return -ENOMEM;
+	}
+
+	/* Build TXD (32 bytes) at start of buffer using Windows RE values */
+	mt7927_mac_write_txwi_mgmt_sf(dev, (__le32 *)buf, skb, wcid);
+
+	/* Copy 802.11 frame after TXD */
+	memcpy(buf + MT_TXD_SIZE, skb->data, skb->len);
+
+	/* Write DMA descriptor */
+	desc = &ring->desc[ring->head];
+	desc->buf0 = cpu_to_le32(lower_32_bits(dma));
+	desc->buf1 = cpu_to_le32(upper_32_bits(dma));
+	desc->ctrl = cpu_to_le32(FIELD_PREP(MT_DMA_CTL_SD_LEN0, total_len) |
+				 MT_DMA_CTL_LAST_SEC0);
+	desc->info = 0;
+
+	/* Store for completion handler */
+	ring->buf[ring->head] = buf;
+	ring->buf_dma[ring->head] = dma;
+
+	ring->head = next;
+
+	dev_kfree_skb_any(skb);
+
+	return 0;
+}
+
+/*
  * mt7927_tx_kick — Submit queued TX descriptors to hardware
  *
  * After one or more descriptors have been enqueued via mt7927_tx_queue_skb(),
@@ -603,6 +728,15 @@ void mt7927_tx_kick(struct mt7927_dev *dev, struct mt7927_ring *ring)
 			 mt7927_rr(dev, 0x0c0b0),  /* PSE_QUEUE_EMPTY: bus2chip 0x820c8000→BAR0 0x0c000 */
 			 mt7927_rr(dev, MT_HIF_DMASHDL_QUEUE_MAP0),
 			 dma_rr(dev, MT_WPDMA_TX_RING_DIDX(ring->qid)));
+		/* PLE STATION_PAUSE 诊断 — 检查 TX scheduler 是否暂停了 station */
+		dev_info(&dev->pdev->dev,
+			 "POST-TX PLE: STA_PAUSE0=0x%08x STA_PAUSE1=0x%08x "
+			 "DIS0=0x%08x DIS1=0x%08x FL_QUE_CTRL0=0x%08x\n",
+			 mt7927_rr(dev, 0x083e0),  /* PLE_STATION_PAUSE0: 0x820c03e0 */
+			 mt7927_rr(dev, 0x083e4),  /* PLE_STATION_PAUSE1: 0x820c03e4 */
+			 mt7927_rr(dev, 0x08390),  /* PLE_DIS_STA_MAP0: 0x820c0390 */
+			 mt7927_rr(dev, 0x08394),  /* PLE_DIS_STA_MAP1: 0x820c0394 */
+			 mt7927_rr(dev, 0x081a0)); /* PLE_FL_QUE_CTRL_0 */
 	}
 }
 
