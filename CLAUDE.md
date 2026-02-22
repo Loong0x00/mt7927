@@ -91,16 +91,28 @@ pci_enable_device → ioremap BAR0
 
 | 优先级 | 来源 | 路径 | 备注 |
 |--------|------|------|------|
-| **1** | **Windows RE (Ghidra)** | `docs/win_*.md`, Windows .sys 二进制 | **唯一权威来源，实际运行的驱动** |
+| **1** | **Windows RE (Ghidra)** | `docs/re/win_*.md`, Windows .sys 二进制 | **唯一权威来源，实际运行的驱动** |
 | 2 | MT6639 Android 驱动 | `mt6639/` | 同芯片辅助参考，代码不一定准确 |
 | 3 | mt7925 上游驱动 | `mt76/mt7925/` | **不可信**，不同芯片，禁止用于固件相关逻辑 |
-| 4 | Ghidra RE 文档 | `docs/references/ghidra_post_fw_init.md` | PostFwDownloadInit 分析 |
+| 4 | Ghidra RE 文档 | `docs/re/ghidra_post_fw_init.md` | PostFwDownloadInit 分析 |
 
 **用户明确指示 (Session 15)**:
 - **Windows 逆向是唯一权威**，mt6639 和 mt76 都不可信，有冲突时以 Windows RE 为准
 - mt7925 和 mt6639 已反复导致错误修复，"吃的亏还不够多么"
 - 涉及 TXD/DMA/固件交互的字段，**必须从 Windows 二进制逆向确认**
 - Ghidra 项目: `tmp/ghidra_project/mt7927_re`，Windows 驱动 .sys 文件在 `tmp/` 下
+
+## 文档结构
+
+| 目录 | 内容 |
+|------|------|
+| `docs/re/` | Windows 逆向工程文档（高/中可信度） |
+| `docs/analysis/` | 对比分析（mt6639/mt7925 vs Windows） |
+| `docs/debug/` | 调试日志、实验记录 |
+| `docs/archive/` | 过时文档 |
+| `docs/archive/low_trust/` | 低可信度（主要结论被证伪） |
+| `docs/archive/discard/` | 应废弃（完全被取代） |
+| `docs/re_audit_report.md` | 文档可信度审计报告 |
 
 ## 致命操作 — 永远不要使用
 
@@ -162,7 +174,7 @@ STATE_DISCONNECT = 0
 ### 当前现象 (Session 17, Ring 2)
 - Ring 2 SF mode 提交 → DMA DIDX 前进 (DMA 消费成功)
 - BIT(6) 中断触发 (Session 16 新增 — 之前没有)
-- TXD DW0-DW7 全部匹配 Windows (Ghidra 汇编级验证, `docs/win_re_dw2_dw6_verified.md`)
+- TXD DW0-DW7 全部匹配 Windows (Ghidra 汇编级验证, `docs/re/win_re_dw2_dw6_verified.md`)
 - **固件完全静默** — 无 TX_DONE (eid=0x2D)、无 TXFREE、无任何错误
 - **TXD 已排除为根因** — 问题在更上层 (init/config)
 
@@ -190,7 +202,7 @@ STATE_DISCONNECT = 0
 
 **频段**: 5GHz ch161, 2.4GHz ch6 — 均失败
 
-### 当前方向: TX auth 帧 (调查报告 `docs/win_re_hif_ctrl_investigation.md`)
+### 当前方向: TX auth 帧 (调查报告 `docs/re/win_re_hif_ctrl_investigation.md`)
 
 **已排除**: TXD (全部匹配 Windows), DMASHDL (full init 恢复), EFUSE_CTRL (恢复)
 
@@ -232,7 +244,7 @@ echo 1 | sudo tee /sys/bus/pci/devices/0000:09:00.0/remove && sleep 2 && echo 1 
 
 ## Windows RE: 完整 CID 映射表 (2026-02-21 分析, 58个条目)
 
-**分析来源**: `docs/win_re_cid_mapping.md` — 从 `mtkwecx.sys` dispatch table `0x1402507e0` 提取
+**分析来源**: `docs/re/win_re_cid_mapping.md` — 从 `mtkwecx.sys` dispatch table `0x1402507e0` 提取
 
 ### 关键确认 (Ghidra 汇编级验证)
 
