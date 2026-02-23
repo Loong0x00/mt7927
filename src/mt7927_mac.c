@@ -358,13 +358,17 @@ void mt7927_mac_write_txwi_mgmt_sf(struct mt7927_dev *dev, __le32 *txwi,
 	 * Source: docs/win_re_txd_dw0_dw1_precise.md (Sections 5, 10, 12)
 	 * ==================================================================== */
 
-	/* DW0: Q_IDX=8, PKT_FMT=0 (SF mode)
+	/* DW0: Q_IDX=8, PKT_FMT=0 (SF mode), TX_BYTES = MSDU length
 	 * Windows RE: queue_class=0x04, Q_IDX = 0x04 << 1 = 8
 	 *   FIELD_PREP(GENMASK(31,25), 8) = 0x10000000
 	 * Source: docs/re/win_re_full_txd_dma_path.md Section 4 Step 2
-	 * Previous Q_IDX=0x10 (ALTX0) was wrong queue for mgmt SF mode */
+	 *
+	 * TX_BYTES = MSDU payload length (NOT including 32-byte TXD!)
+	 * Previous bug: used (skb->len + MT_TXD_SIZE) = 62 for 30-byte auth frame,
+	 * firmware interpreted as 62 bytes of MSDU after TXD → buffer overread → silent drop.
+	 * DMA descriptor SD_LEN0 carries the total DMA buffer size (TXD+payload). */
 	txwi[0] = cpu_to_le32(FIELD_PREP(MT_TXD0_Q_IDX, 8) |
-			      (skb->len + MT_TXD_SIZE));
+			      FIELD_PREP(MT_TXD0_TX_BYTES, skb->len));
 
 	/* DW1: CONNAC3 FIELD_PREP — aligned with unified path (mt7927_mac_write_txwi)
 	 * Key fixes vs old raw bits:
@@ -748,6 +752,32 @@ void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb)
 					dev_info(&dev->pdev->dev,
 						 "  B1_TX20=%u B1_TX40=%u\n",
 						 b1_tx20, b1_tx40);
+				}
+
+				/* Ring 4 DIDX + PLE HIF — Session 33
+				 * CODA: wf_ple_top.h 寄存器偏移 (bus 0x820c0000 → BAR0 0x08000) */
+				{
+					u32 r4d, r6d, r7d, r4c;
+					u32 freepg, hif_pg, hif_grp;
+
+					r4d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(4));
+					r6d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+					r7d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+					r4c = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(4));
+					/* PLE_FREEPG_CNT: offset 0x3A0 */
+					freepg = mt7927_rr(dev, 0x083a0);
+					/* PLE_HIF_PG_INFO: offset 0x3A8
+					 * bits[27:16]=HIF_SRC_CNT, bits[11:0]=HIF_RSV_CNT */
+					hif_pg = mt7927_rr(dev, 0x083a8);
+					/* PLE_PG_HIF_GROUP: offset 0x0C
+					 * bits[27:16]=HIF_MAX_QUOTA, bits[11:0]=HIF_MIN_QUOTA */
+					hif_grp = mt7927_rr(dev, 0x0800c);
+					dev_info(&dev->pdev->dev,
+						 "  RX DIDX: R4=%u R6=%u R7=%u (R4_CIDX=%u)\n",
+						 r4d, r6d, r7d, r4c);
+					dev_info(&dev->pdev->dev,
+						 "  PLE: FREEPG=0x%08x HIF_PG=0x%08x HIF_GRP=0x%08x\n",
+						 freepg, hif_pg, hif_grp);
 				}
 
 				/* DMASHDL state: check if BYPASS is still on,

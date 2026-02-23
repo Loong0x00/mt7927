@@ -1,0 +1,57 @@
+# 格式: 函数标签  反编译文件  反汇编文件
+# 文件均位于 /home/user/mt7927/tmp/ghidra_exports/
+#
+# === Phase 1: Auth TX 核心命令 ===
+
+# --- BSS_INFO 方向 ---
+nicUniCmdBssInfoTagBasic  nicUniCmdBssInfoTagBasic_BSS_BASIC_builder__14014c610_decomp.c  nicUniCmdBssInfoTagBasic_BSS_BASIC_builder__14014c610_disasm.txt
+nicUniCmdSetBssInfo_dispatch  nicUniCmdSetBssInfo_14TLV_dispatch__1401444a0_decomp.c  nicUniCmdSetBssInfo_14TLV_dispatch__1401444a0_disasm.txt
+MtCmdSetBssInfo  MtCmdSetBssInfo__1400cf928_decomp.c  MtCmdSetBssInfo__1400cf928_disasm.txt
+RLM_PROTECT_IFS_builder  RLM_PROTECT_IFS_builder__14014cc80_decomp.c  RLM_PROTECT_IFS_builder__14014cc80_disasm.txt
+RATE_builder  RATE_builder__14014cc90_decomp.c  RATE_builder__14014cc90_disasm.txt
+SEC_builder  SEC_builder__14014ccb0_decomp.c  SEC_builder__14014ccb0_disasm.txt
+QBSS_builder  QBSS_builder__14014ccd0_decomp.c  QBSS_builder__14014ccd0_disasm.txt
+SAP_builder  SAP_builder__14014ccf0_decomp.c  SAP_builder__14014ccf0_disasm.txt
+P2P_builder  P2P_builder__14014cd30_decomp.c  P2P_builder__14014cd30_disasm.txt
+HE_BSS_builder  HE_BSS_builder__14014cd50_decomp.c  HE_BSS_builder__14014cd50_disasm.txt
+BSS_COLOR_builder  BSS_COLOR_builder__14014d010_decomp.c  BSS_COLOR_builder__14014d010_disasm.txt
+EHT_BSS_builder  EHT_BSS_builder__14014d150_decomp.c  EHT_BSS_builder__14014d150_disasm.txt
+MBSSID_builder  MBSSID_builder__14014d300_decomp.c  MBSSID_builder__14014d300_disasm.txt
+UNKNOWN_0C_builder  UNKNOWN_0C_builder__14014d320_decomp.c  UNKNOWN_0C_builder__14014d320_disasm.txt
+IoT_builder  IoT_builder__14014d350_decomp.c  IoT_builder__14014d350_disasm.txt
+IFS_TIME_builder  IFS_TIME_builder__140150edc_decomp.c  IFS_TIME_builder__140150edc_disasm.txt
+nicUniCmdBssInfoMld  nicUniCmdBssInfoMld_MLD_builder__14014fad0_decomp.c  nicUniCmdBssInfoMld_MLD_builder__14014fad0_disasm.txt
+
+# --- STA_REC 方向 ---
+MtCmdSendStaRecUpdate  MtCmdSendStaRecUpdate__1400cdea0_decomp.c  MtCmdSendStaRecUpdate__1400cdea0_disasm.txt
+nicUniCmdUpdateStaRec_dispatch  nicUniCmdUpdateStaRec_13TLV_dispatch__1401446d0_decomp.c  nicUniCmdUpdateStaRec_13TLV_dispatch__1401446d0_disasm.txt
+STA_BASIC_builder  STA_BASIC_builder__14014d6d0_decomp.c  STA_BASIC_builder__14014d6d0_disasm.txt
+STATE_INFO_builder  STATE_INFO_builder__14014d730_decomp.c  STATE_INFO_builder__14014d730_disasm.txt
+PHY_INFO_builder  PHY_INFO_builder__14014d760_decomp.c  PHY_INFO_builder__14014d760_disasm.txt
+HT_INFO_builder  HT_INFO_builder__14014d7a0_decomp.c  HT_INFO_builder__14014d7a0_disasm.txt
+VHT_INFO_builder  VHT_INFO_builder__14014d7e0_decomp.c  VHT_INFO_builder__14014d7e0_disasm.txt
+HE_BASIC_STA_builder  HE_BASIC_STA_builder__14014d810_decomp.c  HE_BASIC_STA_builder__14014d810_disasm.txt
+HE_6G_CAP_builder  HE_6G_CAP_builder__14014dae0_decomp.c  HE_6G_CAP_builder__14014dae0_disasm.txt
+RA_INFO_builder  RA_INFO_builder__14014e570_decomp.c  RA_INFO_builder__14014e570_disasm.txt
+BA_OFFLOAD_builder  BA_OFFLOAD_builder__14014e5b0_decomp.c  BA_OFFLOAD_builder__14014e5b0_disasm.txt
+UAPSD_builder  UAPSD_builder__14014e620_decomp.c  UAPSD_builder__14014e620_disasm.txt
+EHT_INFO_builder  EHT_INFO_builder__14014db80_decomp.c  EHT_INFO_builder__14014db80_disasm.txt
+EHT_MLD_builder  EHT_MLD_builder__14014e2a0_decomp.c  EHT_MLD_builder__14014e2a0_disasm.txt
+MLD_SETUP_builder  MLD_SETUP_builder__14014ddc0_decomp.c  MLD_SETUP_builder__14014ddc0_disasm.txt
+
+# --- 基础设施命令 ---
+BssActivateCtrl  BssActivateCtrl_nicUniCmdBssActivateCtrl__140143540_decomp.c  BssActivateCtrl_nicUniCmdBssActivateCtrl__140143540_disasm.txt
+nicUniCmdPmDisable  nicUniCmdPmDisable__1400caefc_decomp.c  nicUniCmdPmDisable__1400caefc_disasm.txt
+MtCmdActivateDeactivateNetwork  MtCmdActivateDeactivateNetwork__1400c558c_decomp.c  MtCmdActivateDeactivateNetwork__1400c558c_disasm.txt
+MtCmdChPrivilage  MtCmdChPrivilage__1400c5e08_decomp.c  MtCmdChPrivilage__1400c5e08_disasm.txt
+ChPrivilege_acquire_TLV  ChPrivilege_acquire_TLV_builder__14014fe60_decomp.c  ChPrivilege_acquire_TLV_builder__14014fe60_disasm.txt
+nicUniCmdSendCmd  nicUniCmdSendCmd__14014eb0c_decomp.c  nicUniCmdSendCmd__14014eb0c_disasm.txt
+
+# --- 连接流程 ---
+MlmeCntlOidConnectProc  MlmeCntlOidConnectProc__140123588_decomp.c  MlmeCntlOidConnectProc__140123588_disasm.txt
+MlmeCntlWaitJoinProc  MlmeCntlWaitJoinProc__1401273a8_decomp.c  MlmeCntlWaitJoinProc__1401273a8_disasm.txt
+
+# --- 辅助 ---
+phy_mode_from_band  phy_mode_from_band__14014fdfc_decomp.c  phy_mode_from_band__14014fdfc_disasm.txt
+connType_helper  connType_helper__140151608_decomp.c  connType_helper__140151608_disasm.txt
+option_decode_0xed  option_decode_0xed__1400ca864_decomp.c  option_decode_0xed__1400ca864_disasm.txt
