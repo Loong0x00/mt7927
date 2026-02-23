@@ -1,3 +1,6 @@
+# Claude Code project instructions (private)
+CLAUDE.md
+
 # Kernel module build artifacts
 *.o
 *.ko
@@ -153,7 +156,7 @@ ghidra_*/
 # Windows driver packages (proprietary binaries - legal issues)
 DRV_Bluetooth_MTK_*/
 DRV_WiFi_MTK_*/
-WiFi_AMD-MediaTek_*/
+WiFi_AMD-MediaTek_*
 
 # Third-party driver code (not our code)
 linux-driver-mediatek-mt7927-bluetooth-main/
