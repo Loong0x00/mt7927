@@ -2147,6 +2147,10 @@ static void mt7927_mac_init_band(struct mt7927_dev *dev, u8 band)
 		 mt7927_rr(dev, MT_MDP_BNRCFR0(band)),
 		 mt7927_rr(dev, MT_MDP_BNRCFR1(band)));
 
+	/* S43 TEST: 注释掉 BNRCFR bypass，让固件保持默认 RX 路由
+	 * 目的: 测试固件默认路径下硬件 ACK 是否工作
+	 * 原始代码保留以便恢复 */
+#if 0 /* S43: disabled to test firmware default RX routing */
 	/* 所有值 = MT_MDP_TO_HIF = 0, 所以只需清除对应位域 */
 	mt7927_rmw(dev, MT_MDP_BNRCFR0(band),
 		   MT_MDP_RCFR0_MCU_RX_MGMT |
@@ -2156,6 +2160,7 @@ static void mt7927_mac_init_band(struct mt7927_dev *dev, u8 band)
 		   MT_MDP_RCFR1_MCU_RX_BYPASS |
 		   MT_MDP_RCFR1_RX_DROPPED_UCAST |
 		   MT_MDP_RCFR1_RX_DROPPED_MCAST, 0);
+#endif
 
 	dev_info(&dev->pdev->dev,
 		 "band%d BNRCFR AFTER: CFR0=0x%08x CFR1=0x%08x\n",
@@ -2435,38 +2440,75 @@ static void mt7927_scan_work(struct work_struct *work)
 
 /* --- 连接 MCU 命令 --- */
 
-/* DEV_INFO_UPDATE (CID=0x01) — 激活虚拟接口 */
-static int mt7927_mcu_uni_add_dev(struct mt7927_dev *dev,
-				  struct ieee80211_vif *vif, bool enable)
+/* BssActivateCtrl COMBO — Windows RE (0x140143540)
+ *
+ * 关键突破 (S42): Windows 把 DEV_INFO + BSS_INFO(BASIC+MLD) 作为单个 CID=0x01
+ * 帧发送。固件的 CID=0x01 处理器是 BssActivateCtrl, 期望同时收到两部分数据。
+ * 之前分开发送导致固件不完成 MUAR 编程 → 硬件不认识我们的 MAC → 不发 ACK。
+ *
+ * DEV_INFO 使用 Windows 平坦格式 (16B, 非 TLV):
+ *   byte[0]=omac_idx(MUAR slot), byte[1]=0xFF(STA type)
+ *   byte[4-7]=conn_info(0x000C0000)
+ *   byte[8]=active(1=activate, 0=deactivate), byte[9]=phy_idx, byte[10-15]=MAC
+ *
+ * Payload: [16B DEV_INFO flat] + [4B bss_hdr + 32B BASIC + 20B MLD] = 72B
+ * 来源: docs/re/win_re_connect_flow_complete.md Section 3 */
+static int mt7927_mcu_bss_activate_combo(struct mt7927_dev *dev,
+					  struct ieee80211_vif *vif,
+					  bool enable)
 {
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
-	/* MT6639: UNI_CMD_DEVINFO header + DEVINFO_ACTIVE TLV
-	 * header 包含 OwnMacIdx + DbdcIdx, TLV 只有 active + mac
-	 * 之前 rsv[4] 全零: DbdcIdx=0 (只用 band0), MAC 偏移 2 字节!
-	 * 已修复: header 设正确值, TLV 匹配 MT6639 的 12 字节格式 */
 	struct {
-		struct dev_info_hdr hdr;
-		struct dev_info_active_tlv tlv;
+		/* Segment 1: DEV_INFO flat format (16 bytes) */
+		struct dev_info_req dev;
+		/* Segment 2: BSS_INFO (4B hdr + 32B BASIC + 20B MLD = 56B) */
+		struct bss_req_hdr hdr;
+		struct mt76_connac_bss_basic_tlv basic;
+		struct bss_mld_tlv mld;
 	} __packed req = {};
 
-	req.hdr.omac_idx = mvif->omac_idx;
-	/* Use actual band_idx instead of 0xff(AUTO) after ROC_GRANT
-	 * band_idx=0xff at add_interface time, updated to 0/1 after ROC_GRANT.
-	 * Firmware needs correct band_idx for RX MAC address filtering on DBDC */
-	req.hdr.band_idx = mvif->band_idx;
+	/* === DEV_INFO flat format (Ghidra nicUniCmdBssActivateCtrl) === */
+	req.dev.omac_idx = mvif->omac_idx;        /* [0] MUAR slot */
+	req.dev.type_flag = 0xFF;                  /* [1] STA mode */
+	req.dev.conn_info = cpu_to_le32(0x000C0000);
+	req.dev.active = enable ? 1 : 0;           /* [8] activate/deactivate */
+	req.dev.phy_idx = 0;
+	memcpy(req.dev.mac_addr, vif->addr, ETH_ALEN);
 
-	req.tlv.tag = cpu_to_le16(UNI_DEV_INFO_ACTIVE);
-	req.tlv.len = cpu_to_le16(sizeof(req.tlv));
-	req.tlv.active = enable;
-	memcpy(req.tlv.omac_addr, vif->addr, ETH_ALEN);
+	/* === BSS_INFO header + BASIC + MLD (Windows RE Section 3.3) === */
+	req.hdr.bss_idx = mvif->bss_idx;
+
+	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
+	req.basic.len = cpu_to_le16(sizeof(req.basic));
+	req.basic.active = mvif->bss_idx;
+	req.basic.omac_idx = mvif->omac_idx;
+	req.basic.hw_bss_idx = mvif->omac_idx;
+	req.basic.band_idx = 0xFF;  /* inherit from DEV_INFO */
+	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
+	req.basic.conn_state = 1;   /* activate */
+	req.basic.link_idx = mvif->band_idx;
+	memcpy(req.basic.bssid, vif->bss_conf.bssid, ETH_ALEN);
+
+	req.mld.tag = cpu_to_le16(UNI_BSS_INFO_MLD);
+	req.mld.len = cpu_to_le16(sizeof(req.mld));
+	req.mld.link_id = 0xff;
+	req.mld.group_mld_id = mvif->bss_idx;
+	memcpy(req.mld.own_mld_addr, vif->addr, ETH_ALEN);
+	req.mld.remap_idx = 0x00;
+	req.mld.band_idx = 0xff;
+	req.mld.omac_idx = 0xff;
 
 	dev_info(&dev->pdev->dev,
-		 "mcu: DEV_INFO active=%d omac=%d band=%u addr=%pM (size=%zu)\n",
-		 enable, mvif->omac_idx, mvif->band_idx, vif->addr,
+		 "mcu: BssActivateCtrl COMBO cid=0x01 active=%d bss=%d omac=%d "
+		 "band=%u ownmac_idx=%u mac=%pM bssid=%pM (size=%zu)\n",
+		 enable, mvif->bss_idx, mvif->omac_idx, mvif->band_idx,
+		 req.dev.omac_idx, vif->addr, vif->bss_conf.bssid,
 		 sizeof(req));
 
-	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_DEV_INFO, &req,
-					   sizeof(req));
+	/* CID=0x01: firmware routes to BssActivateCtrl handler which processes
+	 * BOTH DEV_INFO (16B at start) and BSS_INFO (remaining bytes) */
+	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_DEV_INFO,
+					   &req, sizeof(req));
 }
 
 /* BSS_INFO PM_DISABLE — 在 BSS activate 前禁用省电模式
@@ -2476,13 +2518,12 @@ static int mt7927_mcu_uni_add_dev(struct mt7927_dev *dev,
 static int mt7927_mcu_bss_pm_disable(struct mt7927_dev *dev, u8 bss_idx)
 {
 	struct {
-		u8  bss_idx;
-		u8  pad[3];
+		struct bss_req_hdr hdr;
 		__le16 tag;
 		__le16 len;
 	} __packed req = {};
 
-	req.bss_idx = bss_idx;
+	req.hdr.bss_idx = bss_idx;
 	req.tag = cpu_to_le16(UNI_BSS_INFO_PM);
 	req.len = cpu_to_le16(4);  /* TLV header only */
 
@@ -2491,10 +2532,8 @@ static int mt7927_mcu_bss_pm_disable(struct mt7927_dev *dev, u8 bss_idx)
 					  &req, sizeof(req));
 }
 
-/* BssActivateCtrl 等效 — Windows RE (0x140143540)
- * 发送最小 BSS_INFO (BASIC+MLD only) 激活 BSS
- * Windows 在完整 BSS_INFO 之前先发此命令, conn_state=1(activate)
- * 固件用此步骤分配 BSS 内部资源, 没有它后续 TX 被固件忽略 */
+/* BssActivateCtrl — BSS_INFO(BASIC+MLD) 独立发送 (CID=0x02)
+ * S42: combo 版本 (CID=0x01, 72B) 导致 ROC 超时, 回退到独立发送 */
 static int mt7927_mcu_bss_activate(struct mt7927_dev *dev,
 				   struct ieee80211_vif *vif)
 {
@@ -2510,13 +2549,17 @@ static int mt7927_mcu_bss_activate(struct mt7927_dev *dev,
 	/* BASIC TLV — 与 full BSS_INFO 相同字段, 但 conn_state=1(activate) */
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.active = 1;  /* Windows RE: enable flag (boolean), NOT bss_idx! */
+	/* Windows RE (win_re_connect_flow_complete.md 3.2):
+	 * BSS_INFO offset +0x08 = BASIC TLV +0x04 = bss_idx, NOT boolean active.
+	 * Windows sets rbp[0] = bss_idx here. Value 1 vs 0 may affect MUAR setup. */
+	req.basic.active = mvif->bss_idx;
 	req.basic.omac_idx = mvif->omac_idx;
 	req.basic.hw_bss_idx = mvif->omac_idx;
-	/* mt7925 uses actual band_idx, NOT 0xff.
-	 * 0xff causes firmware to set WTBL BAND=0 for all STAs,
-	 * leading to band mismatch when TX on band 1 (5GHz) → TXFREE stat=1 */
-	req.basic.band_idx = mvif->band_idx;
+	/* Windows RE (win_re_connect_flow_complete.md Section 3.2):
+	 * BssActivateCtrl sets band_idx = 0xFF in BASIC TLV (BSS_INFO offset +0x0b).
+	 * This tells firmware "inherit band from DEV_INFO", not to override.
+	 * Full BSS_INFO (14 TLV) later sends actual band_idx. */
+	req.basic.band_idx = 0xFF;
 	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
 	req.basic.conn_state = 1;  /* WIN RE +0x0C: 1 = activate */
 	/* WIN RE BssActivateCtrl seg2+0x23 = BASIC TLV offset 0x1F = band_info
@@ -2594,7 +2637,10 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	/* === [0] BSS_BASIC TLV (tag=0) === */
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.active = enable;  /* Windows RE: enable flag (boolean), NOT bss_idx! */
+	/* Windows RE (re_tlv_complete_analysis.md 1.1):
+	 * Offset +0x04 = "active/bss_idx" = param3[0x5e] = BSS index.
+	 * NOT a boolean enable flag. */
+	req.basic.active = mvif->bss_idx;
 	req.basic.omac_idx = mvif->omac_idx;
 	req.basic.hw_bss_idx = mvif->omac_idx;
 	req.basic.band_idx = mvif->band_idx;
@@ -2619,7 +2665,9 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 			req.basic.phymode = 0x0f;
 	}
 	req.basic.nonht_basic_phy = 0;
-	req.basic.link_idx = mvif->band_idx;
+	/* Windows RE: only BssActivateCtrl writes link_idx (band_info).
+	 * Full BSS_INFO leaves it 0 (firmware already has band from activation). */
+	req.basic.link_idx = 0;
 
 	/* === [1] BSS_RATE TLV (tag=0x0B) === */
 	req.rate.tag = cpu_to_le16(UNI_BSS_INFO_RATE);
@@ -2783,7 +2831,8 @@ static int mt7927_mcu_set_bss_rlm(struct mt7927_dev *dev,
 static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 				 struct ieee80211_vif *vif,
 				 struct ieee80211_sta *sta,
-				 bool enable, u8 conn_state)
+				 bool enable, u8 conn_state,
+				 u8 fw_state)
 {
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 	struct mt7927_sta *msta;
@@ -2880,10 +2929,14 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	req.he6g.tag = cpu_to_le16(STA_REC_HE_6G_CAP);
 	req.he6g.len = cpu_to_le16(sizeof(req.he6g));
 
-	/* [5] STA_REC_STATE (tag=0x07) — state=0 (Windows RE: 内部 JOIN=1→wire=0) */
+	/* [5] STA_REC_STATE (tag=0x07)
+	 * Windows RE (win_re_sta_rec_all_tlvs.md):
+	 *   state=0 (DISCONNECT): auth 阶段, STA 存在但未关联
+	 *   state=2 (CONNECTED): association 完成后
+	 * fw_state 由调用者根据连接阶段设置 */
 	req.state.tag = cpu_to_le16(STA_REC_STATE);
 	req.state.len = cpu_to_le16(sizeof(req.state));
-	req.state.state = 0;
+	req.state.state = fw_state;
 	req.state.flags = 0;
 
 	/* [6] STA_REC_PHY (tag=0x15) */
@@ -3269,6 +3322,138 @@ static void mt7927_dump_wtbl(struct mt7927_dev *dev, u16 wlan_idx)
 		 "=== WTBL DUMP wlan_idx=%u END ===\n", wlan_idx);
 }
 
+/* DIAG: dump MUAR (MAC Unicast Address Register) hardware table
+ * Reads WMUDR/WMUMR registers and attempts indirect read of slots 0-3.
+ * MUAR is programmed by firmware when DEV_INFO is sent — if empty,
+ * hardware won't recognize our MAC and won't auto-ACK incoming frames.
+ *
+ * Access method: WIUCR (same addr as MT_WTBL_UPDATE = BAR0 0x034380)
+ *   Write: bits[5:0] = slot index, BIT(16) = write flag (0=read, 1=write)
+ *          BIT(31) = execute trigger
+ *   Then read WMUDR (lower 32 bits of MAC) and WMUMR (upper 16 + mask)
+ *
+ * 来源: CODA wf_wtblon_top.h, mt6639 dbg_wtbl_connac3x.c */
+static void mt7927_dump_muar(struct mt7927_dev *dev)
+{
+	u32 val;
+	int off;
+
+	dev_info(&dev->pdev->dev, "=== DIAG MUAR DUMP ===\n");
+
+	/* 广范围 RMAC 寄存器扫描 (Band 0: BAR0 0x021400 - 0x0217FC)
+	 * 目的: 找到 MUAR 真正的寄存器偏移 (CONNAC3 可能与 mt7615 不同)
+	 * 只打印非零值以减少输出 */
+	for (off = 0; off < 0x400; off += 4) {
+		val = mt7927_rr(dev, 0x021400 + off);
+		if (val != 0)
+			dev_info(&dev->pdev->dev,
+				 "RMAC[0x%03x]=0x%08x\n", off, val);
+	}
+
+	dev_info(&dev->pdev->dev, "=== DIAG MUAR DUMP END ===\n");
+}
+
+/* EXPERIMENT: 手动编程 MUAR slot 0 — 写入本机 MAC 地址
+ * 802.11 硬件用 MUAR 匹配收到帧的 RA, 匹配后自动发 ACK.
+ * 如果固件没编程 MUAR, 我们手动写.
+ *
+ * 方法: WIUCR indirect write
+ *   1. 写 MAC[31:0] 到 WMUDR
+ *   2. 写 MAC[47:32] | valid bits 到 WMUMR
+ *   3. 写 slot_idx | BIT(16)(write) | BIT(31)(execute) 到 WIUCR
+ *
+ * 同时尝试 RMAC_MAR0/MAR1 方式 (mt7615 兼容路径) */
+static void mt7927_program_muar(struct mt7927_dev *dev, const u8 *mac_addr,
+				u8 band_idx)
+{
+	u32 mar0, mar1;
+	u32 wmudr_val, wmumr_val;
+
+	dev_info(&dev->pdev->dev,
+		 "=== MUAR PROGRAM: MAC=%pM slot=0 band=%u ===\n",
+		 mac_addr, band_idx);
+
+	/* === 方法 1: RMAC_MAR0/MAR1 (mt7615-style, RMAC base + offset) ===
+	 * RMAC Band0 base = 0x021400
+	 * MAR0 = base + 0x025c = MAC[31:0]
+	 * MAR1 = base + 0x0260 = MAC[47:32] | BIT(31)=start | idx<<24 */
+#define MT_RMAC_MAR0(_band)  (MT_RMAC_BAR0(_band) + 0x025c)
+#define MT_RMAC_MAR1(_band)  (MT_RMAC_BAR0(_band) + 0x0260)
+
+	mar0 = get_unaligned_le32(mac_addr);
+	mar1 = get_unaligned_le16(mac_addr + 4) |
+	       BIT(31) |    /* START/valid bit */
+	       (0 << 24);   /* MUAR index = 0 */
+
+	dev_info(&dev->pdev->dev,
+		 "RMAC MAR0/1 BEFORE: MAR0=0x%08x MAR1=0x%08x\n",
+		 mt7927_rr(dev, MT_RMAC_MAR0(band_idx)),
+		 mt7927_rr(dev, MT_RMAC_MAR1(band_idx)));
+
+	mt7927_wr(dev, MT_RMAC_MAR0(band_idx), mar0);
+	mt7927_wr(dev, MT_RMAC_MAR1(band_idx), mar1);
+
+	dev_info(&dev->pdev->dev,
+		 "RMAC MAR0/1 AFTER:  MAR0=0x%08x MAR1=0x%08x (wrote 0x%08x 0x%08x)\n",
+		 mt7927_rr(dev, MT_RMAC_MAR0(band_idx)),
+		 mt7927_rr(dev, MT_RMAC_MAR1(band_idx)),
+		 mar0, mar1);
+
+	/* === 方法 2: WIUCR indirect write to WMUDR/WMUMR ===
+	 * WMUDR = MAC[31:0], WMUMR = MAC[47:32] | (valid << 16)? */
+	wmudr_val = get_unaligned_le32(mac_addr);
+	wmumr_val = get_unaligned_le16(mac_addr + 4) | BIT(16); /* valid? */
+
+	mt7927_wr(dev, MT_WTBLON_WMUDR, wmudr_val);
+	mt7927_wr(dev, MT_WTBLON_WMUMR, wmumr_val);
+	/* WIUCR: slot=0, BIT(16)=write, BIT(31)=execute */
+	mt7927_wr(dev, MT_WTBL_UPDATE, BIT(31) | BIT(16) | 0);
+	udelay(10);
+
+	dev_info(&dev->pdev->dev,
+		 "WIUCR write done: readback WMUDR=0x%08x WMUMR=0x%08x\n",
+		 mt7927_rr(dev, MT_WTBLON_WMUDR),
+		 mt7927_rr(dev, MT_WTBLON_WMUMR));
+
+	/* === 方法 3: 直接写 WTBL[0] DW0/DW1 — 填入本机 MAC ===
+	 * LWTBL DW0[15:0] = addr[47:32], DW0[21:16] = MUAR idx
+	 * LWTBL DW1[31:0] = addr[31:0] */
+	{
+		u32 lwtbl_dw0, lwtbl_dw1;
+		u32 wlan_idx = 0;
+		u32 group = (wlan_idx >> 7) & 0x1F;
+		u32 base;
+
+		/* addr[0]:addr[1] = highest MAC bytes → DW0[7:0]:DW0[15:8] */
+		lwtbl_dw0 = (mac_addr[5]) |
+			    ((u32)mac_addr[4] << 8) |
+			    (0 << 16) |     /* MUAR index = 0 */
+			    BIT(22) |       /* RCA1 = receive class A1 */
+			    (band_idx << 26); /* BAND */
+		lwtbl_dw1 = (mac_addr[3]) |
+			    ((u32)mac_addr[2] << 8) |
+			    ((u32)mac_addr[1] << 16) |
+			    ((u32)mac_addr[0] << 24);
+
+		mt7927_wr(dev, BAR0_LWTBL_WDUCR, group);
+		base = BAR0_LWTBL_BASE | ((wlan_idx & 0x7F) << 8);
+		mt7927_wr(dev, base | (0 << 2), lwtbl_dw0); /* DW0 */
+		mt7927_wr(dev, base | (1 << 2), lwtbl_dw1); /* DW1 */
+
+		dev_info(&dev->pdev->dev,
+			 "WTBL[0] WRITE: DW0=0x%08x DW1=0x%08x (MAC=%pM MUAR=0 BAND=%u)\n",
+			 lwtbl_dw0, lwtbl_dw1, mac_addr, band_idx);
+
+		/* Verify readback */
+		dev_info(&dev->pdev->dev,
+			 "WTBL[0] VERIFY: DW0=0x%08x DW1=0x%08x\n",
+			 mt7927_rr(dev, base | (0 << 2)),
+			 mt7927_rr(dev, base | (1 << 2)));
+	}
+
+	dev_info(&dev->pdev->dev, "=== MUAR PROGRAM END ===\n");
+}
+
 /* --- TX: mac80211 发帧回调 --- */
 static void mt7927_mac80211_tx(struct ieee80211_hw *hw,
 			       struct ieee80211_tx_control *control,
@@ -3426,7 +3611,17 @@ static void mt7927_remove_interface(struct ieee80211_hw *hw,
 
 	/* 停用接口 — mt7925 顺序: BSS_INFO(off) → DEV_INFO(off) */
 	mt7927_mcu_add_bss_info(dev, vif, false);
-	mt7927_mcu_uni_add_dev(dev, vif, false);
+	{
+		struct mt7927_vif *mvif_rm = (struct mt7927_vif *)vif->drv_priv;
+		struct dev_info_req dev_req = {};
+		dev_req.omac_idx = mvif_rm->omac_idx;  /* [0] MUAR slot */
+		dev_req.type_flag = 0xFF;              /* [1] STA mode (NOT 0xFE!) */
+		dev_req.conn_info = cpu_to_le32(0x000C0000);
+		dev_req.active = 0;                    /* [8] DEACTIVATE */
+		memcpy(dev_req.mac_addr, vif->addr, ETH_ALEN);
+		mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_DEV_INFO,
+					    &dev_req, sizeof(dev_req));
+	}
 
 	dev->vif_mask &= ~BIT_ULL(mvif->bss_idx);
 	dev->omac_mask &= ~BIT_ULL(mvif->omac_idx);
@@ -3566,6 +3761,9 @@ static int mt7927_sta_state(struct ieee80211_hw *hw,
 				 "AUTH-FAIL RX Ring %d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
 				 i, base, cnt, cidx, didx);
 		}
+		dev_info(&dev->pdev->dev,
+			 "AUTH-FAIL RX counters: ok=%u drop=%u\n",
+			 dev->rx_ok_count, dev->rx_drop_count);
 	}
 
 	/* NOTEXIST → NONE: 分配 WCID + 通知固件 */
@@ -3612,28 +3810,56 @@ static int mt7927_sta_state(struct ieee80211_hw *hw,
 		return 0;
 	}
 
-	/* AUTH → ASSOC: 发送 BSS_INFO + STA_REC */
+	/* AUTH → ASSOC: 发送 BSS_INFO + STA_REC(state=2)
+	 * Windows RE: post-association 发 STA_REC STATE=2 (CONNECTED)
+	 * 告诉固件 STA 已关联, 允许数据帧 (EAPOL Key) 通过 */
 	if (old_state == IEEE80211_STA_AUTH &&
 	    new_state == IEEE80211_STA_ASSOC) {
 		mt7927_mcu_add_bss_info(dev, vif, true);
 		mt7927_mcu_sta_update(dev, vif, sta, true,
-				      CONN_STATE_CONNECT);
+				      CONN_STATE_CONNECT, 2);
+
+		/* Clear RFCR DROP_OTHER_UC after BSS_INFO+STA_REC update
+		 * Firmware may restore RFCR during BSS reconfiguration */
+		{
+			u32 rfcr = mt7927_rr(dev, MT_WF_RFCR(mvif->band_idx));
+			if (rfcr & MT_WF_RFCR_DROP_OTHER_UC) {
+				mt7927_rmw(dev, MT_WF_RFCR(mvif->band_idx),
+					   MT_WF_RFCR_DROP_OTHER_UC, 0);
+				dev_info(&dev->pdev->dev,
+					 "sta_state AUTH→ASSOC: cleared RFCR DROP_OTHER_UC band%u\n",
+					 mvif->band_idx);
+			}
+		}
+
+		/* DIAG T4: post-AUTH→ASSOC BSS_INFO+STA_REC(state=2) */
+		dev_info(&dev->pdev->dev, "=== DIAG T4: post-AUTH→ASSOC ===\n");
+		mt7927_dump_wtbl(dev, 0);
+		mt7927_dump_wtbl(dev, 1);
+		mt7927_dump_muar(dev);
+		{
+			u32 rfcr = mt7927_rr(dev, MT_WF_RFCR(mvif->band_idx));
+
+			dev_info(&dev->pdev->dev,
+				 "DIAG T4: RFCR=0x%08x DROP_OTHER_UC=%d\n",
+				 rfcr, !!(rfcr & MT_WF_RFCR_DROP_OTHER_UC));
+		}
 		return 0;
 	}
 
-	/* ASSOC → AUTHORIZED: 端口授权 */
+	/* ASSOC → AUTHORIZED: 端口授权, state=2 */
 	if (old_state == IEEE80211_STA_ASSOC &&
 	    new_state == IEEE80211_STA_AUTHORIZED) {
 		mt7927_mcu_sta_update(dev, vif, sta, true,
-				      CONN_STATE_CONNECT);
+				      CONN_STATE_CONNECT, 2);
 		return 0;
 	}
 
-	/* ASSOC → AUTH: 断开 */
+	/* ASSOC → AUTH: 断开, state=0 */
 	if (old_state == IEEE80211_STA_ASSOC &&
 	    new_state == IEEE80211_STA_AUTH) {
 		mt7927_mcu_sta_update(dev, vif, sta, false,
-				      CONN_STATE_DISCONNECT);
+				      CONN_STATE_DISCONNECT, 0);
 		mt7927_mcu_add_bss_info(dev, vif, false);
 		return 0;
 	}
@@ -3650,27 +3876,11 @@ static int mt7927_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 	int ret;
 
-	/* 仅支持常见加密算法 */
-	switch (key->cipher) {
-	case WLAN_CIPHER_SUITE_CCMP:
-	case WLAN_CIPHER_SUITE_CCMP_256:
-	case WLAN_CIPHER_SUITE_TKIP:
-	case WLAN_CIPHER_SUITE_GCMP:
-	case WLAN_CIPHER_SUITE_GCMP_256:
-	case WLAN_CIPHER_SUITE_AES_CMAC:
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
-	ret = mt7927_mcu_add_key(dev, vif, sta, key, cmd);
-	if (ret)
-		return ret;
-
-	if (cmd == SET_KEY)
-		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
-
-	return 0;
+	/* S44 诊断: 强制软件加密，测试 TX 路径是否可达 AP */
+	dev_info(&dev->pdev->dev,
+		 "set_key: cipher=0x%08x keyidx=%d → SW crypto (diag)\n",
+		 key->cipher, key->keyidx);
+	return -EOPNOTSUPP;
 }
 
 static int mt7927_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
@@ -3763,7 +3973,8 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 	struct ieee80211_channel *chan;
 	u16 duration = info->duration ? info->duration : 1000; /* 默认 1 秒 */
-	/* CH_PRIVILEGE TLV — 旧格式 (ROC_GRANT 正常返回) */
+	/* CH_PRIVILEGE — Windows RE: direct TLV, no inner header
+	 * rsv[4] is standard UniCmd padding (not bss_idx header) */
 	struct {
 		u8 rsv[4];
 		__le16 tag;
@@ -3803,17 +4014,41 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 
 		/* [0] ChipConfig — Windows 每次 connect 都重发 */
 		mt7927_mcu_chip_config(dev);
-		/* [1] DEV_INFO + [2] BssActivateCtrl (BASIC+MLD) */
-		mt7927_mcu_uni_add_dev(dev, vif, true);
+		/* [1] DEV_INFO — Windows flat format (16B, CID=0x01)
+		 * S43 关键修复: Ghidra 反编译 nicUniCmdBssActivateCtrl 确认:
+		 *   byte[0]=omac_idx(MUAR slot), byte[1]=0xFF(STA type, NOT activate!)
+		 *   byte[4-7]=conn_info=0x000C0000
+		 *   byte[8]=active=1(ACTIVATE — 触发固件编程 MUAR!)
+		 *   byte[10-15]=MAC */
+		{
+			struct dev_info_req dev_req = {};
+			dev_req.omac_idx = mvif->omac_idx;   /* [0] MUAR slot */
+			dev_req.type_flag = 0xFF;             /* [1] STA mode */
+			dev_req.conn_info = cpu_to_le32(0x000C0000);
+			dev_req.active = 1;                   /* [8] ACTIVATE! 触发 MUAR 编程 */
+			dev_req.phy_idx = 0;
+			memcpy(dev_req.mac_addr, vif->addr, ETH_ALEN);
+			dev_info(&dev->pdev->dev,
+				 "mcu: DEV_INFO FLAT omac=%u type=0x%02x active=%u mac=%pM (size=%zu)\n",
+				 dev_req.omac_idx, dev_req.type_flag,
+				 dev_req.active, vif->addr,
+				 sizeof(dev_req));
+			mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_DEV_INFO,
+						    &dev_req, sizeof(dev_req));
+		}
+
+		/* DIAG T1: post-DEV_INFO flat */
+		dev_info(&dev->pdev->dev, "=== DIAG T1: post-DEV_INFO FLAT ===\n");
+		mt7927_dump_wtbl(dev, 0);
+		mt7927_dump_muar(dev);
+
+		/* [2] BssActivateCtrl (BASIC+MLD) — 独立 CID=0x02 */
 		mt7927_mcu_bss_activate(dev, vif);
 		/* [3] PM_DISABLE */
 		mt7927_mcu_bss_pm_disable(dev, mvif->bss_idx);
 		/* [4] BSS_INFO full 13 TLV (Windows dispatch table order) */
 		mt7927_mcu_add_bss_info(dev, vif, true);
-		/* [4.5] BSS_RLM — RLM+PROTECT+IFS_TIME (Windows: nicUniCmdSetBssRlm)
-		 * win_re_full_connect_cmd_sequence.md: dispatch entry 17 (outer=0x19)
-		 * win_tx_connection_flow.md: "STA 模式通过 ROC + BSS_INFO_RLM 配置信道"
-		 * RLM TLV 告诉固件 BSS 操作信道/带宽/频段 — 没有它固件不配置 RX 路由 */
+		/* [4.5] BSS_RLM — RLM+PROTECT+IFS_TIME */
 		mt7927_mcu_set_bss_rlm(dev, vif);
 	}
 
@@ -3855,7 +4090,7 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	req.center_chan = chan->hw_value;
 	req.center_chan_from_ap = chan->hw_value;
 	req.reqtype = 0;  /* JOIN */
-	req.dbdcband = 0xff;  /* ENUM_BAND_AUTO */
+	req.dbdcband = 0xff;  /* AUTO — firmware assigns band */
 	req.maxinterval = cpu_to_le32(duration);
 
 	switch (chan->band) {
@@ -3956,12 +4191,33 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 				 "mgd_prepare_tx: first STA_REC after ROC_GRANT (band_idx=%u)\n",
 				 mvif->band_idx);
 			mt7927_mcu_sta_update(dev, vif, sta, true,
-					      CONN_STATE_CONNECT);
+					      CONN_STATE_CONNECT, 0);
 		}
 
 		/* RX_FILTER — Windows RE: caller3 (0x1400b5ca4) 在 STA_REC 后发送
 		 * 不依赖 mac80211 configure_filter 回调时机 */
 		mt7927_mcu_set_rx_filter(dev, 0x0B);
+
+		/* DIAG: Read RFCR before and after clearing DROP_OTHER_UC */
+		{
+			u32 rfcr0 = mt7927_rr(dev, MT_WF_RFCR(0));
+			u32 rfcr1_reg = mt7927_rr(dev, MT_WF_RFCR1(0));
+			dev_info(&dev->pdev->dev,
+				 "RFCR BEFORE: Band0 RFCR=0x%08x RFCR1=0x%08x DROP_OTHER_UC=%d\n",
+				 rfcr0, rfcr1_reg, !!(rfcr0 & MT_WF_RFCR_DROP_OTHER_UC));
+
+			/* Clear DROP_OTHER_UC — allow ALL unicast to pass through
+			 * regardless of MUAR state. This is a diagnostic workaround
+			 * to test if MUAR is the root cause of missing Auth-2. */
+			if (rfcr0 & MT_WF_RFCR_DROP_OTHER_UC) {
+				mt7927_rmw(dev, MT_WF_RFCR(0),
+					   MT_WF_RFCR_DROP_OTHER_UC, 0);
+				rfcr0 = mt7927_rr(dev, MT_WF_RFCR(0));
+				dev_info(&dev->pdev->dev,
+					 "RFCR AFTER clear DROP_OTHER_UC: Band0=0x%08x\n",
+					 rfcr0);
+			}
+		}
 
 		/* DIAG: full WFDMA register dump — Ring 0-7 snapshot */
 		{
@@ -4017,6 +4273,29 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 		/* 诊断: dump WTBL WLAN_IDX=0 和 1 (L1 remap 直接读) */
 		mt7927_dump_wtbl(dev, 0);
 		mt7927_dump_wtbl(dev, 1);
+
+		/* DIAG T2: post-STA_REC(state=0) — MUAR + MIB snapshot */
+		dev_info(&dev->pdev->dev, "=== DIAG T2: post-STA_REC(state=0) ===\n");
+		mt7927_dump_muar(dev);
+		/* MIB RX_FCS_OK vs SU_TX_OK — read-to-clear baseline then 50ms sample */
+		{
+			u32 rx_fcs_ok, su_tx_ok;
+
+			(void)mt7927_rr(dev, MT_MIB_RSCR0(0)); /* clear */
+			(void)mt7927_rr(dev, MT_MIB_TSCR7(0)); /* clear */
+			msleep(50);
+			rx_fcs_ok = mt7927_rr(dev, MT_MIB_RSCR0(0));
+			su_tx_ok  = mt7927_rr(dev, MT_MIB_TSCR7(0));
+			dev_info(&dev->pdev->dev,
+				 "DIAG T2 MIB(50ms): RX_FCS_OK=%u SU_TX_OK=%u\n",
+				 rx_fcs_ok, su_tx_ok);
+		}
+
+		/* S42: 移除手动 MUAR 编程 — 证实无效
+		 * S41 发现: WIUCR/WMUDR/WMUMR 是 WTBL ON-chip SRAM 寄存器,
+		 * 不是真正的 RMAC MUAR 表. 只有固件能通过 DEV_INFO 编程真正的 MUAR.
+		 * 现在通过 BssActivateCtrl COMBO 让固件正确处理. */
+		mt7927_dump_muar(dev);  /* 验证固件是否编程了 MUAR */
 	}
 }
 

@@ -216,7 +216,12 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 		q_idx = MT_TX_MCU_PORT_RX_Q0;
 		p_fmt = MT_TX_TYPE_FW;
 	} else if (!is_8023) {
-		q_idx = 0x10; /* MT_LMAC_ALTX0 — non-mgmt 802.11 frames */
+		/* S44: 管理帧 → ALTX0, 数据帧 → AC 队列
+		 * 之前所有 802.11 帧都用 ALTX0, 导致数据帧不走 WTBL 加密 */
+		if (is_mgmt)
+			q_idx = 0x10; /* MT_LMAC_ALTX0 */
+		else
+			q_idx = mt7927_lmac_mapping(skb_get_queue_mapping(skb));
 	} else {
 		q_idx = mt7927_lmac_mapping(skb_get_queue_mapping(skb));
 	}
@@ -297,8 +302,8 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 	 * misparses TXP offset and cannot find payload DMA address.
 	 * (memset already zeroed txwi[7]) */
 
-	/* Debug: dump unified CT path TXD for management frames */
-	if (is_mgmt) {
+	/* Debug: dump TXD for all frames (S44 diag) */
+	if (is_mgmt || key) {
 		print_hex_dump(KERN_INFO, "CT-TXD: ", DUMP_PREFIX_OFFSET,
 			       16, 4, txwi, MT_TXD_SIZE, false);
 	}
@@ -536,8 +541,22 @@ int mt7927_tx_prepare_skb(struct mt7927_dev *dev, struct sk_buff *skb,
 	/* 3. Compute txwi location in coherent pool */
 	txwi = (__le32 *)(dev->txwi_buf + token * MT7927_TXWI_SIZE);
 
-	/* 4. Build TXD (first 32 bytes) */
-	mt7927_mac_write_txwi(dev, txwi, skb, wcid, key, 0, false);
+	/* 4. Build TXD (first 32 bytes)
+	 * For mgmt frames, assign rotating PID (1-99) so TXS can be correlated
+	 * to specific frames. CT path previously used pid=0 which was a blind spot.
+	 * SF path (Ring 2) already uses dev->tx_mgmt_pid — share the same counter. */
+	{
+		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+		int pid = 0;
+
+		if (skb->len >= 2 && ieee80211_is_mgmt(hdr->frame_control)) {
+			pid = dev->tx_mgmt_pid;
+			dev->tx_mgmt_pid++;
+			if (dev->tx_mgmt_pid == 0 || dev->tx_mgmt_pid > 99)
+				dev->tx_mgmt_pid = 1;
+		}
+		mt7927_mac_write_txwi(dev, txwi, skb, wcid, key, pid, false);
+	}
 
 	/* 5. Fill TXP (second 32 bytes) — scatter-gather page table */
 	txp = (struct mt7927_hw_txp *)(txwi + MT_TXD_SIZE / 4);
@@ -1005,11 +1024,19 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 
 	/* --- Error checks --- */
 
-	if (rxd2 & MT_RXD2_NORMAL_AMSDU_ERR)
+	if (rxd2 & MT_RXD2_NORMAL_AMSDU_ERR) {
+		dev_info_ratelimited(&dev->pdev->dev,
+			"fill_rx DROP: AMSDU_ERR rxd0=0x%08x rxd1=0x%08x rxd2=0x%08x\n",
+			rxd0, rxd1, rxd2);
 		return -EINVAL;
+	}
 
-	if (rxd2 & MT_RXD2_NORMAL_MAX_LEN_ERROR)
+	if (rxd2 & MT_RXD2_NORMAL_MAX_LEN_ERROR) {
+		dev_info_ratelimited(&dev->pdev->dev,
+			"fill_rx DROP: MAX_LEN_ERROR rxd0=0x%08x rxd2=0x%08x\n",
+			rxd0, rxd2);
 		return -EINVAL;
+	}
 
 	hdr_trans = !!(rxd2 & MT_RXD2_NORMAL_HDR_TRANS);
 
@@ -1019,8 +1046,12 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	remove_pad = FIELD_GET(MT_RXD2_NORMAL_HDR_OFFSET, rxd2);
 
 	/* Header translation + cipher mismatch → drop */
-	if (hdr_trans && (rxd1 & MT_RXD1_NORMAL_CM))
+	if (hdr_trans && (rxd1 & MT_RXD1_NORMAL_CM)) {
+		dev_info_ratelimited(&dev->pdev->dev,
+			"fill_rx DROP: HDR_TRANS+CM rxd1=0x%08x rxd2=0x%08x\n",
+			rxd1, rxd2);
 		return -EINVAL;
+	}
 
 	/* --- Extract basic fields --- */
 
@@ -1124,15 +1155,76 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	{
 		u16 hdr_gap = (u8 *)rxd - skb->data + 2 * remove_pad;
 
-		if (hdr_gap > skb->len)
+		if (hdr_gap > skb->len) {
+			dev_info_ratelimited(&dev->pdev->dev,
+				"fill_rx DROP: hdr_gap=%u > len=%u rxd0=0x%08x rxd1=0x%08x\n",
+				hdr_gap, skb->len, rxd0, rxd1);
 			return -EINVAL;
+		}
 		skb_pull(skb, hdr_gap);
 	}
 
-	/* --- Handle header translation --- */
+	/* --- Handle header translation: 反转 802.3→802.11 ---
+	 *
+	 * S43 关键修复: 硬件头翻译 (HW_HDR_TRANS) 输出 802.3 帧。
+	 * mac80211 的 8023 快速路径需要 sta->fast_rx（仅 AUTHORIZED 后设置），
+	 * 导致所有 pre-authorization 数据帧（含 EAPOL）被丢弃。
+	 *
+	 * 解决: 反转头翻译，构造 802.11 + LLC/SNAP 头，走 mac80211 慢路径。
+	 * 慢路径不需要 fast_rx，能正确处理 EAPOL。
+	 *
+	 * 802.3: [DA(6)][SA(6)][ET(2)][payload]  = 14 + N
+	 * 802.11: [FC(2)][Dur(2)][A1(6)][A2(6)][A3(6)][SC(2)][SNAP(6)][ET(2)][payload] = 32 + N
+	 * 需扩展 18 字节 (headroom 来自已剥离的 RXD)
+	 */
+	if (hdr_trans) {
+		if (skb->len >= ETH_HLEN && skb_headroom(skb) >= 18) {
+			u8 da[ETH_ALEN], sa[ETH_ALEN];
+			__be16 etype;
+			struct ieee80211_hdr_3addr dot11 = {};
+			static const u8 rfc1042[6] = {
+				0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00
+			};
 
-	if (hdr_trans)
-		status->flag |= RX_FLAG_8023;
+			/* Save 802.3 fields */
+			memcpy(da, skb->data, ETH_ALEN);
+			memcpy(sa, skb->data + ETH_ALEN, ETH_ALEN);
+			etype = *(__be16 *)(skb->data + 2 * ETH_ALEN);
+
+			/* DA=0 修复 (MUAR 未编程时) */
+			if (is_zero_ether_addr(da) && dev->hw && dev->hw->wiphy)
+				ether_addr_copy(da, dev->hw->wiphy->perm_addr);
+
+			/* Strip 802.3 header */
+			skb_pull(skb, ETH_HLEN);
+
+			/* Build 802.11 header: FromDS data frame
+			 * Addr1=DA(RA), Addr2=BSSID=SA(TA), Addr3=SA */
+			dot11.frame_control = cpu_to_le16(
+				IEEE80211_FTYPE_DATA |
+				IEEE80211_STYPE_DATA |
+				IEEE80211_FCTL_FROMDS);
+			memcpy(dot11.addr1, da, ETH_ALEN);
+			memcpy(dot11.addr2, sa, ETH_ALEN);
+			memcpy(dot11.addr3, sa, ETH_ALEN);
+			dot11.seq_ctrl = cpu_to_le16(seq_ctrl);
+
+			/* Prepend LLC/SNAP (8 bytes: 6 SNAP + 2 EtherType) */
+			skb_push(skb, 2);
+			memcpy(skb->data, &etype, 2);
+			skb_push(skb, 6);
+			memcpy(skb->data, rfc1042, 6);
+
+			/* Prepend 802.11 header (24 bytes) */
+			skb_push(skb, sizeof(dot11));
+			memcpy(skb->data, &dot11, sizeof(dot11));
+
+			/* DON'T set RX_FLAG_8023 — this is now a native 802.11 frame */
+		} else {
+			/* Insufficient headroom — just set 8023 flag and hope for the best */
+			status->flag |= RX_FLAG_8023;
+		}
+	}
 
 	/* --- AMSDU info --- */
 
@@ -1290,6 +1382,25 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 			 "mcu-evt: ROC_GRANT status=%u ch=%u dbdcband=%u\n",
 			 status, primary_ch, dbdcband);
 		dev->roc_active = true;
+
+		/* Clear DROP_OTHER_UC in RFCR immediately after ROC_GRANT.
+		 * Firmware restores RFCR (including DROP_OTHER_UC=1) when
+		 * granting the channel. Clear it here so unicast frames
+		 * can pass through even if MUAR is not programmed.
+		 * Use band from ROC_GRANT (dbdcband, 0=2.4GHz, 1=5GHz). */
+		{
+			u8 band = (dbdcband < 2) ? dbdcband : 0;
+			u32 rfcr = mt7927_rr(dev, MT_WF_RFCR(band));
+			if (rfcr & MT_WF_RFCR_DROP_OTHER_UC) {
+				mt7927_wr(dev, MT_WF_RFCR(band),
+					  rfcr & ~MT_WF_RFCR_DROP_OTHER_UC);
+				dev_info(&dev->pdev->dev,
+					 "ROC_GRANT: cleared RFCR DROP_OTHER_UC band%u "
+					 "(0x%08x -> 0x%08x)\n",
+					 band, rfcr, rfcr & ~MT_WF_RFCR_DROP_OTHER_UC);
+			}
+		}
+
 		complete(&dev->roc_complete);
 	}
 
@@ -1341,22 +1452,69 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 
 	switch (type) {
 	case PKT_TYPE_NORMAL_MCU:
-	case PKT_TYPE_NORMAL:
+	case PKT_TYPE_NORMAL: {
 		/*
 		 * 数据帧 (beacon, probe response, data 等):
 		 * 解析 RXD 并交给 mac80211. 扫描期间 beacon/probe response
 		 * 可能通过 MCU ring (ring 6) 到达, 类型为 PKT_TYPE_NORMAL_MCU(8).
 		 * 来源: mt7925/mac.c lines 1240-1246
 		 */
-		if (mt7927_mac_fill_rx(dev, skb)) {
+		int ret = mt7927_mac_fill_rx(dev, skb);
+
+		if (ret) {
+			dev->rx_drop_count++;
+			if (dev->rx_drop_count <= 20)
+				dev_info(&dev->pdev->dev,
+					"RX DROP #%u: fill_rx=%d rxd0=0x%08x rxd1=0x%08x rxd2=0x%08x len=%u\n",
+					dev->rx_drop_count, ret, rxd0,
+					le32_to_cpu(rxd[1]),
+					le32_to_cpu(rxd[2]), skb->len);
 			dev_kfree_skb(skb);
 			return;
+		}
+		dev->rx_ok_count++;
+		/* 诊断: RX 帧类型记录 */
+		{
+			u8 *d = skb->data;
+
+			if (skb->len >= 24) {
+				u8 fc0 = d[0];
+				u8 ftype = (fc0 >> 2) & 0x3;
+				u8 subtype = (fc0 >> 4) & 0xf;
+
+				if (ftype == 0 && subtype != 8 && subtype != 4) {
+					dev_info(&dev->pdev->dev,
+						"RX-MGMT #%u: FC=%02x%02x subtype=%u len=%u freq=%u\n",
+						dev->rx_ok_count, fc0, d[1], subtype,
+						skb->len,
+						IEEE80211_SKB_RXCB(skb)->freq);
+				}
+				/* EAPOL 检测: data frame + LLC/SNAP + ethertype 0x888e */
+				if (ftype == 2 && skb->len >= 32 + 2) {
+					/* 802.11 hdr(24) + SNAP(6) + ET(2) */
+					u16 et = (d[30] << 8) | d[31];
+
+					if (et == 0x888E) {
+						dev_info(&dev->pdev->dev,
+							"RX-EAPOL #%u: 802.11 len=%u FC=%02x%02x "
+							"A1=%02x:%02x:%02x:%02x:%02x:%02x\n",
+							dev->rx_ok_count, skb->len,
+							fc0, d[1],
+							d[4], d[5], d[6], d[7], d[8], d[9]);
+					} else if (dev->rx_ok_count <= 300) {
+						dev_info_ratelimited(&dev->pdev->dev,
+							"RX-DATA #%u: FC=%02x%02x len=%u\n",
+							dev->rx_ok_count, fc0, d[1], skb->len);
+					}
+				}
+			}
 		}
 		if (dev->hw)
 			ieee80211_rx_irqsafe(dev->hw, skb);
 		else
 			dev_kfree_skb(skb);
 		return;
+	}
 
 	case PKT_TYPE_RX_EVENT:
 		/* 真正的 MCU 事件 (flag != 0x1), 路由到 MCU 事件处理器 */

@@ -299,6 +299,20 @@ int mt7927_poll_rx_data(struct napi_struct *napi, int budget)
 	struct mt7927_ring *ring = &dev->ring_rx4;
 	int done = 0;
 
+	/* S40 DIAG: log NAPI entry with ring state for first calls */
+	if (dev->rx4_diag_cnt < 30) {
+		u32 didx = dma_rr(dev, MT_WPDMA_RX_RING_DIDX(ring->qid));
+		u32 cidx = dma_rr(dev, MT_WPDMA_RX_RING_CIDX(ring->qid));
+		struct mt76_desc *peek = &ring->desc[ring->tail];
+		u32 peek_ctrl = le32_to_cpu(READ_ONCE(peek->ctrl));
+
+		dev_info(&dev->pdev->dev,
+			 "RX4-NAPI: entry tail=%u DIDX=%u CIDX=%u peek_ctrl=0x%08x (DMA_DONE=%d SD_LEN=%u)\n",
+			 ring->tail, didx, cidx, peek_ctrl,
+			 !!(peek_ctrl & MT_DMA_CTL_DMA_DONE),
+			 (unsigned)FIELD_GET(MT_DMA_CTL_SD_LEN0, peek_ctrl));
+	}
+
 	while (done < budget) {
 		struct sk_buff *skb;
 
@@ -306,17 +320,40 @@ int mt7927_poll_rx_data(struct napi_struct *napi, int budget)
 		if (!skb)
 			break;
 
-		/* DIAG: log frames received on RX ring 4 */
-		{
+		/* S40 DIAG: unconditional logging for first 30 Ring 4 frames */
+		if (dev->rx4_diag_cnt < 30) {
 			__le32 *rxd = (__le32 *)skb->data;
 			u32 r0 = le32_to_cpu(rxd[0]);
-			u8 pkt_type = FIELD_GET(MT_RXD0_PKT_TYPE, r0);
-			/* If it looks like a normal frame, peek at 802.11 header */
-			if (skb->len > 64) {
-				dev_info_ratelimited(&dev->pdev->dev,
-					"RX4: pkt_type=%u len=%u rxd0=0x%08x\n",
-					pkt_type, skb->len, r0);
-			}
+			u32 r1 = skb->len >= 8  ? le32_to_cpu(rxd[1]) : 0;
+			u32 r2 = skb->len >= 12 ? le32_to_cpu(rxd[2]) : 0;
+			u32 r3 = skb->len >= 16 ? le32_to_cpu(rxd[3]) : 0;
+
+			dev_info(&dev->pdev->dev,
+				 "RX4[%u]: len=%u pkt_type=%u flag=0x%x byte_cnt=%u\n",
+				 dev->rx4_diag_cnt, skb->len,
+				 (unsigned)FIELD_GET(MT_RXD0_PKT_TYPE, r0),
+				 (unsigned)FIELD_GET(MT_RXD0_PKT_FLAG, r0),
+				 (unsigned)FIELD_GET(MT_RXD0_LENGTH, r0));
+			dev_info(&dev->pdev->dev,
+				 "RX4[%u]: DW0=0x%08x DW1=0x%08x DW2=0x%08x DW3=0x%08x\n",
+				 dev->rx4_diag_cnt, r0, r1, r2, r3);
+			dev_info(&dev->pdev->dev,
+				 "RX4[%u]: GRP_VLD=%u%u%u%u%u HDR_TRANS=%u CH=%u ADDR_TYPE=%u\n",
+				 dev->rx4_diag_cnt,
+				 !!(r1 & MT_RXD1_NORMAL_GROUP_1),
+				 !!(r1 & MT_RXD1_NORMAL_GROUP_2),
+				 !!(r1 & MT_RXD1_NORMAL_GROUP_3),
+				 !!(r1 & MT_RXD1_NORMAL_GROUP_4),
+				 !!(r1 & MT_RXD1_NORMAL_GROUP_5),
+				 !!(r2 & MT_RXD2_NORMAL_HDR_TRANS),
+				 (unsigned)FIELD_GET(MT_RXD3_NORMAL_CH_FREQ, r3),
+				 (unsigned)FIELD_GET(MT_RXD3_NORMAL_ADDR_TYPE, r3));
+			/* Hex dump first 64 bytes */
+			print_hex_dump(KERN_INFO, "RX4-raw: ",
+				       DUMP_PREFIX_OFFSET, 16, 1,
+				       skb->data,
+				       min_t(int, skb->len, 96), false);
+			dev->rx4_diag_cnt++;
 		}
 
 		/* Dispatch to mac80211 RX processing (implemented in mac.c) */

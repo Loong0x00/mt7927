@@ -414,7 +414,16 @@
 #define MT_WTBL_SPE_IDX_SEL          BIT(6)
 #define MT_BASIC_RATES_TBL           11
 
-/* WTBL UPDATE register (ADM counter clear) */
+/* MUAR (MAC Unicast Address Register) — indirect access via WMUDR/WMUMR
+ * WMUDR: MUAR data register, WMUMR: MUAR mask/mode register
+ * Note: WIUCR (CODA offset 0x380) shares address with MT_WTBL_UPDATE below
+ * BAR0 offsets: bus 0x820d4384 → BAR0 0x034384, bus 0x820d4388 → BAR0 0x034388
+ * 来源: wf_wtblon_top.h (CODA auto-generated) */
+#define MT_WTBLON_WMUDR              (MT_WTBLON_TOP_BAR0 + 0x4384)  /* MUAR data register */
+#define MT_WTBLON_WMUMR              (MT_WTBLON_TOP_BAR0 + 0x4388)  /* MUAR mask register */
+
+/* WTBL UPDATE register (ADM counter clear)
+ * Note: same address as CODA WIUCR (MUAR indirect update control) */
 #define MT_WTBL_UPDATE               (MT_WTBLON_TOP_BAR0 + 0x4380)
 #define MT_WTBL_UPDATE_WLAN_IDX      GENMASK(11, 0)
 #define MT_WTBL_UPDATE_ADM_COUNT_CLEAR BIT(14)
@@ -508,6 +517,22 @@
 #define MT_TMAC_CTCR0_INS_DDLMT_REFTIME  GENMASK(5, 0)
 #define MT_TMAC_CTCR0_INS_DDLMT_EN       BIT(17)
 #define MT_TMAC_CTCR0_INS_DDLMT_VHT_SMPDU_EN BIT(18)
+
+/* RMAC — RX Frame Control Register (per band)
+ * Controls which frame types are dropped by hardware BEFORE reaching DMA.
+ * Firmware programs this via RX_FILTER MCU command, but host can also write directly. */
+#define MT_WF_RFCR(_band)           (MT_RMAC_BAR0(_band) + 0x000)
+#define MT_WF_RFCR_DROP_STBC_MULTI  BIT(0)
+#define MT_WF_RFCR_DROP_FCSFAIL     BIT(1)
+#define MT_WF_RFCR_DROP_PROBEREQ    BIT(4)
+#define MT_WF_RFCR_DROP_MCAST       BIT(5)
+#define MT_WF_RFCR_DROP_BCAST       BIT(6)
+#define MT_WF_RFCR_DROP_OTHER_BEACON BIT(11)
+#define MT_WF_RFCR_DROP_DUPLICATE   BIT(16)
+#define MT_WF_RFCR_DROP_OTHER_BSS   BIT(17)
+#define MT_WF_RFCR_DROP_OTHER_UC    BIT(18)  /* DROP unicast not matching MUAR */
+#define MT_WF_RFCR_DROP_OTHER_TIM   BIT(19)
+#define MT_WF_RFCR1(_band)          (MT_RMAC_BAR0(_band) + 0x004)
 
 /* RMAC MIB 时间 */
 #define MT_WF_RMAC_MIB_TIME0(_band)  (MT_RMAC_BAR0(_band) + 0x03c4)
@@ -933,6 +958,9 @@ struct mt7927_dev {
 	struct ieee80211_hw *hw;		/* mac80211 硬件抽象 */
 	struct mt7927_phy phy;			/* PHY 层信息 */
 
+	/* RX Ring 4 diagnostics */
+	u32 rx4_diag_cnt;			/* 帧计数: 用于前 N 帧的详细 dump */
+
 	/* VIF/STA 管理 */
 	u64 vif_mask;				/* VIF 分配位图 */
 	u64 omac_mask;				/* OMAC 地址分配位图 */
@@ -957,6 +985,10 @@ struct mt7927_dev {
 	/* 扫描状态 */
 	u8 scan_seq_num;			/* 扫描序列号 */
 	unsigned long scan_state;		/* BIT(0)=SCANNING */
+
+	/* RX 诊断计数器 */
+	u32 rx_ok_count;
+	u32 rx_drop_count;
 
 	/* 中断/NAPI */
 	struct tasklet_struct irq_tasklet;	/* 中断下半部 */
@@ -1559,7 +1591,7 @@ enum connac3_mcu_cipher_type {
 	CONNAC3_CIPHER_GCMP_256 = 12,
 };
 
-/* BSS 请求头 */
+/* BSS 请求头 — 4 bytes (原始格式, ROC 正常工作) */
 struct bss_req_hdr {
 	u8 bss_idx;
 	u8 __rsv[3];
@@ -1576,22 +1608,38 @@ struct sta_req_hdr {
 	u8 __rsv;
 } __packed;
 
-/* DEV_INFO command header — MT6639: UNI_CMD_DEVINFO
- * OwnMacIdx + DbdcIdx 在 header 中, 不在 TLV 里 */
+/* DEV_INFO command header — original 4-byte format (ROC works) */
 struct dev_info_hdr {
 	u8 omac_idx;
-	u8 band_idx;     /* 0xFF = BAND_AUTO */
-	u8 __rsv[2];
+	u8 band_idx;
+	u8 rsv[2];
 } __packed;
 
-/* DEV_INFO_ACTIVE TLV (tag=0) — MT6639: UNI_CMD_DEVINFO_ACTIVE
- * 注意: band_idx 和 omac_idx 在 header 中, TLV 只有 active + mac */
+/* DEV_INFO_ACTIVE TLV (tag=UNI_DEV_INFO_ACTIVE=1) */
 struct dev_info_active_tlv {
 	__le16 tag;
 	__le16 len;
 	u8 active;
-	u8 __pad;
+	u8 dbdc_idx;
 	u8 omac_addr[ETH_ALEN];
+} __packed;
+
+/* DEV_INFO — Windows RE flat format (16 bytes, NO TLV)
+ * 来源: Ghidra 反编译 nicUniCmdBssActivateCtrl (0x140143540)
+ *   pcVar2[0x00] = pcVar1[3]   → omac_idx (MUAR slot)
+ *   pcVar2[0x01] = 0xFF/0xFE   → type_flag (0xFF=STA, 0xFE=AP, NOT activate/deactivate!)
+ *   pcVar2[0x04-0x07] = conn_info (0x000C0000 LE)
+ *   pcVar2[0x08] = pcVar1[1]   → active (1=activate, 0=deactivate — THE KEY FIELD!)
+ *   pcVar2[0x09] = pcVar1[0xb] → phy_idx
+ *   pcVar2[0x0a-0x0f] = MAC[6] */
+struct dev_info_req {
+	u8 omac_idx;          /* [0x00] ownmac_idx (MUAR slot, typically 0 for STA) */
+	u8 type_flag;         /* [0x01] 0xFF=STA/non-AP, 0xFE=AP mode */
+	u8 rsv1[2];
+	__le32 conn_info;     /* [0x04-0x07] hardcoded 0x000C0000 */
+	u8 active;            /* [0x08] 1=activate, 0=deactivate (triggers MUAR programming!) */
+	u8 phy_idx;           /* [0x09] */
+	u8 mac_addr[ETH_ALEN]; /* [0x0a-0x0f] */
 } __packed;
 
 /* BSS_INFO_BASIC TLV (tag=0)
