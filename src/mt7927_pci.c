@@ -3043,15 +3043,19 @@ static int mt7927_mcu_add_key(struct mt7927_dev *dev,
 	/* Linux cipher → CONNAC3 cipher */
 	switch (key->cipher) {
 	case WLAN_CIPHER_SUITE_CCMP:
-	case WLAN_CIPHER_SUITE_CCMP_256:
 		cipher = CONNAC3_CIPHER_AES_CCMP;
+		break;
+	case WLAN_CIPHER_SUITE_CCMP_256:
+		cipher = CONNAC3_CIPHER_CCMP_256;
 		break;
 	case WLAN_CIPHER_SUITE_TKIP:
 		cipher = CONNAC3_CIPHER_TKIP;
 		break;
 	case WLAN_CIPHER_SUITE_GCMP:
-	case WLAN_CIPHER_SUITE_GCMP_256:
 		cipher = CONNAC3_CIPHER_GCMP;
+		break;
+	case WLAN_CIPHER_SUITE_GCMP_256:
+		cipher = CONNAC3_CIPHER_GCMP_256;
 		break;
 	case WLAN_CIPHER_SUITE_AES_CMAC:
 		cipher = CONNAC3_CIPHER_BIP_CMAC_128;
@@ -3069,24 +3073,36 @@ static int mt7927_mcu_add_key(struct mt7927_dev *dev,
 	req.sec.tag = cpu_to_le16(STA_REC_KEY_V3);
 	req.sec.len = cpu_to_le16(sizeof(req.sec));
 	req.sec.add = (cmd == SET_KEY);
-	req.sec.tx_key = 1;
-	req.sec.key_type = 1; /* pairwise */
 	req.sec.bss_idx = mvif->bss_idx;
 	req.sec.cipher_id = cipher;
 	req.sec.key_id = key->keyidx;
 	req.sec.key_len = key->keylen;
 	req.sec.wlan_idx = msta->wcid.idx;
-	if (sta)
+
+	/* S44: PTK vs GTK 区分 (mt7925 参考)
+	 * PTK (sta!=NULL): tx_key=1, key_type=1(pairwise), peer=STA_MAC
+	 * GTK (sta==NULL): tx_key=0, key_type=0(group), peer=BSSID */
+	if (sta) {
+		req.sec.tx_key = 1;
+		req.sec.key_type = 1; /* pairwise */
 		memcpy(req.sec.peer_addr, sta->addr, ETH_ALEN);
+	} else {
+		req.sec.tx_key = 0;
+		req.sec.key_type = 0; /* group */
+		if (vif->bss_conf.bssid)
+			memcpy(req.sec.peer_addr, vif->bss_conf.bssid,
+			       ETH_ALEN);
+	}
 	memcpy(req.sec.key, key->key, min_t(u8, key->keylen, 32));
 
 	dev_info(&dev->pdev->dev,
-		 "mcu: KEY %s cipher=%d keyidx=%d keylen=%d\n",
+		 "mcu: KEY %s cipher=%d keyidx=%d keylen=%d type=%d tx=%d wcid=%d\n",
 		 cmd == SET_KEY ? "SET" : "DEL", cipher,
-		 key->keyidx, key->keylen);
+		 key->keyidx, key->keylen,
+		 req.sec.key_type, req.sec.tx_key, msta->wcid.idx);
 
-	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_STA_REC, &req,
-					   sizeof(req));
+	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_STA_REC,
+					   &req, sizeof(req));
 }
 
 /* =====================================================================
@@ -3876,11 +3892,26 @@ static int mt7927_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 	int ret;
 
-	/* S44 诊断: 强制软件加密，测试 TX 路径是否可达 AP */
-	dev_info(&dev->pdev->dev,
-		 "set_key: cipher=0x%08x keyidx=%d → SW crypto (diag)\n",
-		 key->cipher, key->keyidx);
-	return -EOPNOTSUPP;
+	/* 仅支持常见加密算法 */
+	switch (key->cipher) {
+	case WLAN_CIPHER_SUITE_CCMP:
+	case WLAN_CIPHER_SUITE_CCMP_256:
+	case WLAN_CIPHER_SUITE_TKIP:
+	case WLAN_CIPHER_SUITE_GCMP:
+	case WLAN_CIPHER_SUITE_GCMP_256:
+	case WLAN_CIPHER_SUITE_AES_CMAC:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	ret = mt7927_mcu_add_key(dev, vif, sta, key, cmd);
+	if (ret)
+		return ret;
+
+	/* S44: 硬件加密 — 固件处理一切 (IV 生成 + 加密)
+	 * 不设 GENERATE_IV — 让固件完全控制 */
+	return 0;
 }
 
 static int mt7927_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,

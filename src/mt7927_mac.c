@@ -1079,7 +1079,9 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	if (rxd1 & MT_RXD1_NORMAL_TKIP_MIC_ERR)
 		status->flag |= RX_FLAG_MMIC_ERROR;
 
-	/* --- Security: mark decrypted if hw handled it --- */
+	/* --- Security: mark decrypted if hw handled it ---
+	 * S44: 硬件加密 — 当 SEC_MODE!=0 且无 cipher/ICV 错误时，
+	 * 标记帧已由固件解密，mac80211 跳过软件解密 */
 
 	if (FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2) != 0 &&
 	    !(rxd1 & (MT_RXD1_NORMAL_CLM | MT_RXD1_NORMAL_CM))) {
@@ -1200,10 +1202,17 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 
 			/* Build 802.11 header: FromDS data frame
 			 * Addr1=DA(RA), Addr2=BSSID=SA(TA), Addr3=SA */
-			dot11.frame_control = cpu_to_le16(
-				IEEE80211_FTYPE_DATA |
-				IEEE80211_STYPE_DATA |
-				IEEE80211_FCTL_FROMDS);
+		{
+			u16 fc_flags = IEEE80211_FTYPE_DATA |
+				       IEEE80211_STYPE_DATA |
+				       IEEE80211_FCTL_FROMDS;
+			/* S44: 硬件加密修复 — 原始帧是加密的，
+			 * FC 必须反映 Protected 状态，否则 mac80211
+			 * 会丢弃 "未加密的数据帧" (安全降级检测) */
+			if (status->flag & RX_FLAG_DECRYPTED)
+				fc_flags |= IEEE80211_FCTL_PROTECTED;
+			dot11.frame_control = cpu_to_le16(fc_flags);
+		}
 			memcpy(dot11.addr1, da, ETH_ALEN);
 			memcpy(dot11.addr2, sa, ETH_ALEN);
 			memcpy(dot11.addr3, sa, ETH_ALEN);
