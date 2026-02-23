@@ -470,9 +470,11 @@ static void mt7927_reprogram_prefetch(struct mt7927_dev *dev)
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(16), PREFETCH(0x0140, 0x4));
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(15), PREFETCH(0x0180, 0x10));
 	mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(0), PREFETCH(0x0280, 0x4));
-	/* Ring 2 EXT_CTRL: Windows 不写 per-ring EXT_CTRL for Ring 2
-	 * Session 22 分析: 写了会导致 Ring 2 TX 时固件 crash (PLE 填满)
-	 * 见 docs/win_re_ring2_analysis.md */
+	/* TX ring 2 (管理帧 SF mode):
+	 * Session 30: Windows RE 确认 MT6639InitTxRxRing 不写 per-ring EXT_CTRL,
+	 * 仅使用 packed prefetch (CFG0-CFG3). 按 Windows 行为: 不写 Ring 2 EXT_CTRL.
+	 * Source: docs/re/win_re_wfdma_glo_cfg.md Section 5,
+	 *         docs/re/win_re_ring2_analysis.md Section 4 */
 }
 
 /* =====================================================================
@@ -776,6 +778,9 @@ static int mt7927_mcu_send_firmware_chunks(struct mt7927_dev *dev,
 	}
 	return 0;
 }
+
+/* Forward declarations */
+static int mt7927_mcu_chip_config(struct mt7927_dev *dev);
 
 /* 发送 UniCmd (CONNAC3 固件启动后命令格式)
  * 来源: mt76/mt76_connac_mcu.c + mt7925/mcu.c + src/docs/unicmd_format_analysis.md */
@@ -1174,10 +1179,8 @@ static void mt7927_wpdma_config(struct mt7927_dev *dev, bool enable)
 		 * depth=0x4 与 mt7925 一致 (mt7925/pci.c line 232)
 		 * 缺少此配置导致 auth 帧无法通过 DMA 发出 */
 		mt7927_wr(dev, MT_WFDMA_TX_RING_EXT_CTRL(0), PREFETCH(0x0280, 0x4));
-		/* TX ring 2 (管理帧 SF): Windows 不写 per-ring EXT_CTRL!
-		 * Windows 只用 packed prefetch (0xd70f0-fc), 不写单独的 EXT_CTRL.
-		 * Session 22 发现写 EXT_CTRL 可能导致 Ring 2 firmware crash.
-		 * 移除此写入，只依赖 packed prefetch 配置. */
+		/* TX ring 2: Windows 不写 per-ring EXT_CTRL, 仅用 packed prefetch.
+		 * Session 30: 移除以匹配 Windows (docs/re/win_re_wfdma_glo_cfg.md S5) */
 
 		/* GLO_CFG: 启用 TX_DMA_EN | RX_DMA_EN + Windows 关键位 (步骤 4)
 		 * 来源: Windows — glo_cfg |= 0x5 + 额外关键位
@@ -1715,36 +1718,9 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 	 *   mt7925 初始化时发送 "KeepFullPwr 0" 禁用深度睡眠 — 此处复用
 	 * SET 命令, option=0x06, fire-and-forget */
 	dev_info(&dev->pdev->dev, "发送 ChipConfig (class=0xca, KeepFullPwr)\n");
-	{
-		struct {
-			u8 rsv[4];              /* UniCmd CHIP_CONFIG header */
-			__le16 tag;             /* UNI_CHIP_CONFIG_CHIP_CFG = 2 */
-			__le16 len;             /* TLV 长度 */
-			__le16 id;              /* config id */
-			u8 type;                /* config type */
-			u8 resp_type;           /* response type */
-			__le16 data_size;       /* string length */
-			__le16 data_resv;       /* reserved */
-			u8 data[320];           /* config string */
-		} __packed chip_cfg;
-		/* mt7925: set_deep_sleep(false) → "KeepFullPwr 1" = 保持全功率 = 禁用深睡眠
-		 * "KeepFullPwr 0" = 允许深度睡眠 (错误! 会导致固件不发帧) */
-		const char *cfg_str = "KeepFullPwr 1";
-		u16 str_len = strlen(cfg_str) + 1;
-
-		memset(&chip_cfg, 0, sizeof(chip_cfg));
-		chip_cfg.tag = cpu_to_le16(2);  /* UNI_CHIP_CONFIG_CHIP_CFG */
-		chip_cfg.len = cpu_to_le16(sizeof(chip_cfg) - 4);
-		chip_cfg.data_size = cpu_to_le16(str_len);
-		memcpy(chip_cfg.data, cfg_str, str_len);
-
-		ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_SCAN_CFG,
-					      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
-					      &chip_cfg, sizeof(chip_cfg));
-		if (ret)
-			dev_warn(&dev->pdev->dev,
-				 "ChipConfig 失败: %d (继续)\n", ret);
-	}
+	ret = mt7927_mcu_chip_config(dev);
+	if (ret)
+		dev_warn(&dev->pdev->dev, "ChipConfig 失败: %d (继续)\n", ret);
 	/* Step 9: SetLogLevelConfig (class=0xca)
 	 * 来源: Ghidra RE — AsicConnac3xSetLogLevelConfig
 	 *   class=0xca, target=0xed, 字符串 "EvtDrvnLogCatLvl"
@@ -1953,6 +1929,36 @@ static int mt7927_mcu_set_rts_thresh(struct mt7927_dev *dev, u32 val)
 	return ret;
 }
 
+/* ChipConfig (CID=0xca, tag=2) — "KeepFullPwr 1"
+ * Windows RE: 0x1400484c0 每次 connect 都发送 (不仅在 init)
+ * mt7925: mt7925_mcu_chip_config() 发送配置字符串 */
+static int mt7927_mcu_chip_config(struct mt7927_dev *dev)
+{
+	struct {
+		u8 rsv[4];
+		__le16 tag;
+		__le16 len;
+		__le16 id;
+		u8 type;
+		u8 resp_type;
+		__le16 data_size;
+		__le16 data_resv;
+		u8 data[320];
+	} __packed chip_cfg;
+	const char *cfg_str = "KeepFullPwr 1";
+	u16 str_len = strlen(cfg_str) + 1;
+
+	memset(&chip_cfg, 0, sizeof(chip_cfg));
+	chip_cfg.tag = cpu_to_le16(2);
+	chip_cfg.len = cpu_to_le16(sizeof(chip_cfg) - 4);
+	chip_cfg.data_size = cpu_to_le16(str_len);
+	memcpy(chip_cfg.data, cfg_str, str_len);
+
+	return mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_SCAN_CFG,
+				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+				      &chip_cfg, sizeof(chip_cfg));
+}
+
 /* RX Packet Filter (CID=0x08 BAND_CONFIG, tag=0x0002 SET_RX_FILTER)
  * 来源: Windows RE 0x140143cd0 (nicUniCmdSetRxFilter) + MT6639 参考代码
  * Windows 强制: BROADCAST(0x08) 和 MULTICAST(0x02) 始终设置
@@ -1975,14 +1981,15 @@ static int mt7927_mcu_set_rx_filter(struct mt7927_dev *dev, u32 filter)
 	int ret;
 
 	dev_info(&dev->pdev->dev,
-		 "SET_RX_FILTER: filter=0x%08x\n", filter);
+		 "SET_RX_FILTER: filter=0x%08x band=%u\n", filter, req.band_idx);
 
+	/* CID=0x08 (mt7925 BAND_CONFIG)
+	 * Session 33: A/B 测试确认 CID=0x08 和 0x49 效果相同 (均 ret=0 但不改变 RX)
+	 * 保留以保持与 Windows 命令序列一致 */
 	ret = mt7927_mcu_send_unicmd(dev, MT_MCU_CLASS_BAND_CONFIG,
-				      UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
-				      &req, sizeof(req));
-	if (ret)
-		dev_warn(&dev->pdev->dev,
-			 "SET_RX_FILTER 失败: %d\n", ret);
+				     UNI_CMD_OPT_SET, &req, sizeof(req));
+	dev_info(&dev->pdev->dev,
+		 "SET_RX_FILTER: ret=%d\n", ret);
 	return ret;
 }
 
@@ -2370,6 +2377,19 @@ static void mt7927_scan_work(struct work_struct *work)
 		.aborted = false,
 	};
 
+	/* DIAG: 扫描刚完成 — 此时射频应该还在 (或刚关), 读 MDRDY 确认 */
+	{
+		u32 mdrdy0, mdrdy1, rx_ok0, rx_ok1;
+		/* 不清零 — 读取自上次清零以来的累积值 */
+		mdrdy0 = mt7927_rr(dev, MT_MIB_RSCR26(0));
+		mdrdy1 = mt7927_rr(dev, MT_MIB_RSCR26(1));
+		rx_ok0 = mt7927_rr(dev, MT_MIB_RSCR0(0));
+		rx_ok1 = mt7927_rr(dev, MT_MIB_RSCR0(1));
+		dev_info(&dev->pdev->dev,
+			 "SCAN_DONE MIB: B0_MDRDY=%u RX_OK=%u  B1_MDRDY=%u RX_OK=%u\n",
+			 mdrdy0, rx_ok0, mdrdy1, rx_ok1);
+	}
+
 	/* scan_done 事件已清除 MT7927_SCANNING 标志,
 	 * 这里直接通知 mac80211 扫描完成.
 	 * 如果 scanning 标志仍然设置 (超时路径), 也清除它. */
@@ -2484,15 +2504,25 @@ static int mt7927_mcu_bss_activate(struct mt7927_dev *dev,
 	req.mld.omac_idx = 0xff;	/* Windows: 0xFF (不指定) */
 
 	dev_info(&dev->pdev->dev,
-		 "mcu: BssActivateCtrl bss=%d omac=%d band=%u link_idx=%u (size=%zu)\n",
+		 "mcu: BssActivateCtrl bss=%d omac=%d band=%u link_idx=%u bssid=%pM vif_addr=%pM (size=%zu)\n",
 		 mvif->bss_idx, mvif->omac_idx, mvif->band_idx,
-		 req.basic.link_idx, sizeof(req));
+		 req.basic.link_idx, req.basic.bssid, vif->addr, sizeof(req));
 
 	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_BSS_INFO,
 					  &req, sizeof(req));
 }
 
-/* BSS_INFO_UPDATE (CID=0x02) — 配置 BSS */
+/* BSS_INFO_UPDATE (CID=0x02) — 配置 BSS
+ * Windows RE: MtCmdSetBssInfo (0x1400cf928) → nicUniCmdSetBssInfo (0x1401444a0)
+ * Dispatch table DAT_1402505b0: 14 entries (不含 RLM/PROTECT/IFS_TIME)
+ * RLM/PROTECT/IFS_TIME 由 nicUniCmdSetBssRlm (0x1401445e0) 独立发送
+ *
+ * TLV 顺序对齐 Windows dispatch table:
+ *   [0] BASIC(0), [1] RATE(0xB), [2] SEC(0x10), [3] QBSS(0xF),
+ *   [4] SAP(0xD), [5] P2P(0xE), [6] HE(5), [7] COLOR(4),
+ *   [8] MBSSID(6), [9] 0C(0xC), [10] IOT(0x18), [11] MLD(0x1A),
+ *   [12] EHT(0x1E) — 共 13 TLV (Windows 14th entry 未确认, 可能是 Wapi)
+ */
 static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 				   struct ieee80211_vif *vif, bool enable)
 {
@@ -2500,41 +2530,26 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	struct ieee80211_channel *chan;
 	struct {
 		struct bss_req_hdr hdr;
-		struct mt76_connac_bss_basic_tlv basic; /* tag=0 */
-		/* BSS_RA (tag=1) 已移除 — Windows dispatch table 无此条目 */
-		struct bss_rlm_tlv rlm;                 /* tag=2 */
-		struct bss_protect_tlv protect;         /* tag=3 */
-		struct bss_color_tlv color;             /* tag=4 */
-		struct bss_he_tlv he;                   /* tag=5 */
-		struct bss_rate_tlv rate;               /* tag=0xB */
-		struct bss_sap_tlv sap;                 /* tag=0xD */
-		struct bss_p2p_tlv p2p;                 /* tag=0xE */
-		struct bss_qbss_tlv qbss;               /* tag=0xF */
-		struct bss_sec_tlv sec;                 /* tag=0x10 */
-		struct bss_mbssid_tlv mbssid;           /* tag=0x06 */
-		struct bss_0c_tlv bss_0c;               /* tag=0x0C */
-		struct bss_ifs_time_tlv ifs_time;       /* tag=0x17 */
-		struct bss_iot_tlv iot;                 /* tag=0x18 */
-		struct bss_mld_tlv mld;                 /* tag=0x1A */
-		struct bss_eht_tlv eht;                 /* tag=0x1E */
+		/* Windows dispatch table order (DAT_1402505b0) */
+		struct mt76_connac_bss_basic_tlv basic; /* [0] tag=0x00 */
+		struct bss_rate_tlv rate;               /* [1] tag=0x0B */
+		struct bss_sec_tlv sec;                 /* [2] tag=0x10 */
+		struct bss_qbss_tlv qbss;               /* [3] tag=0x0F */
+		struct bss_sap_tlv sap;                 /* [4] tag=0x0D */
+		struct bss_p2p_tlv p2p;                 /* [5] tag=0x0E */
+		struct bss_he_tlv he;                   /* [6] tag=0x05 */
+		struct bss_color_tlv color;             /* [7] tag=0x04 */
+		struct bss_mbssid_tlv mbssid;           /* [8] tag=0x06 */
+		struct bss_0c_tlv bss_0c;               /* [9] tag=0x0C */
+		struct bss_iot_tlv iot;                 /* [10] tag=0x18 */
+		struct bss_mld_tlv mld;                 /* [11] tag=0x1A */
+		struct bss_eht_tlv eht;                 /* [12] tag=0x1E */
+		/* RLM(2)/PROTECT(3)/IFS_TIME(0x17) 不在此 — 由 mt7927_mcu_set_bss_rlm() 独立发送 */
 	} __packed req = {};
 
-	/* Windows RE 序列: BssActivateCtrl → PM_DISABLE → full BSS_INFO
-	 * BssActivateCtrl: 最小 BSS_INFO (BASIC+MLD, conn_state=1) 激活 BSS
-	 *
-	 * CRITICAL: Skip BssActivateCtrl when band_idx=0xff (before ROC_GRANT).
-	 * If activated with band=0xff, firmware assigns WTBL BAND=0 (2.4GHz),
-	 * and subsequent re-activation with band=1 does NOT update WTBL BAND.
-	 * This causes all 5GHz TX to fail with TXFREE stat=1 (band mismatch).
-	 * Only activate after ROC_GRANT when we have the actual band_idx. */
-	if (enable && mvif->band_idx != 0xff) {
-		mt7927_mcu_bss_activate(dev, vif);
-		mt7927_mcu_bss_pm_disable(dev, mvif->bss_idx);
-	}
+	/* BssActivateCtrl + PM_DISABLE 已在 mgd_prepare_tx 中显式调用,
+	 * 不在此处重复 — 重复发送可能导致固件 BSS context 被重置 */
 
-	/* 优先从 vif BSS conf 获取信道 (AP 的实际信道),
-	 * 回退到 hw->conf (可能是扫描/默认信道).
-	 * mt7925: mt7925_mcu_bss_basic_tlv() 用 chandef->chan */
 	if (vif->bss_conf.chanreq.oper.chan)
 		chan = vif->bss_conf.chanreq.oper.chan;
 	else
@@ -2542,28 +2557,18 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 
 	req.hdr.bss_idx = mvif->bss_idx;
 
-	/* === BSS_BASIC TLV (tag=0) === */
+	/* === [0] BSS_BASIC TLV (tag=0) === */
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.active = mvif->bss_idx;          /* +4: bss_idx (WIN RE BssActivateCtrl 确认) */
-	req.basic.omac_idx = mvif->omac_idx;       /* +5: 保持不变 */
-	req.basic.hw_bss_idx = mvif->omac_idx;     /* WIN RE +6: 固件读为 omac_idx (dup) */
-	/* mt7925 uses actual band_idx for WTBL BAND assignment.
-	 * 0xff was wrong — caused WTBL BAND=0 even on 5GHz (band 1),
-	 * firmware dropped TX frames due to band mismatch (TXFREE stat=1).
-	 * Previous comment "firmware reads as sco" was incorrect. */
+	req.basic.active = mvif->bss_idx;
+	req.basic.omac_idx = mvif->omac_idx;
+	req.basic.hw_bss_idx = mvif->omac_idx;
 	req.basic.band_idx = mvif->band_idx;
-	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA); /* +8: 保持不变 */
-	req.basic.conn_state = 1;                  /* WIN RE +10: active flag (NOT conn_state!)
-	                                            * Codex 分析: TLV +0x0C 映射到 Windows RE 的
-	                                            * "active = ~(bss->0x2e6964 >> 7) & 1"
-	                                            * BssActivateCtrl 设 1, full BSS_INFO 也应该设 1
-	                                            * 设 0 = BSS 未激活 → 固件拒绝发帧 */
-	req.basic.wmm_idx = mvif->wmm_idx;        /* +D: 固件读为 network_type, 0 不变 */
-	req.basic.bmc_tx_wlan_idx = cpu_to_le16(0); /* WIN RE +14: 固件读为 sta_type, STA=0 */
-	/* WIN RE +1A: 固件读为 mbss_flags, Windows 写 0x00FE */
-	req.basic.sta_idx = cpu_to_le16(0x00FE);
-
+	req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
+	req.basic.conn_state = 1;  /* WIN RE: active flag */
+	req.basic.wmm_idx = mvif->wmm_idx;
+	req.basic.bmc_tx_wlan_idx = cpu_to_le16(0);
+	req.basic.sta_idx = cpu_to_le16(0x00FE);  /* WIN RE: mbss_flags */
 	if (vif->bss_conf.bssid)
 		memcpy(req.basic.bssid, vif->bss_conf.bssid, ETH_ALEN);
 	if (vif->bss_conf.beacon_int) {
@@ -2571,74 +2576,18 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 			cpu_to_le16(vif->bss_conf.beacon_int);
 		req.basic.dtim_period = vif->bss_conf.dtim_period;
 	}
-
-	/* PHY mode — 告诉固件此 BSS 的能力 (OFDM/HT/VHT/HE)
-	 * 参考: mt7925/mcu.c mt7925_mcu_bss_basic_tlv() line 2503
-	 * 缺失此字段, 固件不知道该用什么调制方式 */
 	if (chan) {
-		if (chan->band == NL80211_BAND_5GHZ) {
-			/* 5GHz: 11a + HT + VHT */
-			req.basic.phymode = 0x31; /* PHY_MODE_A|AN|AC */
-		} else if (chan->band == NL80211_BAND_6GHZ) {
-			req.basic.phymode = 0xb1; /* A|AN|AC|AX_5G */
-		} else {
-			/* 2.4GHz: 11b/g + HT */
-			req.basic.phymode = 0x0f; /* PHY_MODE_B|G|GN */
-		}
+		if (chan->band == NL80211_BAND_5GHZ)
+			req.basic.phymode = 0x31;
+		else if (chan->band == NL80211_BAND_6GHZ)
+			req.basic.phymode = 0xb1;
+		else
+			req.basic.phymode = 0x0f;
 	}
-	/* WIN RE +1C: 固件读为 wlan_idx (TX 用的 WCID index) */
-	req.basic.nonht_basic_phy = cpu_to_le16(mvif->sta.wcid.idx);
-	/* WIN RE +1F: Windows nicUniCmdBssInfoTagBasic 不写此字段 (保持零值)
-	 * Session 27 Ghidra RE 逐字节确认: offset 0x1F 无写入
-	 * 之前误写 band_idx=1, 固件可能误读导致 WTBL BAND 设置异常 */
-	req.basic.link_idx = 0;
+	req.basic.nonht_basic_phy = 0;
+	req.basic.link_idx = mvif->band_idx;
 
-	/* === BSS_RLM TLV (tag=2) — 告诉固件信道/频段/带宽 === */
-	req.rlm.tag = cpu_to_le16(UNI_BSS_INFO_RLM);
-	req.rlm.len = cpu_to_le16(sizeof(req.rlm));
-	if (chan) {
-		req.rlm.control_channel = chan->hw_value;
-		req.rlm.center_chan = chan->hw_value; /* 20MHz: center=control */
-		req.rlm.bw = 1;  /* Windows RE: 20MHz映射为0x01 (映射表: 0→1, 1→2, 2→3, 3→6, 4→7) */
-		req.rlm.tx_streams = 2;  /* MT6639: 2T2R */
-		req.rlm.rx_streams = 2;
-		req.rlm.ht_op_info = 4;  /* HT 40MHz allowed */
-		switch (chan->band) {
-		case NL80211_BAND_5GHZ:
-			req.rlm.band = 2;  /* CMD_BAND_5G */
-			break;
-		case NL80211_BAND_6GHZ:
-			req.rlm.band = 3;  /* CMD_BAND_6G */
-			break;
-		default:
-			req.rlm.band = 1;  /* CMD_BAND_24G */
-			break;
-		}
-	}
-
-	/* === BSS_PROTECT TLV (tag=3) — 保护模式 ===
-	 * 初始 auth 阶段无保护, protect_mode=0
-	 * MT6639: nic_uni_cmd_event.c nicUniCmdBssInfoProtect() */
-	req.protect.tag = cpu_to_le16(UNI_BSS_INFO_PROTECT);
-	req.protect.len = cpu_to_le16(sizeof(req.protect));
-	req.protect.protect_mode = 0;
-
-	/* === BSS_IFS_TIME TLV (tag=0x17) — 帧间距时间 ===
-	 * 5GHz 必须用 short slot (9μs), 否则 DIFS=56μs (应为 34μs)
-	 * MT6639: nic_uni_cmd_event.c nicUniCmdBssInfoIfsTime() */
-	req.ifs_time.tag = cpu_to_le16(UNI_BSS_INFO_IFS_TIME);
-	req.ifs_time.len = cpu_to_le16(sizeof(req.ifs_time));
-	req.ifs_time.slot_valid = 1;
-	/* Windows RE: 只设slot_valid和slot_time，sifs_valid=0 */
-	if (chan && chan->band != NL80211_BAND_2GHZ) {
-		req.ifs_time.slot_time = cpu_to_le16(9);    /* 5GHz short slot */
-	} else {
-		req.ifs_time.slot_time = cpu_to_le16(20);   /* 2.4GHz legacy */
-	}
-
-	/* === BSS_RATE TLV (tag=0x0B) — 速率集合 ===
-	 * 告诉固件此 BSS 可用的速率, 缺少时固件可能无法发送管理帧
-	 * 来源: mt6639/nic/nic_uni_cmd_event.c line 1694 */
+	/* === [1] BSS_RATE TLV (tag=0x0B) === */
 	req.rate.tag = cpu_to_le16(UNI_BSS_INFO_RATE);
 	req.rate.len = cpu_to_le16(sizeof(req.rate));
 	if (chan) {
@@ -2653,102 +2602,134 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 		}
 	}
 
-	/* BSS_RA (tag=1) 已移除 — Windows dispatch table 无此条目 */
+	/* === [2] BSS_SEC TLV (tag=0x10) === */
+	req.sec.tag = cpu_to_le16(UNI_BSS_INFO_SEC);
+	req.sec.len = cpu_to_le16(sizeof(req.sec));
+	req.sec.auth_mode = 0;
+	req.sec.enc_status = 0;
+	req.sec.cipher_suit = 0;
 
-	/* === BSS_COLOR TLV (tag=4) — HE BSS Color ===
-	 * 初始认证阶段禁用 BSS Color */
-	req.color.tag = cpu_to_le16(UNI_BSS_INFO_BSS_COLOR);
-	req.color.len = cpu_to_le16(sizeof(req.color));
-	req.color.enable = 0;
-	req.color.bss_color = 0;
-
-	/* === BSS_MBSSID TLV (tag=0x06) — 11V MBSSID ===
-	 * STA 模式: 不是 MBSSID 设备, 全填 0 */
-	req.mbssid.tag = cpu_to_le16(UNI_BSS_INFO_MBSSID);
-	req.mbssid.len = cpu_to_le16(sizeof(req.mbssid));
-
-	/* === BSS_HE TLV (tag=5) — HE 能力配置 ===
-	 * CONNAC3 固件需要此 TLV 以处理 HE BSS
-	 * au2MaxNssMcs=0: 初始阶段不设特定 NSS/MCS 限制 */
-	req.he.tag = cpu_to_le16(UNI_BSS_INFO_HE);
-	req.he.len = cpu_to_le16(sizeof(req.he));
-	req.he.txop_duration_rts_threshold = 0;
-	req.he.default_pe_duration = 0;
-	req.he.er_su_disable = 0;
-
-	/* === BSS_SAP TLV (tag=0x0D) — Soft AP 配置 ===
-	 * STA 模式: 全填 0 (无 SSID 广播) */
-	req.sap.tag = cpu_to_le16(UNI_BSS_INFO_SAP);
-	req.sap.len = cpu_to_le16(sizeof(req.sap));
-
-	/* === BSS_P2P TLV (tag=0x0E) — P2P 配置 ===
-	 * STA 模式: private_data=0 */
-	req.p2p.tag = cpu_to_le16(UNI_BSS_INFO_P2P);
-	req.p2p.len = cpu_to_le16(sizeof(req.p2p));
-
-	/* === BSS_QBSS TLV (tag=0x0F) — QoS BSS 配置 ===
-	 * WPA2 连接通常支持 QoS，设 is_qbss=1 */
+	/* === [3] BSS_QBSS TLV (tag=0x0F) === */
 	req.qbss.tag = cpu_to_le16(UNI_BSS_INFO_QBSS);
 	req.qbss.len = cpu_to_le16(sizeof(req.qbss));
 	req.qbss.is_qbss = 1;
 
-	/* === BSS_SEC TLV (tag=0x10) — 安全配置 ===
-	 * Open System Auth 阶段: auth_mode=0, enc=0
-	 * 实际加密配置在 CONNECT 状态时更新 */
-	req.sec.tag = cpu_to_le16(UNI_BSS_INFO_SEC);
-	req.sec.len = cpu_to_le16(sizeof(req.sec));
-	req.sec.auth_mode = 0;   /* AUTH_MODE_OPEN */
-	req.sec.enc_status = 0;  /* ENCRYPT_DISABLED */
-	req.sec.cipher_suit = 0; /* no cipher */
+	/* === [4] BSS_SAP TLV (tag=0x0D) === */
+	req.sap.tag = cpu_to_le16(UNI_BSS_INFO_SAP);
+	req.sap.len = cpu_to_le16(sizeof(req.sap));
 
-	/* === BSS_0C TLV (tag=0x0C) — 未知标志 ===
-	 * Windows 发送, 功能不明, STA 模式填 0 */
+	/* === [5] BSS_P2P TLV (tag=0x0E) === */
+	req.p2p.tag = cpu_to_le16(UNI_BSS_INFO_P2P);
+	req.p2p.len = cpu_to_le16(sizeof(req.p2p));
+
+	/* === [6] BSS_HE TLV (tag=5) === */
+	req.he.tag = cpu_to_le16(UNI_BSS_INFO_HE);
+	req.he.len = cpu_to_le16(sizeof(req.he));
+
+	/* === [7] BSS_COLOR TLV (tag=4) === */
+	req.color.tag = cpu_to_le16(UNI_BSS_INFO_BSS_COLOR);
+	req.color.len = cpu_to_le16(sizeof(req.color));
+
+	/* === [8] BSS_MBSSID TLV (tag=0x06) === */
+	req.mbssid.tag = cpu_to_le16(UNI_BSS_INFO_MBSSID);
+	req.mbssid.len = cpu_to_le16(sizeof(req.mbssid));
+
+	/* === [9] BSS_0C TLV (tag=0x0C) === */
 	req.bss_0c.tag = cpu_to_le16(UNI_BSS_INFO_0C);
 	req.bss_0c.len = cpu_to_le16(sizeof(req.bss_0c));
 
-	/* === BSS_STA_IOT TLV (tag=0x18) — IoT AP 兼容 ===
-	 * iot_ap_bmp=0: 不启用特殊 IoT workaround */
+	/* === [10] BSS_STA_IOT TLV (tag=0x18) === */
 	req.iot.tag = cpu_to_le16(UNI_BSS_INFO_STA_IOT);
 	req.iot.len = cpu_to_le16(sizeof(req.iot));
 
-	/* === BSS_MLD TLV (tag=0x1A) — CONNAC3/WiFi 7 必需 ===
-	 * MT6639 在 BSS_ACTIVATE_CTRL 和 SET_BSS_INFO 中都发送此 TLV
-	 * 即使非 MLO 连接也需要: GroupMldId=0xff, OmRemapIdx=0xff
-	 * 来源: mt6639/nic/nic_uni_cmd_event.c nicUniCmdBssActivateCtrl() */
+	/* === [11] BSS_MLD TLV (tag=0x1A) === */
 	req.mld.tag = cpu_to_le16(UNI_BSS_INFO_MLD);
-	req.mld.len = cpu_to_le16(sizeof(req.mld)); /* 20 bytes! 之前只有 16 */
-	/* Windows Non-MLD fallback path (0x14014fad0):
-	 * link_id=0xFF, group_mld_id=bss_idx, MAC=adapter->mac_addr */
-	req.mld.link_id = 0xff;		/* 非 MLD: 无 link */
-	/* Windows RE 非 MLD fallback (nicUniCmdBssInfoMld):
-	 * group_mld_id = bss_idx (NOT 0xFF!)
-	 * offset 0x0C-0x0F = {0xFF, 0xFF, 0x00, 0x00}
-	 *   → band_idx=0xFF, omac_idx=0xFF, remap_idx=0x00
-	 * 即非 MLD 模式下不指定 band/omac, 固件从 BSS_BASIC TLV band_idx 获取
-	 * 之前我们写 band_idx=1, omac_idx=0, remap_idx=0xFF — 全部反转! */
-	req.mld.group_mld_id = mvif->bss_idx;	/* Windows: bss_idx, NOT 0xFF */
+	req.mld.len = cpu_to_le16(sizeof(req.mld));
+	req.mld.link_id = 0xff;
+	req.mld.group_mld_id = mvif->bss_idx;
 	memcpy(req.mld.own_mld_addr, vif->addr, ETH_ALEN);
-	req.mld.remap_idx = 0x00;	/* Windows: 0x00, NOT 0xFF */
-	req.mld.band_idx = 0xff;	/* Windows: 0xFF (不指定) */
-	req.mld.omac_idx = 0xff;	/* Windows: 0xFF (不指定) */
+	req.mld.remap_idx = 0x00;
+	req.mld.band_idx = 0xff;
+	req.mld.omac_idx = 0xff;
 
-	/* === BSS_EHT TLV (tag=0x1E) — EHT/WiFi 7 能力 ===
-	 * 初始 auth 阶段全零, 固件需要此 TLV 存在 */
+	/* === [12] BSS_EHT TLV (tag=0x1E) === */
 	req.eht.tag = cpu_to_le16(UNI_BSS_INFO_EHT);
 	req.eht.len = cpu_to_le16(sizeof(req.eht));
 
 	dev_info(&dev->pdev->dev,
-		 "mcu: BSS_INFO bss=%d enable=%d [+4]bss_idx=%u [+6]omac_dup=%u [+C]active=%u [+1C]wlan_idx=%u phymode=0x%02x bssid=%pM ch=%u rlm_band=%u link_idx=%u mld_grp=%u mld_band=0x%02x mld_remap=%u\n",
-		 mvif->bss_idx, enable, req.basic.active, req.basic.hw_bss_idx,
-		 req.basic.conn_state,
-		 le16_to_cpu(req.basic.nonht_basic_phy),
-		 req.basic.phymode, req.basic.bssid,
-		 req.rlm.control_channel, req.rlm.band, req.basic.link_idx,
-		 req.mld.group_mld_id, req.mld.band_idx, req.mld.remap_idx);
+		 "mcu: BSS_INFO(13 TLV) bss=%d en=%d band=%u bssid=%pM ch=%u phymode=0x%02x\n",
+		 mvif->bss_idx, enable, mvif->band_idx,
+		 req.basic.bssid, chan ? chan->hw_value : 0, req.basic.phymode);
 
-	/* Hex dump for RE verification — compare raw bytes with Windows RE TLV layout */
-	print_hex_dump(KERN_INFO, "BSS_INFO payload: ", DUMP_PREFIX_OFFSET,
-		       16, 1, &req, sizeof(req), false);
+	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_BSS_INFO, &req,
+					   sizeof(req));
+}
+
+/* BSS_INFO_RLM (CID=0x02) — 独立发送 RLM+PROTECT+IFS_TIME
+ * Windows RE: nicUniCmdSetBssRlm (0x1401445e0)
+ * 使用 CID=2 (与 BSS_INFO 相同) 但不经过 14-TLV dispatch table
+ * 直接创建 3 个 inline TLV: RLM(tag=2) + PROTECT(tag=3) + IFS_TIME(tag=0x17)
+ */
+static int mt7927_mcu_set_bss_rlm(struct mt7927_dev *dev,
+				   struct ieee80211_vif *vif)
+{
+	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
+	struct ieee80211_channel *chan;
+	struct {
+		struct bss_req_hdr hdr;
+		struct bss_rlm_tlv rlm;            /* tag=0x02 */
+		struct bss_protect_tlv protect;    /* tag=0x03 */
+		struct bss_ifs_time_tlv ifs_time;  /* tag=0x17 */
+	} __packed req = {};
+
+	if (vif->bss_conf.chanreq.oper.chan)
+		chan = vif->bss_conf.chanreq.oper.chan;
+	else
+		chan = dev->hw->conf.chandef.chan;
+
+	req.hdr.bss_idx = mvif->bss_idx;
+
+	/* RLM TLV (tag=2) */
+	req.rlm.tag = cpu_to_le16(UNI_BSS_INFO_RLM);
+	req.rlm.len = cpu_to_le16(sizeof(req.rlm));
+	if (chan) {
+		req.rlm.control_channel = chan->hw_value;
+		req.rlm.center_chan = chan->hw_value;
+		req.rlm.bw = 0;  /* 20MHz */
+		req.rlm.tx_streams = 2;
+		req.rlm.rx_streams = 2;
+		req.rlm.ht_op_info = 4;
+		switch (chan->band) {
+		case NL80211_BAND_5GHZ:
+			req.rlm.band = 2;
+			break;
+		case NL80211_BAND_6GHZ:
+			req.rlm.band = 3;
+			break;
+		default:
+			req.rlm.band = 1;
+			break;
+		}
+	}
+
+	/* PROTECT TLV (tag=3) */
+	req.protect.tag = cpu_to_le16(UNI_BSS_INFO_PROTECT);
+	req.protect.len = cpu_to_le16(sizeof(req.protect));
+	req.protect.protect_mode = 0;
+
+	/* IFS_TIME TLV (tag=0x17) */
+	req.ifs_time.tag = cpu_to_le16(UNI_BSS_INFO_IFS_TIME);
+	req.ifs_time.len = cpu_to_le16(sizeof(req.ifs_time));
+	req.ifs_time.slot_valid = 1;
+	if (chan && chan->band != NL80211_BAND_2GHZ)
+		req.ifs_time.slot_time = cpu_to_le16(9);
+	else
+		req.ifs_time.slot_time = cpu_to_le16(20);
+
+	dev_info(&dev->pdev->dev,
+		 "mcu: BSS_RLM(3 TLV) bss=%d ch=%u band=%u bw=%u slot=%u\n",
+		 mvif->bss_idx, req.rlm.control_channel, req.rlm.band,
+		 req.rlm.bw, le16_to_cpu(req.ifs_time.slot_time));
 
 	return mt7927_mcu_send_unicmd_set(dev, MCU_UNI_CMD_BSS_INFO, &req,
 					   sizeof(req));
@@ -2770,26 +2751,25 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 {
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 	struct mt7927_sta *msta;
-	/* STA_REC TLVs — 匹配 Windows dispatch table 13 个 TLV
-	 *   BASIC(0) + RA(1) + STATE(7) + HT(9) + VHT(0xA) + PHY(0x15)
-	 *   + BA_OFFLOAD(0x16) + HE_6G_CAP(0x17) + HE_BASIC(0x19)
-	 *   + MLD_SETUP(0x20) + EHT_MLD(0x21) + EHT(0x22) + UAPSD(0x24)
-	 *   共 13 个 TLV */
+	/* STA_REC TLVs — Windows dispatch table DAT_140250710 顺序
+	 *   [0]BASIC(0) [1]HT(9) [2]VHT(A) [3]HE(19) [4]HE6G(17)
+	 *   [5]STATE(7) [6]PHY(15) [7]RA(1) [8]BA(16) [9]UAPSD(24)
+	 *   [10]EHT(22) [11]EHT_MLD(21) [12]MLD(20) */
 	struct {
 		struct sta_req_hdr hdr;
-		struct sta_rec_basic basic;
-		struct sta_rec_ra_info ra;
-		struct sta_rec_state state;
-		struct sta_rec_ht_info ht;
-		struct sta_rec_vht_info vht;
-		struct sta_rec_phy phy;
-		struct sta_rec_ba_offload ba;	/* tag=0x16, Windows 始终发送 */
-		struct sta_rec_he_6g_cap he6g;	/* tag=0x17, 6GHz caps */
-		struct sta_rec_he_basic he;
-		struct sta_rec_mld_setup mld;	/* tag=0x20, MLD setup */
-		struct sta_rec_eht_mld eht_mld;	/* tag=0x21, EHT MLD */
-		struct sta_rec_eht_info eht;	/* tag=0x22, EHT caps */
-		struct sta_rec_uapsd uapsd;	/* tag=0x24, Windows 始终发送 */
+		struct sta_rec_basic basic;      /* [0] tag=0x00 */
+		struct sta_rec_ht_info ht;       /* [1] tag=0x09 */
+		struct sta_rec_vht_info vht;     /* [2] tag=0x0A */
+		struct sta_rec_he_basic he;      /* [3] tag=0x19 */
+		struct sta_rec_he_6g_cap he6g;   /* [4] tag=0x17 */
+		struct sta_rec_state state;      /* [5] tag=0x07 */
+		struct sta_rec_phy phy;          /* [6] tag=0x15 */
+		struct sta_rec_ra_info ra;       /* [7] tag=0x01 */
+		struct sta_rec_ba_offload ba;    /* [8] tag=0x16 */
+		struct sta_rec_uapsd uapsd;      /* [9] tag=0x24 */
+		struct sta_rec_eht_info eht;     /* [10] tag=0x22 */
+		struct sta_rec_eht_mld eht_mld;  /* [11] tag=0x21 */
+		struct sta_rec_mld_setup mld;    /* [12] tag=0x20 */
 	} __packed req = {};
 
 	if (sta)
@@ -2803,33 +2783,20 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	req.hdr.wlan_idx_hi = (msta->wcid.idx >> 8) & 0xff;
 	req.hdr.muar_idx = mvif->omac_idx;
 	req.hdr.is_tlv_append = 1;
-	req.hdr.tlv_num = cpu_to_le16(13); /* Windows 13 TLVs: BASIC+RA+STATE+HT+VHT+PHY+BA+HE6G+HE+MLD+EHT_MLD+EHT+UAPSD */
+	req.hdr.tlv_num = cpu_to_le16(13);
 
-	/* STA_REC_BASIC (tag=0)
-	 * 来源: mt76/mt76_connac_mcu.c mt76_connac_mcu_sta_basic_tlv()
-	 * 新建 STA: PORT_SECURE + EXTRA_INFO_NEW → 固件自动创建 WTBL
-	 * 更新 STA: PORT_SECURE (无 NEW) → 更新已有条目
-	 * 删除 STA: DISCONNECT, 无 NEW */
+	/* [0] STA_REC_BASIC (tag=0x00) */
 	req.basic.tag = cpu_to_le16(STA_REC_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	/* MT6639 ext_cmd + gl_hook_api: STA_REC always uses CONNECTION_INFRA_STA
-	 * (0x10001) regardless of peer type. UniCmd path differs but ext_cmd
-	 * path is what the firmware expects for WTBL creation. */
 	if (vif->type == NL80211_IFTYPE_STATION)
 		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
 	else
 		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
 
 	if (enable) {
-		/* Windows RE (FUN_14014d6d0): conn_state 固定写 0x01 (CONNECT)
-		 * 之前我们用 PORT_SECURE(2), 但 Windows 从不用它.
-		 * 固件可能对 conn_state=2 有不同处理 (如限制 TX 权限) */
 		req.basic.conn_state = CONN_STATE_CONNECT;
-		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
-		/* EXTRA_INFO_NEW: MT6639 分析表明 enable=true 时始终设置
-		 * u2ExtraInfo = 0x03 (VER | NEW), 不论 conn_state 值
-		 * 固件每次都重新创建/更新 WTBL 条目 */
-		req.basic.extra_info |= cpu_to_le16(EXTRA_INFO_NEW);
+		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER |
+						   EXTRA_INFO_NEW);
 	} else {
 		req.basic.conn_state = CONN_STATE_DISCONNECT;
 		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
@@ -2841,9 +2808,71 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 		memcpy(req.basic.peer_addr, sta->addr, ETH_ALEN);
 	}
 
-	/* STA_REC_RA (tag=1) — 支持的速率
-	 * 来源: mt7925/mcu.c mt7925_mcu_sta_rate_ctrl_tlv()
-	 * 固件需要知道 STA 的速率能力来初始化内部速率表 */
+	/* [1] STA_REC_HT (tag=0x09) */
+	req.ht.tag = cpu_to_le16(STA_REC_HT);
+	req.ht.len = cpu_to_le16(sizeof(req.ht));
+	if (sta && sta->deflink.ht_cap.ht_supported)
+		req.ht.ht_cap = cpu_to_le16(sta->deflink.ht_cap.cap);
+
+	/* [2] STA_REC_VHT (tag=0x0A) */
+	req.vht.tag = cpu_to_le16(STA_REC_VHT);
+	req.vht.len = cpu_to_le16(sizeof(req.vht));
+	if (sta && sta->deflink.vht_cap.vht_supported) {
+		req.vht.vht_cap = cpu_to_le32(sta->deflink.vht_cap.cap);
+		req.vht.vht_rx_mcs_map = cpu_to_le16(
+			sta->deflink.vht_cap.vht_mcs.rx_mcs_map);
+		req.vht.vht_tx_mcs_map = cpu_to_le16(
+			sta->deflink.vht_cap.vht_mcs.tx_mcs_map);
+	}
+
+	/* [3] STA_REC_HE_BASIC (tag=0x19) */
+	req.he.tag = cpu_to_le16(STA_REC_HE_BASIC);
+	req.he.len = cpu_to_le16(sizeof(req.he));
+	if (sta && sta->deflink.he_cap.has_he) {
+		memcpy(req.he.mac_cap,
+		       sta->deflink.he_cap.he_cap_elem.mac_cap_info,
+		       sizeof(req.he.mac_cap));
+		memcpy(req.he.phy_cap,
+		       sta->deflink.he_cap.he_cap_elem.phy_cap_info,
+		       sizeof(req.he.phy_cap));
+		req.he.rx_mcs_80 =
+			sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80;
+		req.he.rx_mcs_160 =
+			sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_160;
+		req.he.rx_mcs_80p80 =
+			sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80p80;
+	}
+	req.he.pkt_ext = 2;
+
+	/* [4] STA_REC_HE_6G_CAP (tag=0x17) */
+	req.he6g.tag = cpu_to_le16(STA_REC_HE_6G_CAP);
+	req.he6g.len = cpu_to_le16(sizeof(req.he6g));
+
+	/* [5] STA_REC_STATE (tag=0x07) — state=0 (Windows RE: 内部 JOIN=1→wire=0) */
+	req.state.tag = cpu_to_le16(STA_REC_STATE);
+	req.state.len = cpu_to_le16(sizeof(req.state));
+	req.state.state = 0;
+	req.state.flags = 0;
+
+	/* [6] STA_REC_PHY (tag=0x15) */
+	req.phy.tag = cpu_to_le16(STA_REC_PHY);
+	req.phy.len = cpu_to_le16(sizeof(req.phy));
+	if (dev->hw && dev->hw->conf.chandef.chan) {
+		enum nl80211_band band = dev->hw->conf.chandef.chan->band;
+
+		if (band == NL80211_BAND_5GHZ) {
+			req.phy.phy_type = 0x1C;
+			req.phy.basic_rate = cpu_to_le16(0x0150);
+		} else {
+			req.phy.phy_type = 0x0F;
+			req.phy.basic_rate = cpu_to_le16(0x000F);
+		}
+	} else {
+		req.phy.phy_type = 0x1C;
+		req.phy.basic_rate = cpu_to_le16(0x0150);
+	}
+
+	/* [7] STA_REC_RA (tag=0x01) */
 	req.ra.tag = cpu_to_le16(STA_REC_RA);
 	req.ra.len = cpu_to_le16(sizeof(req.ra));
 	if (sta && dev->hw && dev->hw->conf.chandef.chan) {
@@ -2863,137 +2892,29 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 			       sta->deflink.ht_cap.mcs.rx_mask,
 			       sizeof(req.ra.rx_mcs_bitmask));
 	} else {
-		/* fallback: 5GHz all OFDM rates */
 		req.ra.legacy = cpu_to_le16(FIELD_PREP(RA_LEGACY_OFDM, 0xFF));
 	}
 
-	/* STA_REC_STATE (tag=7 = STATE_CHANGED for MT6639)
-	 * 来源: MT6639 cnmStaRecChangeState(), tag=0x07
-	 * ⚠️ MT6639 布局: flags(4) + state(1) + opmode(1) + action(1) + pad(1) = 12 bytes
-	 * 之前 tag=2 是 RA_COMMON_INFO, 固件从未收到正确的 STATE 通知! */
-	req.state.tag = cpu_to_le16(STA_REC_STATE);
-	req.state.len = cpu_to_le16(sizeof(req.state)); /* 16 bytes! 之前只有 12 */
-	/* STA_STATE_3 (value=2) 清除 PLE STATION_PAUSE → TX scheduler 可以分发帧
-	 * STA_STATE_1 (value=0) 设置 STATION_PAUSE → 断开时暂停 TX
-	 * Windows RE: state@+4 (1B), pad(3B), flags@+8 (4B), action@+C (1B)
-	 * ⚠️ 之前 struct 只有 12B, 后续 TLV 全部错位 4 字节! */
-	req.state.state = enable ? 2 : 0;
-	req.state.flags = 0;
-
-	/* STA_REC_HT_INFO (tag=0x09) — HT 能力
-	 * MT6639: nicUniCmdStaRecTagHtInfo() — 仅当 ht_cap 非零时发送
-	 * 固件需要 HT 能力来创建正确的 WTBL 条目 */
-	req.ht.tag = cpu_to_le16(STA_REC_HT);
-	req.ht.len = cpu_to_le16(sizeof(req.ht));
-	if (sta && sta->deflink.ht_cap.ht_supported)
-		req.ht.ht_cap = cpu_to_le16(sta->deflink.ht_cap.cap);
-
-	/* STA_REC_VHT_INFO (tag=0x0A) — VHT 能力
-	 * MT6639: nicUniCmdStaRecTagVhtInfo() — 仅当 vht_cap 非零时发送
-	 * 5GHz 必需, 2.4GHz 可选 */
-	req.vht.tag = cpu_to_le16(STA_REC_VHT);
-	req.vht.len = cpu_to_le16(sizeof(req.vht));
-	if (sta && sta->deflink.vht_cap.vht_supported) {
-		req.vht.vht_cap = cpu_to_le32(sta->deflink.vht_cap.cap);
-		req.vht.vht_rx_mcs_map = cpu_to_le16(
-			sta->deflink.vht_cap.vht_mcs.rx_mcs_map);
-		req.vht.vht_tx_mcs_map = cpu_to_le16(
-			sta->deflink.vht_cap.vht_mcs.tx_mcs_map);
-	}
-
-	/* STA_REC_PHY (tag=0x15) — PHY type + basic rate set
-	 * MT6639 固件使用自己的 PHY 枚举:
-	 *   HR_DSSS=BIT(0), ERP=BIT(1), OFDM=BIT(2), HT=BIT(3), VHT=BIT(4)
-	 * 来源: mt6639-analyst 确认的 MT6639 固件值 */
-	req.phy.tag = cpu_to_le16(STA_REC_PHY);
-	req.phy.len = cpu_to_le16(sizeof(req.phy));
-	if (dev->hw && dev->hw->conf.chandef.chan) {
-		enum nl80211_band band = dev->hw->conf.chandef.chan->band;
-
-		if (band == NL80211_BAND_5GHZ) {
-			/* 5GHz: OFDM|HT|VHT = BIT(2)|BIT(3)|BIT(4) = 0x1C */
-			req.phy.phy_type = 0x1C;
-			/* OFDM mandatory rates: 6/12/24 Mbps */
-			req.phy.basic_rate = cpu_to_le16(0x0150);
-		} else {
-			/* 2.4GHz: HR_DSSS|ERP|OFDM|HT = 0x0F */
-			req.phy.phy_type = 0x0F;
-			/* CCK basic rates: 1/2/5.5/11 Mbps */
-			req.phy.basic_rate = cpu_to_le16(0x000F);
-		}
-	} else {
-		/* fallback: 5GHz */
-		req.phy.phy_type = 0x1C;
-		req.phy.basic_rate = cpu_to_le16(0x0150);
-	}
-
-	/* STA_REC_BA_OFFLOAD (tag=0x16) — BA 卸载
-	 * Windows RE: 0x14014e5b0, 始终发送 (即使全零)
-	 * auth 阶段无 BA session, 全部为 0 */
+	/* [8] STA_REC_BA_OFFLOAD (tag=0x16) */
 	req.ba.tag = cpu_to_le16(STA_REC_BA_OFFLOAD);
 	req.ba.len = cpu_to_le16(sizeof(req.ba));
-	/* All fields default to 0 for auth phase — no BA sessions yet */
 
-	/* STA_REC_HE_6G_CAP (tag=0x17) — HE 6GHz band capabilities
-	 * Windows RE: FUN_14014dae0, 条件发送 (仅当 he_6g_cap != 0)
-	 * auth 阶段全零, 但 Windows 始终发送 tag+len header */
-	req.he6g.tag = cpu_to_le16(STA_REC_HE_6G_CAP);
-	req.he6g.len = cpu_to_le16(sizeof(req.he6g));
-	/* he_6g_cap defaults to 0 — filled when 6GHz STA has capabilities */
-
-	/* STA_REC_HE_BASIC (tag=0x19) — HE 基础能力
-	 * MT6639 和 Windows 均发送此 TLV，固件需要以配置 HE WTBL 条目
-	 * MT6639 hardcoded pkt_ext=2 for mobile chips */
-	req.he.tag = cpu_to_le16(STA_REC_HE_BASIC);
-	req.he.len = cpu_to_le16(sizeof(req.he));
-	if (sta && sta->deflink.he_cap.has_he) {
-		memcpy(req.he.mac_cap,
-		       sta->deflink.he_cap.he_cap_elem.mac_cap_info,
-		       sizeof(req.he.mac_cap));
-		memcpy(req.he.phy_cap,
-		       sta->deflink.he_cap.he_cap_elem.phy_cap_info,
-		       sizeof(req.he.phy_cap));
-		req.he.rx_mcs_80 =
-			sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80;
-		req.he.rx_mcs_160 =
-			sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_160;
-		req.he.rx_mcs_80p80 =
-			sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80p80;
-	}
-	req.he.pkt_ext = 2; /* MT6639 hardcoded for mobile */
-
-	/* STA_REC_MLD_SETUP (tag=0x20) — MLD setup
-	 * Windows RE: MLD_SETUP_builder (0x14014ddc0), 始终发送
-	 * 变长 TLV — 非 MLO 连接时最小 20B, 全零
-	 * 包含 link entries 循环, auth 阶段无 MLO, 全零 */
-	req.mld.tag = cpu_to_le16(STA_REC_MLD_SETUP);
-	req.mld.len = cpu_to_le16(sizeof(req.mld));
-	/* All fields default to 0 for auth phase — no MLO setup */
-
-	/* STA_REC_EHT_MLD (tag=0x21) — EHT MLD info
-	 * Windows RE: EHT_MLD_builder (0x14014e2a0), Agent B 确认
-	 * 常量 0x00100021 → tag=0x21, len=0x10 (16B)
-	 * auth 阶段全零 */
-	req.eht_mld.tag = cpu_to_le16(STA_REC_EHT_MLD);
-	req.eht_mld.len = cpu_to_le16(sizeof(req.eht_mld));
-	/* All fields default to 0 for auth phase */
-
-	/* STA_REC_EHT (tag=0x22) — EHT capabilities
-	 * Windows RE: FUN_14014db80, Agent A + B 确认
-	 * 常量 0x280022 → tag=0x22, len=0x28 (40B)
-	 * offset 0x04 固定 0xFF, 其余从 STA 记录复制
-	 * auth 阶段: 只有 const_ff=0xFF, 其余全零 */
-	req.eht.tag = cpu_to_le16(STA_REC_EHT);
-	req.eht.len = cpu_to_le16(sizeof(req.eht));
-	req.eht.const_ff = 0xFF; /* Windows RE: 固定值 */
-	/* eht_cap and eht_data default to 0 for auth phase */
-
-	/* STA_REC_UAPSD (tag=0x24) — UAPSD 省电
-	 * Windows RE: 0x14014e620, 始终发送 (即使全零)
-	 * auth 阶段无 UAPSD, 全部为 0 */
+	/* [9] STA_REC_UAPSD (tag=0x24) */
 	req.uapsd.tag = cpu_to_le16(STA_REC_UAPSD);
 	req.uapsd.len = cpu_to_le16(sizeof(req.uapsd));
-	/* All fields default to 0 for auth phase */
+
+	/* [10] STA_REC_EHT (tag=0x22) */
+	req.eht.tag = cpu_to_le16(STA_REC_EHT);
+	req.eht.len = cpu_to_le16(sizeof(req.eht));
+	req.eht.const_ff = 0xFF;
+
+	/* [11] STA_REC_EHT_MLD (tag=0x21) */
+	req.eht_mld.tag = cpu_to_le16(STA_REC_EHT_MLD);
+	req.eht_mld.len = cpu_to_le16(sizeof(req.eht_mld));
+
+	/* [12] STA_REC_MLD_SETUP (tag=0x20) */
+	req.mld.tag = cpu_to_le16(STA_REC_MLD_SETUP);
+	req.mld.len = cpu_to_le16(sizeof(req.mld));
 
 	dev_info(&dev->pdev->dev,
 		 "mcu: STA_REC wcid=%d conn_state=%d state=%d enable=%d "
@@ -3347,24 +3268,11 @@ static void mt7927_mac80211_tx(struct ieee80211_hw *hw,
 				 hdr->addr1, skb->len,
 				 wcid ? wcid->idx : -1);
 
-			/* Ring 0 CT mode — Ring 2 SF tested but firmware
-			 * silently drops (no TXFREE). Ring 0 CT at least
-			 * returns TXFREE, enabling diagnosis.
-			 * mt7927_tx_queue_skb → mt7927_mac_write_txwi(is_mgmt=true)
-			 * DW1 now includes TGID=band_idx for correct band routing */
-			if (!dev->ring_tx0.desc) {
-				dev_err(&dev->pdev->dev, "TX mgmt: ring_tx0 not initialized!\n");
-				dev_kfree_skb(skb);
-				return;
-			}
-			ret = mt7927_tx_queue_skb(dev, &dev->ring_tx0, skb, wcid);
-			if (ret) {
-				dev_err(&dev->pdev->dev, "TX mgmt: queue_skb failed: %d\n", ret);
-				dev_kfree_skb(skb);
-				return;
-			}
-			mt7927_tx_kick(dev, &dev->ring_tx0);
-			return;
+			/* Session 30 实验: 切回 Ring 0 CT mode
+			 * Ring 2 SF 帧卡在 DMASHDL (PKT count+1 但 MIB=0)
+			 * Ring 0 CT 之前能到 LMAC (MIB TX_OK=30)
+			 * 现在 BSS_INFO 有完整 16 TLV + STA_REC 13 TLV
+			 * 测试: 完整 TLV 配置下 Ring 0 CT 是否能成功 */
 		}
 
 		dev_info(&dev->pdev->dev,
@@ -3819,26 +3727,23 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 	struct ieee80211_channel *chan;
 	u16 duration = info->duration ? info->duration : 1000; /* 默认 1 秒 */
-	/* ROC TLV 结构 — 匹配 mt7925/mcu.h UNI_ROC_ACQUIRE 布局 */
+	/* CH_PRIVILEGE TLV — 旧格式 (ROC_GRANT 正常返回) */
 	struct {
-		u8 rsv[4];              /* UniCmd body 通用头 */
-		__le16 tag;             /* +0: UNI_ROC_ACQUIRE = 0 */
-		__le16 len;             /* +2 */
-		u8 bss_idx;             /* +4 */
-		u8 tokenid;             /* +5 */
-		u8 control_channel;     /* +6: chan->hw_value */
-		u8 sco;                 /* +7: 0 */
-		u8 band;                /* +8: 0=2.4G, 1=5G */
-		u8 bw;                  /* +9: 0=20MHz */
-		u8 center_chan;          /* +10: = control_channel */
-		u8 center_chan2;         /* +11: 0 */
-		u8 bw_from_ap;          /* +12: 0 */
-		u8 center_chan_from_ap;  /* +13: 0 */
-		u8 center_chan2_from_ap; /* +14: 0 */
-		u8 reqtype;             /* +15: 0 = JOIN */
-		__le32 maxinterval;     /* +16: duration (ms) */
-		u8 dbdcband;            /* +20: 0xfe (BAND_ALL) */
-		u8 pad[3];              /* +21: padding */
+		u8 rsv[4];
+		__le16 tag;
+		__le16 len;
+		u8 bss_idx;
+		u8 tokenid;
+		u8 control_channel;
+		u8 band;
+		u8 bw;
+		u8 bw_from_ap;
+		u8 center_chan;
+		u8 center_chan_from_ap;
+		u8 reqtype;
+		u8 dbdcband;
+		u8 pad[2];
+		__le32 maxinterval;
 	} __packed req = {0};
 
 	/* 获取频道 — 优先从 vif BSS conf 获取 */
@@ -3852,23 +3757,57 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	}
 
 	/* === Windows 流程对齐: BSS 配置在 ROC 之前 ===
-	 * Windows: DEV_INFO → BssActivateCtrl → PM_DISABLE → BSS_INFO → ChPrivilege(ROC) → STA_REC
-	 * 之前我们在 ROC_GRANT 之后才发所有 MCU 命令, 导致固件处理 ChPrivilege 时
-	 * 没有已激活的 BSS 上下文. 现在: 先推导 band_idx → 配置 BSS → 再申请信道 */
+	 * Windows RE: ChipConfig → DEV_INFO → BssActivateCtrl → PM_DISABLE
+	 *   → BSS_INFO(13 TLV) → BSS_RLM(3 TLV) → SCAN_CANCEL → CH_PRIVILEGE → STA_REC */
 	if (mvif->band_idx == 0xff) {
-		/* 从信道推导 band_idx (DBDC: 0=2.4G, 1=5G) */
 		mvif->band_idx = (chan->band == NL80211_BAND_5GHZ) ? 1 : 0;
 		dev_info(&dev->pdev->dev,
 			 "mgd_prepare_tx: derived band_idx=%u from ch=%u\n",
 			 mvif->band_idx, chan->hw_value);
 
-		/* 重发 DEV_INFO + BSS_INFO with 正确 band_idx.
-		 * add_interface 时 band=0xFF, 现在用真实值覆盖.
-		 * BSS_INFO(enable) 内部会触发 BssActivateCtrl (因 band!=0xFF),
-		 * BssActivateCtrl link_idx=band_idx 让固件设置正确的 WTBL BAND.
-		 * 不做 destroy+recreate — 直接覆盖更新, 避免扫描退化. */
+		/* [0] ChipConfig — Windows 每次 connect 都重发 */
+		mt7927_mcu_chip_config(dev);
+		/* [1] DEV_INFO + [2] BssActivateCtrl (BASIC+MLD) */
 		mt7927_mcu_uni_add_dev(dev, vif, true);
+		mt7927_mcu_bss_activate(dev, vif);
+		/* [3] PM_DISABLE */
+		mt7927_mcu_bss_pm_disable(dev, mvif->bss_idx);
+		/* [4] BSS_INFO full 13 TLV (Windows dispatch table order) */
 		mt7927_mcu_add_bss_info(dev, vif, true);
+		/* [4.5] BSS_RLM — RLM+PROTECT+IFS_TIME (Windows: nicUniCmdSetBssRlm)
+		 * win_re_full_connect_cmd_sequence.md: dispatch entry 17 (outer=0x19)
+		 * win_tx_connection_flow.md: "STA 模式通过 ROC + BSS_INFO_RLM 配置信道"
+		 * RLM TLV 告诉固件 BSS 操作信道/带宽/频段 — 没有它固件不配置 RX 路由 */
+		mt7927_mcu_set_bss_rlm(dev, vif);
+	}
+
+	/* Session 34: Windows 在 BSS_INFO full 和 CH_PRIVILEGE 之间发 SCAN_CANCEL
+	 * Windows RE (win_re_connect_flow.md):
+	 *   [4] BSS_INFO full → [5] SCAN_CANCEL → [6] CH_PRIVILEGE
+	 * 无条件发送: scan_done 事件已清除 MT7927_SCANNING bit,
+	 * 但固件内部可能仍保持 scan 上下文 (RX 路径锁定在 scan mode)
+	 * 发送 SCAN_CANCEL 确保固件释放 scan 资源并恢复正常 RX */
+	{
+		int ret;
+		dev_info(&dev->pdev->dev,
+			 "mgd_prepare_tx: sending SCAN_CANCEL before ROC (Windows RE step 5)\n");
+		ret = mt7927_mcu_cancel_hw_scan(dev, vif);
+		dev_info(&dev->pdev->dev,
+			 "mgd_prepare_tx: SCAN_CANCEL ret=%d\n", ret);
+		msleep(20);
+	}
+
+	/* DIAG: MIB RX 基线 (50ms 采样) */
+	{
+		u32 b0_mdrdy, b1_mdrdy;
+		(void)mt7927_rr(dev, MT_MIB_RSCR26(0));
+		(void)mt7927_rr(dev, MT_MIB_RSCR26(1));
+		msleep(50);
+		b0_mdrdy = mt7927_rr(dev, MT_MIB_RSCR26(0));
+		b1_mdrdy = mt7927_rr(dev, MT_MIB_RSCR26(1));
+		dev_info(&dev->pdev->dev,
+			 "PRE-ROC MIB (50ms): B0_MDRDY=%u B1_MDRDY=%u\n",
+			 b0_mdrdy, b1_mdrdy);
 	}
 
 	req.tag = cpu_to_le16(0);  /* UNI_ROC_ACQUIRE */
@@ -3876,14 +3815,13 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	req.bss_idx = mvif->bss_idx;
 	req.control_channel = chan->hw_value;
 	req.bw = 0;  /* CMD_CBW_20MHZ */
-	req.bw_from_ap = 0;  /* CMD_CBW_20MHZ */
+	req.bw_from_ap = 0;
 	req.center_chan = chan->hw_value;
 	req.center_chan_from_ap = chan->hw_value;
 	req.reqtype = 0;  /* JOIN */
-	req.dbdcband = 0xff;  /* MT6639 用 ENUM_BAND_AUTO=0xFF */
+	req.dbdcband = 0xff;  /* ENUM_BAND_AUTO */
 	req.maxinterval = cpu_to_le32(duration);
 
-	/* band 映射: mt7925 用 1=2.4G, 2=5G, 3=6G */
 	switch (chan->band) {
 	case NL80211_BAND_5GHZ:
 		req.band = 2;
@@ -3965,6 +3903,11 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 			 "mgd_prepare_tx: ROC grant received, band_idx=%u\n",
 			 mvif->band_idx);
 
+		/* Session 36: CHANNEL_SWITCH + RX_PATH 已移除!
+		 * Windows RE 确认: connect 流程不发 CHANNEL_SWITCH/RX_PATH.
+		 * 固件通过 ROC 自动处理信道切换和 RX 启用.
+		 * 这些多余命令可能与 ROC 冲突, 破坏固件 RX 状态机. */
+
 		/* STA_REC 在 ROC_GRANT 后发送 (匹配 Windows: ChPrivilege 后才发 STA_REC).
 		 * 固件创建 WTBL 条目. AP STA 在 sta_state 时分配在 wcid[1] */
 		if (dev->wcid[1]) {
@@ -3980,30 +3923,66 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 					      CONN_STATE_CONNECT);
 		}
 
-		/* ROC 信道切换后重发 RX filter，确保固件接收单播管理帧 (Auth-2 等)
-		 * Windows 在连接流程中于 BSS_INFO/STA_REC 之后调用 MtCmdSetCurrentPacketFilter
-		 * filter = 0x0B = DIRECTED(0x01)|MULTICAST(0x02)|BROADCAST(0x08) */
+		/* RX_FILTER — Windows RE: caller3 (0x1400b5ca4) 在 STA_REC 后发送
+		 * 不依赖 mac80211 configure_filter 回调时机 */
 		mt7927_mcu_set_rx_filter(dev, 0x0B);
 
-		/* DIAG: snapshot RX ring DIDX before auth — check if firmware delivers
-		 * any frames after ROC_GRANT. If DIDX doesn't change during auth,
-		 * firmware's RX path is completely dead (not just filtering) */
+		/* DIAG: full WFDMA register dump */
 		{
+			u32 r4_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(4));
+			u32 r4_cnt = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(4));
+			u32 r4_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(4));
 			u32 r4_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(4));
 			u32 r6_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
 			u32 r7_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+			u32 glo_cfg = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
+			u32 ext0 = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT0);
+			u32 ext1 = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT1);
+			u32 r4_ext = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4));
+			u32 r6_ext = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6));
+			u32 r7_ext = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7));
+			u32 r4_pause = mt7927_rr(dev, MT_WPDMA_PAUSE_RX_Q_TH(4));
+			u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
+			u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+			u32 busy = mt7927_rr(dev, MT_CONN_HIF_BUSY_STATUS);
+			u32 rx_pri = mt7927_rr(dev, MT_WFDMA_INT_RX_PRI);
+			u32 glo2 = mt7927_rr(dev, MT_WPDMA2HOST_ERR_INT_STA);
 			dev_info(&dev->pdev->dev,
-				 "PRE-AUTH RX DIDX: R4=%u R6=%u R7=%u\n",
-				 r4_didx, r6_didx, r7_didx);
+				 "PRE-AUTH Ring4: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u | R6=%u R7=%u\n",
+				 r4_base, r4_cnt, r4_cidx, r4_didx,
+				 r6_didx, r7_didx);
+			dev_info(&dev->pdev->dev,
+				 "WFDMA: GLO=0x%08x EXT0=0x%08x EXT1=0x%08x\n",
+				 glo_cfg, ext0, ext1);
+			dev_info(&dev->pdev->dev,
+				 "RX_EXT_CTRL: R4=0x%08x R6=0x%08x R7=0x%08x PAUSE_R4=0x%08x\n",
+				 r4_ext, r6_ext, r7_ext, r4_pause);
+			dev_info(&dev->pdev->dev,
+				 "INT: ENA=0x%08x STA=0x%08x BUSY=0x%08x RX_PRI=0x%08x ERR=0x%08x\n",
+				 int_ena, int_sta, busy, rx_pri, glo2);
+			/* PLE FREEPG + HIF 状态 (CODA 验证地址) */
+			{
+				u32 fpg = mt7927_rr(dev, 0x083a0);  /* PLE_FREEPG_CNT */
+				u32 hpg = mt7927_rr(dev, 0x083a8);  /* PLE_HIF_PG_INFO */
+				u32 hgp = mt7927_rr(dev, 0x0800c);  /* PLE_PG_HIF_GROUP */
+				u32 fse = mt7927_rr(dev, 0x08008);  /* PLE_FREEPG_START_END */
+				dev_info(&dev->pdev->dev,
+					 "PLE: FREEPG=0x%08x (free=%u ffa=%u) "
+					 "HIF_PG=0x%08x (src=%u rsv=%u) "
+					 "HIF_GRP=0x%08x (max=%u min=%u) "
+					 "START_END=0x%08x\n",
+					 fpg, fpg & 0xfff, (fpg >> 16) & 0xfff,
+					 hpg, (hpg >> 16) & 0xfff, hpg & 0xfff,
+					 hgp, (hgp >> 16) & 0xfff, hgp & 0xfff,
+					 fse);
+			}
 		}
 
-		/* CHANNEL_SWITCH after ROC_GRANT — configure LMAC TX path
-		 * ROC establishes presence on channel, but CHANNEL_SWITCH
-		 * configures the firmware's TX LMAC for the operating band.
-		 * Without this, firmware may not route TX to the correct radio.
-		 * Previously removed "因为没有效果", but that was before DW1
-		 * TGID fix — re-adding to test combined effect. */
-		mt7927_mcu_set_chan_info(dev, chan, UNI_CHANNEL_SWITCH);
+		/* Session 31: CHANNEL_SWITCH 移除!
+		 * 空口抓包证明 TX 已经成功 (Auth-1 on air, AP 回 Auth-2)
+		 * 但 CHANNEL_SWITCH 返回 0xc00000bb 错误!
+		 * 可能与 ROC 冲突, 破坏了 RX 路径
+		 * mt7925 STA 模式也不发 CHANNEL_SWITCH, 只用 ROC */
 
 		/* 诊断: dump WTBL WLAN_IDX=0 和 1 (L1 remap 直接读) */
 		mt7927_dump_wtbl(dev, 0);
@@ -4026,6 +4005,17 @@ static void mt7927_mgd_complete_tx(struct ieee80211_hw *hw,
 		u8 dbdcband;    /* 0xff = auto */
 		u8 rsv2[5];
 	} __packed req = {0};
+
+	/* Session 31 DIAG: POST-AUTH RX ring state */
+	{
+		u32 r4d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(4));
+		u32 r6d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
+		u32 r7d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+		dev_info(&dev->pdev->dev,
+			 "POST-AUTH RX DIDX: R4=%u R6=%u R7=%u INT_STA=0x%08x\n",
+			 r4d, r6d, r7d, int_sta);
+	}
 
 	/* Fix 4: 只在 ROC 活跃时发 abort
 	 * mt7925 用 test_and_clear_bit(MT76_STATE_ROC)
