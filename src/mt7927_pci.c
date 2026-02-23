@@ -1191,7 +1191,7 @@ static void mt7927_wpdma_config(struct mt7927_dev *dev, bool enable)
 		/* Windows 关键位 (来自团队修复) */
 		val |= MT_GLO_CFG_TX_WB_DDONE;                  /* BIT(6) */
 		val |= MT_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN;   /* BIT(15) - 预取链使能 */
-		val |= MT_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;          /* BIT(20) */
+		val &= ~MT_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;         /* BIT(20): REV4 显式清除 — Windows 不设此位 */
 		val |= MT_GLO_CFG_OMIT_RX_INFO_PFET2;           /* BIT(21) */
 		val |= MT_GLO_CFG_ADDR_EXT_EN;                  /* BIT(26) */
 		val |= MT_GLO_CFG_OMIT_TX_INFO;                 /* BIT(28) */
@@ -1777,6 +1777,10 @@ static int mt7927_post_fw_init(struct mt7927_dev *dev)
 		 mt7927_rr(dev, 0x02500),  /* MCU_RX0 BASE */
 		 mt7927_rr(dev, MT_WFDMA_HOST_INT_STA),
 		 mt7927_rr(dev, MT_MCU_CMD_REG));
+	dev_info(&dev->pdev->dev,
+		 "PostFwInit MDP: DCR0=0x%08x DCR1=0x%08x\n",
+		 mt7927_rr(dev, MT_MDP_DCR0),
+		 mt7927_rr(dev, MT_MDP_DCR1));
 
 	dev_info(&dev->pdev->dev, "===== PostFwDownloadInit 完成 =====\n");
 	return 0;
@@ -2132,6 +2136,32 @@ static void mt7927_mac_init_band(struct mt7927_dev *dev, u8 band)
 	val = FIELD_PREP(MT_WTBLOFF_TOP_RSCR_RCPI_MODE, 0) |
 	      FIELD_PREP(MT_WTBLOFF_TOP_RSCR_RCPI_PARAM, 0x3);
 	mt7927_rmw(dev, MT_WTBLOFF_TOP_RSCR(band), mask, val);
+
+	/* MDP BNRCFR: Route all RX frame types to HIF (Host) instead of WM (MCU)
+	 * 来源: mt7925/init.c mt792x_mac_init_band()
+	 * 没有此配置 → 固件将所有 RX 帧路由到 MCU 内部处理
+	 * → Ring 4 DIDX=0 (Host 永远收不到帧!) */
+	dev_info(&dev->pdev->dev,
+		 "band%d BNRCFR BEFORE: CFR0=0x%08x CFR1=0x%08x\n",
+		 band,
+		 mt7927_rr(dev, MT_MDP_BNRCFR0(band)),
+		 mt7927_rr(dev, MT_MDP_BNRCFR1(band)));
+
+	/* 所有值 = MT_MDP_TO_HIF = 0, 所以只需清除对应位域 */
+	mt7927_rmw(dev, MT_MDP_BNRCFR0(band),
+		   MT_MDP_RCFR0_MCU_RX_MGMT |
+		   MT_MDP_RCFR0_MCU_RX_CTL_NON_BAR |
+		   MT_MDP_RCFR0_MCU_RX_CTL_BAR, 0);
+	mt7927_rmw(dev, MT_MDP_BNRCFR1(band),
+		   MT_MDP_RCFR1_MCU_RX_BYPASS |
+		   MT_MDP_RCFR1_RX_DROPPED_UCAST |
+		   MT_MDP_RCFR1_RX_DROPPED_MCAST, 0);
+
+	dev_info(&dev->pdev->dev,
+		 "band%d BNRCFR AFTER: CFR0=0x%08x CFR1=0x%08x\n",
+		 band,
+		 mt7927_rr(dev, MT_MDP_BNRCFR0(band)),
+		 mt7927_rr(dev, MT_MDP_BNRCFR1(band)));
 }
 
 /* --- 速率表初始化 --- */
@@ -2218,6 +2248,10 @@ static void mt7927_mac_init(struct mt7927_dev *dev)
 	/* 4. 基本速率表 */
 	mt7927_mac_init_basic_rates(dev);
 
+	dev_info(&dev->pdev->dev,
+		 "mac_init MDP after writes: DCR0=0x%08x DCR1=0x%08x\n",
+		 mt7927_rr(dev, MT_MDP_DCR0),
+		 mt7927_rr(dev, MT_MDP_DCR1));
 	dev_info(&dev->pdev->dev,
 		 "mac_init: MDP + WTBL(%d) + band(0,1) + rate_table done\n",
 		 MT7927_WTBL_SIZE);
@@ -2476,7 +2510,7 @@ static int mt7927_mcu_bss_activate(struct mt7927_dev *dev,
 	/* BASIC TLV — 与 full BSS_INFO 相同字段, 但 conn_state=1(activate) */
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.active = mvif->bss_idx;
+	req.basic.active = 1;  /* Windows RE: enable flag (boolean), NOT bss_idx! */
 	req.basic.omac_idx = mvif->omac_idx;
 	req.basic.hw_bss_idx = mvif->omac_idx;
 	/* mt7925 uses actual band_idx, NOT 0xff.
@@ -2560,7 +2594,7 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 	/* === [0] BSS_BASIC TLV (tag=0) === */
 	req.basic.tag = cpu_to_le16(UNI_BSS_INFO_BASIC);
 	req.basic.len = cpu_to_le16(sizeof(req.basic));
-	req.basic.active = mvif->bss_idx;
+	req.basic.active = enable;  /* Windows RE: enable flag (boolean), NOT bss_idx! */
 	req.basic.omac_idx = mvif->omac_idx;
 	req.basic.hw_bss_idx = mvif->omac_idx;
 	req.basic.band_idx = mvif->band_idx;
@@ -2695,19 +2729,21 @@ static int mt7927_mcu_set_bss_rlm(struct mt7927_dev *dev,
 	if (chan) {
 		req.rlm.control_channel = chan->hw_value;
 		req.rlm.center_chan = chan->hw_value;
-		req.rlm.bw = 0;  /* 20MHz */
+		req.rlm.bw = 1;  /* Windows RE: 20MHz=0x01 (映射表 0→1,1→2,2→3,3→6,4→7) */
 		req.rlm.tx_streams = 2;
 		req.rlm.rx_streams = 2;
 		req.rlm.ht_op_info = 4;
+		/* Windows RE: band encoding 0-based (DBDC convention)
+		 * 0=2.4GHz, 1=5GHz, 2=6GHz */
 		switch (chan->band) {
 		case NL80211_BAND_5GHZ:
-			req.rlm.band = 2;
+			req.rlm.band = 1;
 			break;
 		case NL80211_BAND_6GHZ:
-			req.rlm.band = 3;
+			req.rlm.band = 2;
 			break;
 		default:
-			req.rlm.band = 1;
+			req.rlm.band = 0;
 			break;
 		}
 	}
@@ -2793,14 +2829,10 @@ static int mt7927_mcu_sta_update(struct mt7927_dev *dev,
 	else
 		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
 
-	if (enable) {
-		req.basic.conn_state = CONN_STATE_CONNECT;
-		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER |
-						   EXTRA_INFO_NEW);
-	} else {
-		req.basic.conn_state = CONN_STATE_DISCONNECT;
-		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
-	}
+	/* Windows RE: +0x08 = new_entry (硬编码=1), +0x12 = extra_info (硬编码=3)
+	 * Windows 始终填 1 和 0x03, 不区分 enable/disable */
+	req.basic.conn_state = 1;  /* new_entry = 1 (always) */
+	req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER | EXTRA_INFO_NEW);
 
 	if (sta) {
 		req.basic.qos = sta->wme;
@@ -3524,12 +3556,16 @@ static int mt7927_sta_state(struct ieee80211_hw *hw,
 	 * if ANY frames arrived during the auth attempt */
 	if (old_state == IEEE80211_STA_NONE &&
 	    new_state == IEEE80211_STA_NOTEXIST) {
-		u32 r4 = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(4));
-		u32 r6 = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
-		u32 r7 = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
-		dev_info(&dev->pdev->dev,
-			 "POST-AUTH RX DIDX: R4=%u R6=%u R7=%u\n",
-			 r4, r6, r7);
+		int i;
+		for (i = 0; i < 8; i++) {
+			u32 base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(i));
+			u32 cnt  = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(i));
+			u32 cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(i));
+			u32 didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(i));
+			dev_info(&dev->pdev->dev,
+				 "AUTH-FAIL RX Ring %d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
+				 i, base, cnt, cidx, didx);
+		}
 	}
 
 	/* NOTEXIST → NONE: 分配 WCID + 通知固件 */
@@ -3927,36 +3963,30 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 		 * 不依赖 mac80211 configure_filter 回调时机 */
 		mt7927_mcu_set_rx_filter(dev, 0x0B);
 
-		/* DIAG: full WFDMA register dump */
+		/* DIAG: full WFDMA register dump — Ring 0-7 snapshot */
 		{
-			u32 r4_base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(4));
-			u32 r4_cnt = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(4));
-			u32 r4_cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(4));
-			u32 r4_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(4));
-			u32 r6_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
-			u32 r7_didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+			int i;
 			u32 glo_cfg = mt7927_rr(dev, MT_WPDMA_GLO_CFG);
 			u32 ext0 = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT0);
 			u32 ext1 = mt7927_rr(dev, MT_WPDMA_GLO_CFG_EXT1);
-			u32 r4_ext = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(4));
-			u32 r6_ext = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(6));
-			u32 r7_ext = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(7));
-			u32 r4_pause = mt7927_rr(dev, MT_WPDMA_PAUSE_RX_Q_TH(4));
 			u32 int_ena = mt7927_rr(dev, MT_WFDMA_HOST_INT_ENA);
 			u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
 			u32 busy = mt7927_rr(dev, MT_CONN_HIF_BUSY_STATUS);
 			u32 rx_pri = mt7927_rr(dev, MT_WFDMA_INT_RX_PRI);
 			u32 glo2 = mt7927_rr(dev, MT_WPDMA2HOST_ERR_INT_STA);
-			dev_info(&dev->pdev->dev,
-				 "PRE-AUTH Ring4: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u | R6=%u R7=%u\n",
-				 r4_base, r4_cnt, r4_cidx, r4_didx,
-				 r6_didx, r7_didx);
+			for (i = 0; i < 8; i++) {
+				u32 base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(i));
+				u32 cnt  = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(i));
+				u32 cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(i));
+				u32 didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(i));
+				u32 extc = mt7927_rr(dev, MT_WFDMA_RX_RING_EXT_CTRL(i));
+				dev_info(&dev->pdev->dev,
+					 "PRE-AUTH RX Ring %d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u EXT=0x%08x\n",
+					 i, base, cnt, cidx, didx, extc);
+			}
 			dev_info(&dev->pdev->dev,
 				 "WFDMA: GLO=0x%08x EXT0=0x%08x EXT1=0x%08x\n",
 				 glo_cfg, ext0, ext1);
-			dev_info(&dev->pdev->dev,
-				 "RX_EXT_CTRL: R4=0x%08x R6=0x%08x R7=0x%08x PAUSE_R4=0x%08x\n",
-				 r4_ext, r6_ext, r7_ext, r4_pause);
 			dev_info(&dev->pdev->dev,
 				 "INT: ENA=0x%08x STA=0x%08x BUSY=0x%08x RX_PRI=0x%08x ERR=0x%08x\n",
 				 int_ena, int_sta, busy, rx_pri, glo2);
@@ -4006,15 +4036,21 @@ static void mt7927_mgd_complete_tx(struct ieee80211_hw *hw,
 		u8 rsv2[5];
 	} __packed req = {0};
 
-	/* Session 31 DIAG: POST-AUTH RX ring state */
+	/* DIAG: POST-AUTH RX ring 0-7 state */
 	{
-		u32 r4d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(4));
-		u32 r6d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(6));
-		u32 r7d = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(7));
+		int i;
 		u32 int_sta = mt7927_rr(dev, MT_WFDMA_HOST_INT_STA);
+		for (i = 0; i < 8; i++) {
+			u32 base = mt7927_rr(dev, MT_WPDMA_RX_RING_BASE(i));
+			u32 cnt  = mt7927_rr(dev, MT_WPDMA_RX_RING_CNT(i));
+			u32 cidx = mt7927_rr(dev, MT_WPDMA_RX_RING_CIDX(i));
+			u32 didx = mt7927_rr(dev, MT_WPDMA_RX_RING_DIDX(i));
+			dev_info(&dev->pdev->dev,
+				 "POST-AUTH RX Ring %d: BASE=0x%08x CNT=%u CIDX=%u DIDX=%u\n",
+				 i, base, cnt, cidx, didx);
+		}
 		dev_info(&dev->pdev->dev,
-			 "POST-AUTH RX DIDX: R4=%u R6=%u R7=%u INT_STA=0x%08x\n",
-			 r4d, r6d, r7d, int_sta);
+			 "POST-AUTH INT_STA=0x%08x\n", int_sta);
 	}
 
 	/* Fix 4: 只在 ROC 活跃时发 abort

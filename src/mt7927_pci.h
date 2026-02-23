@@ -466,8 +466,25 @@
 #define MT_MDP_BAR0                  0x00e800
 #define MT_MDP_DCR0                  (MT_MDP_BAR0 + 0x000)
 #define MT_MDP_DCR0_DAMSDU_EN        BIT(15)
+#define MT_MDP_DCR0_RX_HDR_TRANS_EN  BIT(19)
 #define MT_MDP_DCR1                  (MT_MDP_BAR0 + 0x004)
 #define MT_MDP_DCR1_MAX_RX_LEN       GENMASK(15, 3)
+
+/* MDP BNRCFR — Band N RX Config Frame Routing
+ * 控制每种帧类型路由到 HIF(Host) 还是 WM(MCU)
+ * 来源: mt7925/regs.h (CONNAC3 共用) */
+#define MT_MDP_BNRCFR0(_band)        (MT_MDP_BAR0 + 0x090 + ((_band) << 8))
+#define MT_MDP_RCFR0_MCU_RX_MGMT          GENMASK(5, 4)
+#define MT_MDP_RCFR0_MCU_RX_CTL_NON_BAR   GENMASK(7, 6)
+#define MT_MDP_RCFR0_MCU_RX_CTL_BAR       GENMASK(9, 8)
+
+#define MT_MDP_BNRCFR1(_band)        (MT_MDP_BAR0 + 0x094 + ((_band) << 8))
+#define MT_MDP_RCFR1_MCU_RX_BYPASS        GENMASK(23, 22)
+#define MT_MDP_RCFR1_RX_DROPPED_UCAST     GENMASK(28, 27)
+#define MT_MDP_RCFR1_RX_DROPPED_MCAST     GENMASK(30, 29)
+
+#define MT_MDP_TO_HIF                0
+#define MT_MDP_TO_WM                 1
 
 /* Per-band register bases
  * Band 0: bus 0x820e4000 → BAR0 0x021000 (TMAC)

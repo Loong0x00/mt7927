@@ -1402,9 +1402,9 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 	}
 
 	default:
-		dev_dbg(&dev->pdev->dev,
-			"rx-unknown: q=%d type=%u flag=0x%x rxd0=0x%08x len=%u\n",
-			q, type, flag, rxd0, skb->len);
+		dev_info(&dev->pdev->dev,
+			 "rx-unknown: q=%d type=%u flag=0x%x rxd0=0x%08x len=%u\n",
+			 q, type, flag, rxd0, skb->len);
 		dev_kfree_skb(skb);
 		return;
 	}

@@ -26,6 +26,70 @@
 >    当前代码只处理 TXFREE 和 scan 结果，若固件通过 event 通知 RX ready 则被忽略。
 > 6. **新增第 9 节替代**: 修订后的执行顺序。
 >
+> **Rev 4 — Session 38 (2026-02-23) by Claude Opus (主 agent + 3 sub-agents 执行结果)**
+>
+> 本轮执行了 B1、A1、A5、A6、D3 五项任务，获得确定性结论。
+>
+> #### REV4 执行结果摘要
+>
+> 1. **B1 Ring 0-7 全套寄存器快照 — 确定性结论: 无 ring 映射错误**
+>    ```
+>    PRE-AUTH Ring 0: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0 EXT=0x00000000  ← 未配置
+>    PRE-AUTH Ring 1: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0 EXT=0x00000000  ← 未配置
+>    PRE-AUTH Ring 2: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0 EXT=0x00000000  ← 未配置
+>    PRE-AUTH Ring 3: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0 EXT=0x00000000  ← 未配置
+>    PRE-AUTH Ring 4: BASE=0x506d9000 CNT=256 CIDX=255 DIDX=0 EXT=0x00000008  ← 配置正确, DIDX=0
+>    PRE-AUTH Ring 5: BASE=0x00000000 CNT=512 CIDX=0 DIDX=0 EXT=0x00000000  ← 未配置
+>    PRE-AUTH Ring 6: BASE=0x4d8ce000 CNT=256 CIDX=112 DIDX=112 EXT=0x00800008  ← ✅ 工作中
+>    PRE-AUTH Ring 7: BASE=0x4db61000 CNT=256 CIDX=255 DIDX=0 EXT=0x01000004  ← 配置正确, DIDX=0
+>
+>    AUTH-FAIL Ring 4: DIDX=0 (不变)  Ring 6: DIDX=115 (+3, TXFREE)  Ring 7: DIDX=0 (不变)
+>    ```
+>    **结论**: 固件从未向 Ring 0-7 中的任何 ring 投递 WiFi 数据帧。不是 ring 编号映射错误。
+>    **B1 假设已排除**: 数据帧没有走 Ring 0 或 Ring 2（mt7925 的 ring layout），也没走任何其它 ring。
+>
+> 2. **A1 Windows WFDMA 寄存器审计 — 9 项匹配, 5 项差异**
+>    - ✅ 匹配: GLO_CFG_EXT0/EXT1, packed prefetch CFG0-3, PREFETCH_CTRL, 0xd6060, INT mask
+>    - ⚠️ 差异:
+>      - **GLO_CFG BIT(20) CSR_LBK_RX_Q_SEL_EN**: 我们设了, Windows 不设 → 可操作实验
+>      - **Per-ring EXT_CTRL**: 我们写了, Windows 不写 (auto-chain BIT(15)=1 时不需要)
+>      - GLO_CFG BIT(26) ADDR_EXT_EN: 我们设了, 低风险
+>    - **关键反证**: Ring 6 使用完全相同的 WFDMA 配置且正常 → WFDMA 配置不是根因
+>
+> 3. **A5 RX_EXT_CTRL 分析 — 格式正确但不必要**
+>    - R4 SRAM_BASE=0x0000 DEPTH=8, R6=0x0080/8, R7=0x0100/4 — 区域不重叠，格式正确
+>    - CODA 文档: "If BIT(15)=1 (auto-chain), firmware need to program EXT_CTRL instead" →
+>      auto-chain 模式下 per-ring EXT_CTRL 被忽略，我们多写了但无害
+>    - Ring 6 也有 EXT_CTRL 且正常 → **EXT_CTRL 不是根因**
+>
+> 4. **A6 Band→Ring 映射搜索 — 不存在**
+>    搜索 CODA 头文件、全部 RE 文档、43 个 consensus 报告 — 无 RX_RING_MAP、BAND_MAP、
+>    RX_DATA_RING 等寄存器。**Band→Ring 路由是固件内部逻辑**，通过 BSS/STA MCU 命令配置。
+>
+> 5. **D3 dev_dbg→dev_info — 无 rx-unknown 出现**
+>    auth 窗口内未出现任何 `rx-unknown` 日志，确认没有未知 PKT_TYPE 帧到达任何 ring。
+>
+> #### REV4 更新后的根因排序
+>
+> | 排名 | 假设 | 概率 | 依据 |
+> |------|------|------|------|
+> | **#1** | **BSS/STA 配置不完整 — 固件内部 RX 路由未建立** | **60%** | STA_PAUSE0=0x03000001 始终不变; 无任何 ring 收到数据帧; Band→Ring 路由是固件逻辑 |
+> | **#2** | **GLO_CFG BIT(20) CSR_LBK_RX_Q_SEL_EN 干扰** | **15%** | 我们设了 Windows 没设; 名字含 "RX_Q_SEL"; 可能重定向 RX 队列选择逻辑 |
+> | **#3** | **WFDMA_CFG MCU 命令 payload 含 RX 路由参数** | **10%** | {0x820cc800, 0x3c200} 指向 MDP_DCR0; 可能配置固件内部 RX 投递规则 |
+> | **#4** | **BSS_INFO BASIC 字段值错误 (phymode/packed_field)** | **10%** | 未与 Windows 二进制逐字节对比 |
+> | **#5** | **PostFwDownloadInit 遗漏步骤** | **5%** | 已做过多轮审计但仍可能有盲点 |
+>
+> #### REV4 下一步实验计划 (按优先级)
+>
+> | 优先级 | 实验 | 预估耗时 | 说明 |
+> |--------|------|----------|------|
+> | **P0** | 移除 GLO_CFG BIT(20) | 5 min | 最低成本, 唯一确认的 Windows 差异且名字相关 |
+> | **P0** | Auth 后读 MDP_DCR0/DCR1 (0x00e800/0x00e804) | 10 min | 看固件内部 RX 路由状态 |
+> | **P1** | BSS_INFO BASIC 逐字节与 Windows 二进制对比 | 1 hr | Ghidra 追踪 Windows 构建的 BASIC TLV 原始字节 |
+> | **P1** | WFDMA_CFG payload 位级分析 | 1-2 hr | 0x3c200 的位级含义 |
+> | **P2** | 移除全部 per-ring EXT_CTRL 写入 | 15 min | Windows 不写, 虽然 Ring 6 证明无害但排除干扰 |
+> | **P2** | PostFwDownloadInit 逐子步 Ghidra 深挖 | 2-4 hr | 收尾确认 |
+
 > **Rev 3 — Session 37 (2026-02-23) by Codex / GPT-5（代码+RE 交叉审阅增补）**
 >
 > 基于对当前代码（`src/`）、`docs/re/` 与 `tmp/re_results/consensus/` 的交叉检查，
