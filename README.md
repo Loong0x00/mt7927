@@ -115,6 +115,10 @@ src/
 
 早期开发过程中的笔记、计划和会话记录。`low_trust/` 子目录包含 mt6639 Android 驱动和 mt76 上游驱动的参考代码摘录，这些在开发过程中被证明**不可信**，仅保留供历史参考。
 
+### 致谢
+
+本项目 fork 自 [ehausig/mt7927](https://github.com/ehausig/mt7927)。原项目由 [@ehausig](https://github.com/ehausig) 发起，完成了 PCIe 设备绑定和基本固件加载的早期探索，并得出了关键结论：**MT7927 (MT6639) 与 MT7925 的寄存器空间完全不同（`0x7C0xxxxx` vs `0x7001xxxx`），修改 mt7925 驱动不可行，必须从零编写**。这一结论为本项目选择 Windows 逆向工程路线奠定了基础。
+
 ### 开发历程
 
 本项目在不到两周内完成，经历 44 个开发 session，全程使用 Claude Code：
@@ -247,6 +251,10 @@ Problem analysis and diagnostic records from the development process.
 #### `docs/archive/` — Archived Docs
 
 Early development notes, plans, and session records. The `low_trust/` subdirectory contains code excerpts from the mt6639 Android driver and mt76 upstream driver, which were proven **unreliable** during development and are kept only for historical reference.
+
+### Acknowledgments
+
+This project is forked from [ehausig/mt7927](https://github.com/ehausig/mt7927). The original project by [@ehausig](https://github.com/ehausig) performed early exploration of PCIe device binding and basic firmware loading, and reached a critical conclusion: **MT7927 (MT6639) has a completely different register space from MT7925 (`0x7C0xxxxx` vs `0x7001xxxx`), making it impossible to adapt the mt7925 driver — a from-scratch implementation is required.** This conclusion guided the decision to pursue Windows driver reverse engineering for this project.
 
 ### Development Timeline
 
