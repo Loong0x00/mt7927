@@ -2656,13 +2656,29 @@ static int mt7927_mcu_add_bss_info(struct mt7927_dev *dev,
 			cpu_to_le16(vif->bss_conf.beacon_int);
 		req.basic.dtim_period = vif->bss_conf.dtim_period;
 	}
+	/* S46 RE FIX: phymode 从 phy_mode_from_band (0x14014fdfc) 计算.
+	 * 关键: 5GHz 需要 bit2=11a(OFDM), 不是 bit0=11g!
+	 * 旧值 0x31 = g+HT+VHT — 11g 是 2.4GHz 特有 → 固件可能用错误调制
+	 *
+	 * phy_mode_from_band 输出位映射:
+	 *   bit0=11g, bit1=11b, bit2=11a, bit3+4=HT, bit5=VHT, bit6+7+8=HE
+	 *
+	 * 2.4GHz 11ax: 0x01(g)+0x02(b)+0x08+0x10(HT)      = 0x1B (low byte)
+	 * 5GHz 11ax:   0x04(a)+0x18(HT)+0x20(VHT)+0x1C0(HE) = 0x1FC
+	 *   low byte=0xFC, phymode_ext=0x01
+	 *
+	 * 保守方案: 用最小可工作值, HE 可选 */
 	if (chan) {
-		if (chan->band == NL80211_BAND_5GHZ)
-			req.basic.phymode = 0x31;
-		else if (chan->band == NL80211_BAND_6GHZ)
-			req.basic.phymode = 0xb1;
-		else
-			req.basic.phymode = 0x0f;
+		if (chan->band == NL80211_BAND_5GHZ) {
+			req.basic.phymode = 0x3C;     /* 11a+HT+VHT (bit2+3+4+5) */
+			req.basic.phymode_ext = 0x01; /* HE (bit8) */
+		} else if (chan->band == NL80211_BAND_6GHZ) {
+			req.basic.phymode = 0xFC;     /* 11a+HT+VHT+HE (bit2-8) */
+			req.basic.phymode_ext = 0x01;
+		} else {
+			req.basic.phymode = 0x1B;     /* 11b+11g+HT (bit0+1+3+4) */
+			req.basic.phymode_ext = 0x01; /* HE */
+		}
 	}
 	req.basic.nonht_basic_phy = 0;
 	/* Windows RE: only BssActivateCtrl writes link_idx (band_info).
@@ -2777,21 +2793,22 @@ static int mt7927_mcu_set_bss_rlm(struct mt7927_dev *dev,
 	if (chan) {
 		req.rlm.control_channel = chan->hw_value;
 		req.rlm.center_chan = chan->hw_value;
-		req.rlm.bw = 1;  /* Windows RE: 20MHz=0x01 (映射表 0→1,1→2,2→3,3→6,4→7) */
+		req.rlm.bw = 0;  /* Windows RE 冲突: Doc1说0→1(20MHz), Doc2说0=20MHz.
+				   * 试 0: 2个RE文档对BW映射不一致. 0=20MHz最安全. */
 		req.rlm.tx_streams = 2;
 		req.rlm.rx_streams = 2;
 		req.rlm.ht_op_info = 4;
-		/* Windows RE: band encoding 0-based (DBDC convention)
-		 * 0=2.4GHz, 1=5GHz, 2=6GHz */
+		/* S47 FIX: band encoding 1-indexed (mt7925 确认)
+		 * 1=2.4GHz, 2=5GHz, 3=6GHz (NOT 0-indexed!) */
 		switch (chan->band) {
 		case NL80211_BAND_5GHZ:
-			req.rlm.band = 1;
-			break;
-		case NL80211_BAND_6GHZ:
 			req.rlm.band = 2;
 			break;
+		case NL80211_BAND_6GHZ:
+			req.rlm.band = 3;
+			break;
 		default:
-			req.rlm.band = 0;
+			req.rlm.band = 1;
 			break;
 		}
 	}
@@ -3486,26 +3503,20 @@ static void mt7927_mac80211_tx(struct ieee80211_hw *hw,
 		wcid = &msta->wcid;
 	}
 
-	/* 管理帧 → CMD ring 15 (PKT_FMT=2, Q_IDX=0, inline TXD+frame)
-	 * 数据帧 → data ring 0 (PKT_FMT=0 CT mode, TXD+TXP scatter-gather)
+	/* 管理帧 + 数据帧 → Ring 0 CT mode
 	 *
-	 * MT6639: 管理帧走 TC4 → ring 15, PKT_FMT=2(CMD), Q_IDX=0(MCU_Q0)
-	 * 之前测 ring 15 失败是因为 PKT_FMT 和 Q_IDX 都错了 */
+	 * S46: Ring 2 SF 在两个频段都不工作 (DMA 完成但 MIB TX=0)
+	 * Ring 0 CT 对 2.4GHz 已验证工作 (S31-S45, 包括互联网连接)
+	 * 5GHz Ring 0 CT 返回 MPDU_ERR — 需要调查 ROC/CH_PRIVILEGE TLV */
 	if (skb->len >= 24) {
 		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 
 		if (ieee80211_is_mgmt(hdr->frame_control)) {
 			dev_info(&dev->pdev->dev,
-				 "TX mgmt->ring0 CT: fc=0x%04x DA=%pM len=%u wcid=%d\n",
+				 "TX mgmt→ring0 CT: fc=0x%04x DA=%pM len=%u wcid=%d\n",
 				 le16_to_cpu(hdr->frame_control),
 				 hdr->addr1, skb->len,
 				 wcid ? wcid->idx : -1);
-
-			/* Session 30 实验: 切回 Ring 0 CT mode
-			 * Ring 2 SF 帧卡在 DMASHDL (PKT count+1 但 MIB=0)
-			 * Ring 0 CT 之前能到 LMAC (MIB TX_OK=30)
-			 * 现在 BSS_INFO 有完整 16 TLV + STA_REC 13 TLV
-			 * 测试: 完整 TLV 配置下 Ring 0 CT 是否能成功 */
 		}
 
 		dev_info(&dev->pdev->dev,
@@ -3724,14 +3735,22 @@ static int mt7927_hw_scan(struct ieee80211_hw *hw,
 {
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 
-	if (test_bit(MT7927_SCANNING, &dev->scan_state))
+	if (test_bit(MT7927_SCANNING, &dev->scan_state)) {
+		dev_info(&dev->pdev->dev,
+			 "hw_scan: EBUSY — MT7927_SCANNING bit set (scan_state=0x%lx)\n",
+			 dev->scan_state);
 		return -EBUSY;
+	}
 
 	/* 如果 ROC 活跃中 (auth/assoc 进行中), 推迟扫描
 	 * 否则扫描命令会中断 ROC, 导致 auth 帧被固件丢弃 */
-	if (dev->roc_active)
+	if (dev->roc_active) {
+		dev_info(&dev->pdev->dev,
+			 "hw_scan: EBUSY — roc_active=true\n");
 		return -EBUSY;
+	}
 
+	dev_info(&dev->pdev->dev, "hw_scan: proceeding with scan\n");
 	return mt7927_mcu_hw_scan(dev, vif, req);
 }
 
@@ -3926,9 +3945,43 @@ static int mt7927_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
 }
 
 /* =====================================================================
- * UNI_CHANNEL_SWITCH — 完整配置 TX+RX 射频链路
- * ROC 只配置 RX 监听，不配置 TX 射频。固件需要 CHANNEL_SWITCH 才能发帧。
- * 参考: mt7996/mcu.c mt7996_mcu_set_chan_info()
+ * BAND_CONFIG (outer=0x93, inner CID=0x49) — 5GHz radio 初始化
+ * Windows RE: nicBandConfig @ 0x1400d15d0
+ * 仅在 band_idx=1 (5GHz) 时发送, 2.4GHz 不需要.
+ * 92 字节固定格式, 所有字段为硬编码常量.
+ * ===================================================================== */
+static int mt7927_mcu_set_band_config(struct mt7927_dev *dev)
+{
+	struct {
+		u8  rsv[4];       /* [0x00..0x03] UniCmd body header */
+		__le32 flags;     /* [0x04..0x07] = 0x00580000 (hardcoded) */
+		u8  rsv2;         /* [0x08] = 0 */
+		u8  field_09;     /* [0x09] = 1 */
+		u8  rsv3[2];      /* [0x0a..0x0b] = 0 */
+		u8  field_0c;     /* [0x0c] = 2 */
+		u8  rsv4[3];      /* [0x0d..0x0f] = 0 */
+		__le16 field_10;  /* [0x10..0x11] = 2 */
+		u8  rsv5[12];     /* [0x12..0x1d] = 0 */
+		u8  unused[62];   /* [0x1e..0x5b] = 0 */
+	} __packed req = {
+		.flags    = cpu_to_le32(0x00580000),
+		.field_09 = 1,
+		.field_0c = 2,
+		.field_10 = cpu_to_le16(2),
+	};
+
+	BUILD_BUG_ON(sizeof(req) != 92);
+
+	dev_info(&dev->pdev->dev,
+		 "mcu: BAND_CONFIG (CID=0x49) 5GHz radio init\n");
+
+	return mt7927_mcu_send_unicmd(dev, 0x49,
+				       UNI_CMD_OPT_UNI | UNI_CMD_OPT_SET,
+				       &req, sizeof(req));
+}
+
+/* =====================================================================
+ * UNI_CHANNEL_SWITCH — 信道切换
  * ===================================================================== */
 static int mt7927_mcu_set_chan_info(struct mt7927_dev *dev,
 				    struct ieee80211_channel *chan,
@@ -3964,8 +4017,7 @@ static int mt7927_mcu_set_chan_info(struct mt7927_dev *dev,
 	req.bw = 0;			/* CMD_CBW_20MHZ */
 	req.tx_path_num = 2;		/* MT6639: 2T2R */
 	req.switch_reason = CH_SWITCH_NORMAL;
-	/* MT6639 DBDC: band 0 = 2.4GHz, band 1 = 5GHz */
-	req.band_idx = (chan->band == NL80211_BAND_5GHZ) ? 1 : 0;
+	req.band_idx = 0;
 
 	/* rx_path: CHANNEL_SWITCH 用 count, RX_PATH 用 bitmask
 	 * 参考 mt7996: if (tag == UNI_CHANNEL_SWITCH) req.rx_path = hweight8() */
@@ -4006,25 +4058,40 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	struct mt7927_dev *dev = mt7927_hw_dev(hw);
 	struct mt7927_vif *mvif = (struct mt7927_vif *)vif->drv_priv;
 	struct ieee80211_channel *chan;
-	u16 duration = info->duration ? info->duration : 1000; /* 默认 1 秒 */
-	/* CH_PRIVILEGE — Windows RE: direct TLV, no inner header
-	 * rsv[4] is standard UniCmd padding (not bss_idx header) */
+	/* S47 修复: ROC duration 必须足够长, 覆盖完整的 auth+assoc 流程.
+	 * 之前用 200ms (Windows RE 默认), 但 STA_REC + 诊断等待 (~280ms) 就超过了!
+	 * auth 帧在 ROC 过期后发送 → 射频已回到 2.4GHz → 5GHz MPDU_ERR.
+	 * mt7925 用 info->duration (mac80211 传入). 保守设 5000ms. */
+	u16 duration = info->duration ? info->duration : 5000;
+	/* CH_PRIVILEGE (CID=0x27) — ROC TLV
+	 * S48 根因修复: 必须匹配 mt7925 roc_acquire_tlv (24字节)!
+	 * 旧 struct 有致命错误:
+	 *   - 字段顺序错: band在[3]但固件期望[4] → bw=0当作band=0=2.4G
+	 *   - 大小错: 20字节 vs 正确24字节 → dbdcband缺失
+	 *   - reqtype=0xFF 错: 0xFF是dbdc_req_type映射值, reqtype应为0(JOIN)
+	 * 2.4GHz "能用" 纯属巧合: bw=0恰好==band=0
+	 *
+	 * Windows RE: CID=0x27, tag=0, len=0x18(24)
+	 * mt7925: roc_acquire_tlv — 社区补丁验证可工作 */
 	struct {
-		u8 rsv[4];
-		__le16 tag;
-		__le16 len;
-		u8 bss_idx;
-		u8 tokenid;
-		u8 control_channel;
-		u8 band;
-		u8 bw;
-		u8 bw_from_ap;
-		u8 center_chan;
-		u8 center_chan_from_ap;
-		u8 reqtype;
-		u8 dbdcband;
-		u8 pad[2];
-		__le32 maxinterval;
+		u8 rsv[4];                 /* UniCmd header padding */
+		__le16 tag;                /* UNI_ROC_ACQUIRE=0 */
+		__le16 len;                /* sizeof=24 (含 tag+len) */
+		u8 bss_idx;                /* [+0] BSS index */
+		u8 tokenid;                /* [+1] 递增 token */
+		u8 control_channel;        /* [+2] 主控信道号 */
+		u8 sco;                    /* [+3] 0=none, 1=SCA, 3=SCB */
+		u8 band;                   /* [+4] 1=2.4G, 2=5G, 3=6G */
+		u8 bw;                     /* [+5] CMD_CBW: 0=20MHz */
+		u8 center_chan;            /* [+6] center channel */
+		u8 center_chan2;           /* [+7] center channel 2 */
+		u8 bw_from_ap;             /* [+8] AP bandwidth */
+		u8 center_chan_from_ap;    /* [+9] AP center channel */
+		u8 center_chan2_from_ap;   /* [+10] */
+		u8 reqtype;                /* [+11] 0=JOIN, 1=ROC */
+		__le32 maxinterval;        /* [+12-15] timeout ms */
+		u8 dbdcband;               /* [+16] 0xFF=auto */
+		u8 rsv2[3];                /* [+17-19] pad to 24 bytes */
 	} __packed req = {0};
 
 	/* 获取频道 — 优先从 vif BSS conf 获取 */
@@ -4039,15 +4106,47 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 
 	/* === Windows 流程对齐: BSS 配置在 ROC 之前 ===
 	 * Windows RE: ChipConfig → DEV_INFO → BssActivateCtrl → PM_DISABLE
-	 *   → BSS_INFO(13 TLV) → BSS_RLM(3 TLV) → SCAN_CANCEL → CH_PRIVILEGE → STA_REC */
-	if (mvif->band_idx == 0xff) {
-		mvif->band_idx = (chan->band == NL80211_BAND_5GHZ) ? 1 : 0;
+	 *   → BSS_INFO(13 TLV) → BSS_RLM(3 TLV) → SCAN_CANCEL → CH_PRIVILEGE → STA_REC
+	 *
+	 * S47 根因修复: band_idx = DBDC band index, NOT frequency band!
+	 * ROC_GRANT 返回 dbdcband=0 — 固件在单 STA 模式下只用 Band 0.
+	 * TXD TGID 取自 band_idx: 如果 TGID=1 但固件用 Band 0 调谐 → 帧发到
+	 * 未调谐的 Band 1 → MPDU_ERR (TX_OK=30 但 AP 收不到).
+	 * 频率由 ROC band 字段 (0=2.4G, 1=5G) 和 channel 决定, 不是 band_idx.
+	 * 2.4GHz 成功因为 band_idx=0 恰好匹配 dbdcband=0. */
+	{
+	/* S48 FIX: 从 channel 推导 DBDC band_idx (不再硬编码 0!)
+	 * ROC_GRANT 确认: 2.4GHz → dbdcband=0, 5GHz → dbdcband=1
+	 * 之前硬编码 0 导致: BSS_INFO band=0 但 ROC band=1 → 不匹配 → MPDU_ERR
+	 * 必须在 BSS_INFO/BSS_RLM 发送前就设对, 否则固件把 BSS 建在错误的 band */
+	u8 new_band = (chan->band == NL80211_BAND_5GHZ ||
+		       chan->band == NL80211_BAND_6GHZ) ? 1 : 0;
+	bool is_5ghz = (chan->band == NL80211_BAND_5GHZ);
+	bool need_setup = (mvif->band_idx == 0xff || mvif->band_idx != new_band);
+
+	if (need_setup) {
+		if (mvif->band_idx != 0xff && mvif->band_idx != new_band) {
+			dev_info(&dev->pdev->dev,
+				 "mgd_prepare_tx: band switch %u→%u, re-setup\n",
+				 mvif->band_idx, new_band);
+			dev->roc_active = false;
+		}
+		mvif->band_idx = new_band;
 		dev_info(&dev->pdev->dev,
 			 "mgd_prepare_tx: derived band_idx=%u from ch=%u\n",
 			 mvif->band_idx, chan->hw_value);
 
 		/* [0] ChipConfig — Windows 每次 connect 都重发 */
 		mt7927_mcu_chip_config(dev);
+		/* [0.5] BAND_CONFIG (CID=0x49) — Windows 只在 5GHz 时发送.
+		 * Ghidra RE: outer=0x93→inner=0x49, 92字节 payload.
+		 * 注: CID=0x49 可能不是正确的 outer CID (应为 0x93),
+		 * 但固件可能会 silently ignore. 保留以保持与 Windows 流程对齐. */
+		if (is_5ghz) {
+			dev_info(&dev->pdev->dev,
+				 "mcu: sending BAND_CONFIG for 5GHz\n");
+			mt7927_mcu_set_band_config(dev);
+		}
 		/* [1] DEV_INFO — Windows flat format (16B, CID=0x01)
 		 * S43 关键修复: Ghidra 反编译 nicUniCmdBssActivateCtrl 确认:
 		 *   byte[0]=omac_idx(MUAR slot), byte[1]=0xFF(STA type, NOT activate!)
@@ -4085,6 +4184,7 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 		/* [4.5] BSS_RLM — RLM+PROTECT+IFS_TIME */
 		mt7927_mcu_set_bss_rlm(dev, vif);
 	}
+	} /* end need_setup scope */
 
 	/* Session 34: Windows 在 BSS_INFO full 和 CH_PRIVILEGE 之间发 SCAN_CANCEL
 	 * Windows RE (win_re_connect_flow.md):
@@ -4102,6 +4202,10 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 		msleep(20);
 	}
 
+	/* S48: 移除 UNI_CHANNEL_SWITCH — mt7925 STA 模式不发 CHANNEL_SWITCH,
+	 * ROC 命令本身就让固件切信道. S31 空口抓包也确认 CHANNEL_SWITCH
+	 * 返回 0xc00000bb 错误, 可能与 ROC 冲突. */
+
 	/* DIAG: MIB RX 基线 (50ms 采样) */
 	{
 		u32 b0_mdrdy, b1_mdrdy;
@@ -4116,28 +4220,36 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 	}
 
 	req.tag = cpu_to_le16(0);  /* UNI_ROC_ACQUIRE */
-	req.len = cpu_to_le16(sizeof(req) - 4);
+	req.len = cpu_to_le16(sizeof(req) - 4);  /* 24 bytes (含 tag+len) */
 	req.bss_idx = mvif->bss_idx;
+	req.tokenid = ++dev->roc_token_id;  /* mt7925 也递增 token */
 	req.control_channel = chan->hw_value;
-	req.bw = 0;  /* CMD_CBW_20MHZ */
-	req.bw_from_ap = 0;
-	req.center_chan = chan->hw_value;
-	req.center_chan_from_ap = chan->hw_value;
-	req.reqtype = 0;  /* JOIN */
-	req.dbdcband = 0xff;  /* AUTO — firmware assigns band */
-	req.maxinterval = cpu_to_le32(duration);
-
+	req.sco = 0;  /* 20MHz 无 secondary channel offset */
+	/* S48 FIX: band 在 [+4] (mt7925 verified, 社区补丁确认)
+	 * 之前 band 在 [+3] 而 [+4]=bw=0 → 固件读 band=0=2.4G (巧合!) */
 	switch (chan->band) {
+	case NL80211_BAND_6GHZ:
+		req.band = 3;
+		break;
 	case NL80211_BAND_5GHZ:
 		req.band = 2;
 		break;
 	default:
-		req.band = 1;  /* 2.4GHz */
+		req.band = 1;
 		break;
 	}
-
-	/* 移除了 CHANNEL_SWITCH — STA 模式不需要, 可能和 ROC 冲突
-	 * mt7925 STA 模式从不使用 CHANNEL_SWITCH */
+	req.bw = 0;  /* CMD_CBW_20MHZ */
+	req.center_chan = chan->hw_value;
+	req.center_chan2 = 0;
+	req.bw_from_ap = 0;
+	req.center_chan_from_ap = chan->hw_value;
+	req.center_chan2_from_ap = 0;
+	/* S48 FIX: reqtype=0 (JOIN), 不是 0xFF!
+	 * Windows RE 的 0xFF 是 TLV[+0x15] 的 dbdc_req_type 映射,
+	 * 不是 [+11] 的 reqtype 字段! mt7925: MT7925_ROC_REQ_JOIN=0 */
+	req.reqtype = 0;  /* JOIN */
+	req.maxinterval = cpu_to_le32(duration);
+	req.dbdcband = 0xff;  /* auto */
 
 	/* 如果 ROC 已活跃, 复用已有的 ROC 会话 — 不要 abort + re-acquire!
 	 * 测试发现 MT6639 固件在 abort 后不会为新 acquire 发 ROC_GRANT.
@@ -4195,23 +4307,32 @@ static void mt7927_mgd_prepare_tx(struct ieee80211_hw *hw,
 		 * 固件会丢弃帧 (TXFREE stat=1)
 		 *
 		 * mt7925 参考: mt7925/mcu.c mt7925_mcu_roc_iter() line 313 */
-		/* ROC_GRANT 确认信道切换完成.
-		 * band_idx 已在 ROC 前从 channel 推导并设置,
-		 * DEV_INFO + BSS_INFO 也已在 ROC 前发送 (匹配 Windows 流程). */
-		if (mvif->band_idx != dev->roc_grant_band_idx) {
-			dev_warn(&dev->pdev->dev,
-				 "mgd_prepare_tx: band mismatch! derived=%u grant=%u\n",
-				 mvif->band_idx, dev->roc_grant_band_idx);
+		/* S48: 从 ROC_GRANT 更新 band_idx — mt7925 也这样做
+		 * (mt7925_mcu_roc_iter: mvif->band_idx = grant->dbdcband)
+		 * 5GHz 固件可能返回 dbdcband=1, TGID 必须匹配 */
+		if (dev->roc_grant_band_idx != 0xff)
 			mvif->band_idx = dev->roc_grant_band_idx;
-		}
 		dev_info(&dev->pdev->dev,
-			 "mgd_prepare_tx: ROC grant received, band_idx=%u\n",
-			 mvif->band_idx);
+			 "mgd_prepare_tx: ROC grant received, band_idx=%u (from grant=%u)\n",
+			 mvif->band_idx, dev->roc_grant_band_idx);
 
-		/* Session 36: CHANNEL_SWITCH + RX_PATH 已移除!
-		 * Windows RE 确认: connect 流程不发 CHANNEL_SWITCH/RX_PATH.
-		 * 固件通过 ROC 自动处理信道切换和 RX 启用.
-		 * 这些多余命令可能与 ROC 冲突, 破坏固件 RX 状态机. */
+		/* DIAG: post-ROC MDRDY check — 验证射频是否实际调谐
+		 * 如果 MDRDY > 0, 射频在收信号 (AP beacon 等); MDRDY=0 = 未调谐 */
+		{
+			u32 b0_mdrdy, b1_mdrdy;
+			(void)mt7927_rr(dev, MT_MIB_RSCR26(0));
+			(void)mt7927_rr(dev, MT_MIB_RSCR26(1));
+			msleep(200);  /* 等待 2 个 beacon 间隔 */
+			b0_mdrdy = mt7927_rr(dev, MT_MIB_RSCR26(0));
+			b1_mdrdy = mt7927_rr(dev, MT_MIB_RSCR26(1));
+			dev_info(&dev->pdev->dev,
+				 "POST-ROC MIB (200ms): B0_MDRDY=%u B1_MDRDY=%u "
+				 "(>0 means radio tuned!)\n",
+				 b0_mdrdy, b1_mdrdy);
+		}
+
+		/* Windows RE 确认: STA 模式不发 CHANNEL_SWITCH.
+		 * ROC + BAND_CONFIG 处理所有信道/radio 配置. */
 
 		/* STA_REC 在 ROC_GRANT 后发送 (匹配 Windows: ChPrivilege 后才发 STA_REC).
 		 * 固件创建 WTBL 条目. AP STA 在 sta_state 时分配在 wcid[1] */

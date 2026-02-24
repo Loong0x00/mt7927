@@ -981,6 +981,7 @@ struct mt7927_dev {
 	struct completion roc_complete;		/* ROC_GRANT 等待 */
 	bool roc_active;			/* ROC 会话活跃中 — 阻止扫描 */
 	u8 roc_grant_band_idx;			/* ROC_GRANT 返回的 dbdcband */
+	u8 roc_token_id;			/* ROC token 递增计数器 */
 
 	/* TX mgmt PID counter (rotating 1-99, Windows RE verified) */
 	u8 tx_mgmt_pid;

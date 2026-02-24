@@ -286,12 +286,15 @@ void mt7927_mac_write_txwi(struct mt7927_dev *dev, __le32 *txwi,
 		val |= MT_TXD6_DAS;
 	txwi[6] = cpu_to_le32(val);
 
-	/* Fixed rate for mgmt and any FIXED_RATE frames */
+	/* Fixed rate for mgmt and any FIXED_RATE frames.
+	 * S47 修复: CONNAC3 rate descriptor = PHY_MODE[7:6] | MCS[5:0].
+	 * 0x4B = OFDM(1)<<6 | rate_idx(11) = OFDM 6Mbps.
+	 * 旧 FIELD_PREP(MT_TXD6_TX_RATE, 15) = 0x000F0000 → PHY=CCK(0), MCS=15
+	 *   CCK 在 5GHz 无效, 虽然固件 auto-correct 报 rate=0x004b,
+	 *   但可能影响 TX 调制质量. 改为直接匹配 Windows.
+	 * Windows DW6 rate area = 0x004B0000 (Ghidra verified). */
 	if (txwi[1] & cpu_to_le32(MT_TXD1_FIXED_RATE)) {
-		/* OFDM 6Mbps: rate_idx=11 for both 2.4GHz and 5GHz.
-		 * NOTE: Windows DW6=0x004B0000 includes bit 22 (BW in CONNAC3
-		 * macros → 40MHz) — don't set it, causes firmware hang. */
-		txwi[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, 11));
+		txwi[6] |= cpu_to_le32(0x004B0000);  /* OFDM 6Mbps */
 		txwi[3] |= cpu_to_le32(MT_TXD3_BA_DISABLE);
 	}
 
@@ -1362,21 +1365,22 @@ static void mt7927_mcu_rx_event(struct mt7927_dev *dev, struct sk_buff *skb)
 			 status, primary_ch, dbdcband);
 		dev->roc_active = true;
 
-		/* Clear DROP_OTHER_UC in RFCR immediately after ROC_GRANT.
-		 * Firmware restores RFCR (including DROP_OTHER_UC=1) when
-		 * granting the channel. Clear it here so unicast frames
-		 * can pass through even if MUAR is not programmed.
-		 * Use band from ROC_GRANT (dbdcband, 0=2.4GHz, 1=5GHz). */
+		/* Clear DROP_OTHER_UC on BOTH bands after ROC_GRANT.
+		 * For 5GHz: firmware may assign band 0 in ROC but TX goes
+		 * through band 1 via TGID. Auth response (ACK) could arrive
+		 * on either band. Clear both to ensure RX works. */
 		{
-			u8 band = (dbdcband < 2) ? dbdcband : 0;
-			u32 rfcr = mt7927_rr(dev, MT_WF_RFCR(band));
-			if (rfcr & MT_WF_RFCR_DROP_OTHER_UC) {
-				mt7927_wr(dev, MT_WF_RFCR(band),
-					  rfcr & ~MT_WF_RFCR_DROP_OTHER_UC);
-				dev_info(&dev->pdev->dev,
-					 "ROC_GRANT: cleared RFCR DROP_OTHER_UC band%u "
-					 "(0x%08x -> 0x%08x)\n",
-					 band, rfcr, rfcr & ~MT_WF_RFCR_DROP_OTHER_UC);
+			int b;
+			for (b = 0; b < 2; b++) {
+				u32 rfcr = mt7927_rr(dev, MT_WF_RFCR(b));
+				if (rfcr & MT_WF_RFCR_DROP_OTHER_UC) {
+					mt7927_wr(dev, MT_WF_RFCR(b),
+						  rfcr & ~MT_WF_RFCR_DROP_OTHER_UC);
+					dev_info(&dev->pdev->dev,
+						 "ROC_GRANT: cleared RFCR DROP_OTHER_UC band%u "
+						 "(0x%08x -> 0x%08x)\n",
+						 b, rfcr, rfcr & ~MT_WF_RFCR_DROP_OTHER_UC);
+				}
 			}
 		}
 

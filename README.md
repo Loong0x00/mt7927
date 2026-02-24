@@ -4,6 +4,34 @@
 
 ---
 
+> ### :point_right: 寻找可直接使用的驱动？
+>
+> **推荐使用 [@jetm](https://aur.archlinux.org/account/jetm) 维护的 [`mediatek-mt7927-dkms`](https://aur.archlinux.org/packages/mediatek-mt7927-dkms) AUR 包** — 基于 mt7925e 驱动打补丁，2.4GHz + 5GHz 已测试可用，支持 DKMS 自动编译。
+>
+> ```bash
+> yay -S mediatek-mt7927-dkms
+> ```
+>
+> 追踪讨论：[openwrt/mt76#927](https://github.com/openwrt/mt76/issues/927)
+>
+> **本项目（从零编写的独立驱动）主要价值在于 Windows 逆向工程文档（`docs/re/`），为社区驱动开发提供参考。项目可能不会继续活跃开发。**
+
+---
+
+> ### :point_right: Looking for a ready-to-use driver?
+>
+> **Use the [`mediatek-mt7927-dkms`](https://aur.archlinux.org/packages/mediatek-mt7927-dkms) AUR package maintained by [@jetm](https://aur.archlinux.org/account/jetm)** — patches the mt7925e driver, tested on 2.4GHz + 5GHz, with DKMS auto-build support.
+>
+> ```bash
+> yay -S mediatek-mt7927-dkms
+> ```
+>
+> Tracking: [openwrt/mt76#927](https://github.com/openwrt/mt76/issues/927)
+>
+> **This project (a from-scratch standalone driver) is primarily valuable for its Windows reverse engineering documentation (`docs/re/`), serving as a reference for community driver development. Active development may not continue.**
+
+---
+
 <a id="中文"></a>
 
 ## 中文
