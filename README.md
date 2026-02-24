@@ -109,7 +109,7 @@ src/
 
 #### `docs/ARCHITECTURE.md` — 架构说明文档
 
-**在提问"为什么不直接合并到 mt76"之前，请先读这份文档。**
+**在提问"为什么不直接合并到 mt76"之前，请先读这份文档：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
 面向内核开发者的技术深度文档，包含：
 - 为什么不能直接改 mt76（寄存器空间、DMA、协议层面的具体差异）
@@ -256,7 +256,7 @@ The **sole reference source** for this driver. Reverse-engineered from the Windo
 
 #### `docs/ARCHITECTURE.md` — Architecture Document
 
-**Before asking "why not just merge into mt76", please read this document first.**
+**Before asking "why not just merge into mt76", please read this document first: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
 Technical deep-dive for kernel developers, covering:
 - Why mt76 cannot simply be patched (concrete register space, DMA, and protocol differences)
