@@ -107,6 +107,14 @@ src/
 - 固件下载和初始化 (`win_re_class02_and_postinit.md`)
 - 寄存器映射和 RF/PHY 配置 (`windows_register_map.md`, `win_re_full_rf_phy_config.md`)
 
+#### `docs/ARCHITECTURE.md` — 架构说明文档
+
+面向内核开发者的技术深度文档，包含：
+- 为什么不能直接改 mt76（寄存器空间、DMA、协议层面的具体差异）
+- 驱动中复用的标准内核 API 完整列表（含文件/行号）
+- MT6639 完全独立实现的部分（固件下载、UniCmd、TXD/RXD、硬件加密）
+- 进入 mt76 主线的路径分析
+
 #### `docs/debug/` — 调试记录
 
 开发过程中的问题分析和诊断记录。
@@ -243,6 +251,14 @@ The **sole reference source** for this driver. Reverse-engineered from the Windo
 - Complete connection flow (`win_re_full_connect_cmd_sequence.md`)
 - Firmware download and init (`win_re_class02_and_postinit.md`)
 - Register maps and RF/PHY config (`windows_register_map.md`, `win_re_full_rf_phy_config.md`)
+
+#### `docs/ARCHITECTURE.md` — Architecture Document
+
+Technical deep-dive for kernel developers, covering:
+- Why mt76 cannot simply be patched (concrete register space, DMA, and protocol differences)
+- Complete list of standard kernel APIs reused (with file/line references)
+- Fully independent MT6639-specific implementations (firmware download, UniCmd, TXD/RXD, hardware crypto)
+- Roadmap for upstreaming into mt76
 
 #### `docs/debug/` — Debug Logs
 
