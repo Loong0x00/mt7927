@@ -1004,7 +1004,8 @@ void mt7927_mac_fill_rx_rate(struct mt7927_dev *dev,
  *
  * Returns 0 on success, -EINVAL if frame should be dropped.
  */
-int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
+int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb,
+		       struct ieee80211_sta **sta_out)
 {
 	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 	struct ieee80211_supported_band *sband = NULL;
@@ -1012,8 +1013,10 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	u32 rxd0, rxd1, rxd2, rxd3, rxd4;
 	bool unicast, hdr_trans;
 	u16 seq_ctrl = 0;
+	u16 wlan_idx;
 	u8 chfreq, remove_pad;
 
+	*sta_out = NULL;
 	memset(status, 0, sizeof(*status));
 
 	rxd0 = le32_to_cpu(rxd[0]);
@@ -1039,6 +1042,12 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	}
 
 	hdr_trans = !!(rxd2 & MT_RXD2_NORMAL_HDR_TRANS);
+
+	/* Lookup STA from WLAN_IDX — mac80211's 8023 path requires pubsta */
+	wlan_idx = FIELD_GET(MT_RXD1_NORMAL_WLAN_IDX, rxd1);
+	if (wlan_idx < MT7927_WTBL_SIZE && dev->wcid[wlan_idx] &&
+	    dev->wcid[wlan_idx]->sta)
+		*sta_out = dev->wcid[wlan_idx]->sta;
 
 	/* HDR_OFFSET: additional padding between RXD groups and frame data
 	 * 来源: mt7925/mac.c line 436, 546 — hdr_gap += 2 * remove_pad
@@ -1180,59 +1189,20 @@ int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb)
 	 * 需扩展 18 字节 (headroom 来自已剥离的 RXD)
 	 */
 	if (hdr_trans) {
-		if (skb->len >= ETH_HLEN && skb_headroom(skb) >= 18) {
-			u8 da[ETH_ALEN], sa[ETH_ALEN];
-			__be16 etype;
-			struct ieee80211_hdr_3addr dot11 = {};
-			static const u8 rfc1042[6] = {
-				0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00
-			};
-
-			/* Save 802.3 fields */
-			memcpy(da, skb->data, ETH_ALEN);
-			memcpy(sa, skb->data + ETH_ALEN, ETH_ALEN);
-			etype = *(__be16 *)(skb->data + 2 * ETH_ALEN);
-
-			/* DA=0 修复 (MUAR 未编程时) */
+		/* S45 实验: 直接走 802.3 快速路径 (RX_FLAG_8023)
+		 *
+		 * S43 时 802.3 路径失败因为 STA 在 ASSOC (state 2)，fast_rx 未设置。
+		 * 但现在观察到 mac80211 在 EAPOL 之前就把 STA 推到 AUTHORIZED (state 3)，
+		 * fast_rx 应该可用。同时 802.3→802.11 重建后 mac80211 仍然丢帧。
+		 * 所以回到 802.3 路径测试。
+		 *
+		 * DA=0 修复: 如果 MUAR 未编程，硬件翻译的 DA 可能全零 */
+		if (skb->len >= ETH_HLEN) {
+			u8 *da = skb->data;
 			if (is_zero_ether_addr(da) && dev->hw && dev->hw->wiphy)
 				ether_addr_copy(da, dev->hw->wiphy->perm_addr);
-
-			/* Strip 802.3 header */
-			skb_pull(skb, ETH_HLEN);
-
-			/* Build 802.11 header: FromDS data frame
-			 * Addr1=DA(RA), Addr2=BSSID=SA(TA), Addr3=SA */
-		{
-			u16 fc_flags = IEEE80211_FTYPE_DATA |
-				       IEEE80211_STYPE_DATA |
-				       IEEE80211_FCTL_FROMDS;
-			/* S44: 硬件加密修复 — 原始帧是加密的，
-			 * FC 必须反映 Protected 状态，否则 mac80211
-			 * 会丢弃 "未加密的数据帧" (安全降级检测) */
-			if (status->flag & RX_FLAG_DECRYPTED)
-				fc_flags |= IEEE80211_FCTL_PROTECTED;
-			dot11.frame_control = cpu_to_le16(fc_flags);
 		}
-			memcpy(dot11.addr1, da, ETH_ALEN);
-			memcpy(dot11.addr2, sa, ETH_ALEN);
-			memcpy(dot11.addr3, sa, ETH_ALEN);
-			dot11.seq_ctrl = cpu_to_le16(seq_ctrl);
-
-			/* Prepend LLC/SNAP (8 bytes: 6 SNAP + 2 EtherType) */
-			skb_push(skb, 2);
-			memcpy(skb->data, &etype, 2);
-			skb_push(skb, 6);
-			memcpy(skb->data, rfc1042, 6);
-
-			/* Prepend 802.11 header (24 bytes) */
-			skb_push(skb, sizeof(dot11));
-			memcpy(skb->data, &dot11, sizeof(dot11));
-
-			/* DON'T set RX_FLAG_8023 — this is now a native 802.11 frame */
-		} else {
-			/* Insufficient headroom — just set 8023 flag and hope for the best */
-			status->flag |= RX_FLAG_8023;
-		}
+		status->flag |= RX_FLAG_8023;
 	}
 
 	/* --- AMSDU info --- */
@@ -1468,7 +1438,8 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 		 * 可能通过 MCU ring (ring 6) 到达, 类型为 PKT_TYPE_NORMAL_MCU(8).
 		 * 来源: mt7925/mac.c lines 1240-1246
 		 */
-		int ret = mt7927_mac_fill_rx(dev, skb);
+		struct ieee80211_sta *rx_sta = NULL;
+		int ret = mt7927_mac_fill_rx(dev, skb, &rx_sta);
 
 		if (ret) {
 			dev->rx_drop_count++;
@@ -1498,18 +1469,32 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 						skb->len,
 						IEEE80211_SKB_RXCB(skb)->freq);
 				}
-				/* EAPOL 检测: data frame + LLC/SNAP + ethertype 0x888e */
-				if (ftype == 2 && skb->len >= 32 + 2) {
-					/* 802.11 hdr(24) + SNAP(6) + ET(2) */
-					u16 et = (d[30] << 8) | d[31];
-
+				/* EAPOL 检测: data frame or 802.3 */
+				{
+					struct ieee80211_rx_status *rxst =
+						IEEE80211_SKB_RXCB(skb);
+					u16 et = 0;
+					if (rxst->flag & RX_FLAG_8023) {
+						if (skb->len >= 14)
+							et = (d[12] << 8) | d[13];
+					} else if (ftype == 2 && skb->len >= 34) {
+						/* 802.11 QoS(26)+SNAP(6)+ET(2) or non-QoS(24)+SNAP(6)+ET(2) */
+						int off = ((d[0] >> 4) & 0xf) >= 8 ? 32 : 30;
+						et = (d[off] << 8) | d[off + 1];
+					}
 					if (et == 0x888E) {
+						struct ieee80211_rx_status *st =
+							IEEE80211_SKB_RXCB(skb);
 						dev_info(&dev->pdev->dev,
 							"RX-EAPOL #%u: 802.11 len=%u FC=%02x%02x "
-							"A1=%02x:%02x:%02x:%02x:%02x:%02x\n",
+							"A1=%pM A2=%pM freq=%u band=%u "
+							"flag=0x%x enc=%d\n",
 							dev->rx_ok_count, skb->len,
 							fc0, d[1],
-							d[4], d[5], d[6], d[7], d[8], d[9]);
+							d+4, d+10,
+							st->freq, st->band,
+							st->flag,
+							!!(st->flag & RX_FLAG_DECRYPTED));
 					} else if (dev->rx_ok_count <= 300) {
 						dev_info_ratelimited(&dev->pdev->dev,
 							"RX-DATA #%u: FC=%02x%02x len=%u\n",
@@ -1518,9 +1503,52 @@ void mt7927_queue_rx_skb(struct mt7927_dev *dev, enum mt76_rxq_id q,
 				}
 			}
 		}
-		if (dev->hw)
-			ieee80211_rx_irqsafe(dev->hw, skb);
-		else
+		if (dev->hw) {
+			/* EAPOL bypass: mac80211's __ieee80211_rx_handle_8023
+			 * requires fast_rx which is only set after AUTHORIZED.
+			 * EAPOL arrives during 4-way handshake (STA at ASSOC)
+			 * → fast_rx=NULL → frame dropped. Bypass mac80211 and
+			 * deliver EAPOL directly to the network stack. */
+			{
+				struct ieee80211_rx_status *st =
+					IEEE80211_SKB_RXCB(skb);
+
+				if ((st->flag & RX_FLAG_8023) &&
+				    skb->len >= 14 && dev->wifi_ndev) {
+					u16 etype = (skb->data[12] << 8) |
+						    skb->data[13];
+					if (etype == ETH_P_PAE) {
+						dev_info(&dev->pdev->dev,
+							"EAPOL-BYPASS: len=%u "
+							"rx_sta=%s "
+							"DA=%pM SA=%pM "
+							"dev_addr=%pM "
+							"→ %s via ctrl_port\n",
+							skb->len,
+							rx_sta ? "valid" : "NULL",
+							skb->data,
+							skb->data + 6,
+							dev->wifi_ndev->dev_addr,
+							dev->wifi_ndev->name);
+						/* Deliver EAPOL via nl80211 control
+						 * port — modern wpa_supplicant
+						 * expects this path, not raw socket.
+						 * eth_type_trans sets mac_header for
+						 * cfg80211_rx_control_port. */
+						skb->dev = dev->wifi_ndev;
+						skb->protocol = eth_type_trans(skb,
+							dev->wifi_ndev);
+						skb->pkt_type = PACKET_HOST;
+						cfg80211_rx_control_port(
+							dev->wifi_ndev,
+							skb, true, -1);
+						dev_kfree_skb(skb);
+						return;
+					}
+				}
+			}
+			ieee80211_rx_napi(dev->hw, rx_sta, skb, NULL);
+		} else
 			dev_kfree_skb(skb);
 		return;
 	}

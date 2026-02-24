@@ -966,6 +966,9 @@ struct mt7927_dev {
 	u64 omac_mask;				/* OMAC 地址分配位图 */
 	struct mt7927_wcid *wcid[20];		/* WCID 池 (MT792x_WTBL_SIZE=20) */
 
+	/* WiFi net_device (for EAPOL bypass) */
+	struct net_device *wifi_ndev;		/* 保存于 add_interface */
+
 	/* 工作队列 */
 	struct work_struct init_work;		/* 异步初始化 */
 	struct delayed_work scan_work;		/* 扫描工作队列 */
@@ -2135,7 +2138,8 @@ int mt7927_tx_prepare_skb(struct mt7927_dev *dev, struct sk_buff *skb,
 void mt7927_mac_tx_free(struct mt7927_dev *dev, struct sk_buff *skb);
 
 /* mac.c — RXD 解析 */
-int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb);
+int mt7927_mac_fill_rx(struct mt7927_dev *dev, struct sk_buff *skb,
+		       struct ieee80211_sta **sta_out);
 void mt7927_mac_fill_rx_rate(struct mt7927_dev *dev,
 			     struct ieee80211_rx_status *status,
 			     struct ieee80211_supported_band *sband,

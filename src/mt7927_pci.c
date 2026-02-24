@@ -3608,9 +3608,12 @@ static int mt7927_add_interface(struct ieee80211_hw *hw,
 	 * 后续更新无法修正 WTBL BAND, auth 帧被路由到错误频段.
 	 * DEV_INFO/BSS_INFO 推迟到 mgd_prepare_tx (连接流程). */
 
+	/* 保存 net_device 用于 EAPOL 直接投递 */
+	dev->wifi_ndev = ieee80211_vif_to_wdev(vif)->netdev;
+
 	dev_info(&dev->pdev->dev,
-		 "mac80211: add_interface bss_idx=%d type=%d\n",
-		 idx, vif->type);
+		 "mac80211: add_interface bss_idx=%d type=%d ndev=%p\n",
+		 idx, vif->type, dev->wifi_ndev);
 	return 0;
 
 err:

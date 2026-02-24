@@ -87,13 +87,13 @@ sudo dhcpcd wlp9s0
 
 ```
 src/
-├── mt7927_pci.c    # 初始化、MCU 通信、mac80211 回调 (~4600 行)
-├── mt7927_pci.h    # 寄存器定义、数据结构、宏 (~1970 行)
-├── mt7927_mac.c    # TXD 构建、RXD 解析、RX 帧分发 (~1500 行)
-└── mt7927_dma.c    # 中断处理、NAPI poll、DMA 操作 (~900 行)
+├── mt7927_pci.c    # 初始化、MCU 通信、mac80211 回调 (~4920 行)
+├── mt7927_pci.h    # 寄存器定义、数据结构、宏 (~2170 行)
+├── mt7927_mac.c    # TXD 构建、RXD 解析、RX 帧分发、EAPOL bypass (~1600 行)
+└── mt7927_dma.c    # 中断处理、NAPI poll、DMA 操作 (~1000 行)
 ```
 
-四个文件编译为单一内核模块 `mt7927.ko`（约 9000 行）。
+四个文件编译为单一内核模块 `mt7927.ko`（约 9700 行）。
 
 ### 文档
 
@@ -131,7 +131,7 @@ src/
 
 ### 开发历程
 
-本项目在不到两周内完成，经历 44 个开发 session，全程使用 Claude Code：
+本项目在不到两周内完成，经历 45 个开发 session，全程使用 Claude Code：
 
 - **S1-S21**: PCIe 初始化、固件下载、DMA 引擎、MCU 通信
 - **S22**: WiFi 扫描工作
@@ -140,6 +140,7 @@ src/
 - **S40**: Auth + Association 成功 (突破 28 session 阻塞)
 - **S43**: WPA2 4-Way Handshake 完成，WiFi 连接成功
 - **S44**: 硬件加密实现，DHCP + 互联网 ping 通
+- **S45**: EAPOL 投递修复 (cfg80211_rx_control_port)，重启后连接稳定
 
 ### 许可证
 
@@ -234,13 +235,13 @@ sudo dhcpcd wlp9s0
 
 ```
 src/
-├── mt7927_pci.c    # Init, MCU communication, mac80211 callbacks (~4600 lines)
-├── mt7927_pci.h    # Register definitions, data structures, macros (~1970 lines)
-├── mt7927_mac.c    # TXD building, RXD parsing, RX frame dispatch (~1500 lines)
-└── mt7927_dma.c    # Interrupt handling, NAPI poll, DMA operations (~900 lines)
+├── mt7927_pci.c    # Init, MCU communication, mac80211 callbacks (~4920 lines)
+├── mt7927_pci.h    # Register definitions, data structures, macros (~2170 lines)
+├── mt7927_mac.c    # TXD building, RXD parsing, RX frame dispatch, EAPOL bypass (~1600 lines)
+└── mt7927_dma.c    # Interrupt handling, NAPI poll, DMA operations (~1000 lines)
 ```
 
-Four files compile into a single kernel module `mt7927.ko` (~9000 lines total).
+Four files compile into a single kernel module `mt7927.ko` (~9700 lines total).
 
 ### Documentation
 
@@ -278,7 +279,7 @@ This project is forked from [ehausig/mt7927](https://github.com/ehausig/mt7927).
 
 ### Development Timeline
 
-Completed in under two weeks across 44 development sessions, entirely using Claude Code:
+Completed in under two weeks across 45 development sessions, entirely using Claude Code:
 
 - **S1-S21**: PCIe init, firmware download, DMA engine, MCU communication
 - **S22**: WiFi scanning working
@@ -287,6 +288,7 @@ Completed in under two weeks across 44 development sessions, entirely using Clau
 - **S40**: Auth + Association success (broke 28-session blocker)
 - **S43**: WPA2 4-Way Handshake complete, WiFi connected
 - **S44**: Hardware encryption, DHCP + internet ping working
+- **S45**: EAPOL delivery fix (cfg80211_rx_control_port), stable after reboot
 
 ### License
 
