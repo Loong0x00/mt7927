@@ -78,7 +78,7 @@ make recover                   # PCI remove + rescan 恢复设备
 sudo timeout 25 wpa_supplicant -i wlp9s0 -c /home/user/mt7927/wpa_mt7927.conf -d
 ```
 
-sudo 密码: `123456` | WiFi AP: `CMCC-Pg2Y-2.4G` / `7ue9pxgp`
+WiFi 测试配置: 见本地 `wpa_mt7927.conf`
 
 ## 代码架构
 

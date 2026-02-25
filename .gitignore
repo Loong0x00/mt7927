@@ -1,6 +1,3 @@
-# Claude Code project instructions (private)
-CLAUDE.md
-
 # Kernel module build artifacts
 *.o
 *.ko

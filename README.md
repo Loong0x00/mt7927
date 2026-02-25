@@ -174,11 +174,20 @@ src/
 
 **市场规模：** MT7927 不是小众网卡。AMD AM5 平台的华硕（Crosshair X870E Hero、Strix X870E 全系）、技嘉（X870E AORUS Master）、微星（MPG X870I Edge Ti Evo）等主流旗舰主板几乎全部搭载 MT7927，联想 Legion Pro 7/9 笔记本也有使用。保守估计消费端已有 20-40 万张卡，随着 B850 中端板铺量还在增长。Intel 13/14 代可靠性问题后大量用户转向 AMD，这些用户中 Linux 使用比例远高于平均。
 
-**当前社区方案（`mediatek-mt7927-dkms`）的已知问题：**
+**社区方案（`mediatek-mt7927-dkms`）更新状态**（GitHub：[@jetm/mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms)）：
 
-- **320MHz 未真正实现。** 补丁只填充了发给固件的 TLV，wiphy/mac80211 能力未注册——`iw phy` 无 `BW = 320` MCS map。mt7925 驱动没有 320MHz 代码路径，无法通过打补丁修复。320MHz 是 MT7927 相比 MT7925 的核心卖点。
-- **电源管理完全关闭。** CLR_OWN 会重置 WFDMA 销毁 DMA ring，补丁选择直接禁用 PM。
-- **存在未初始化变量 bug。** `is_mt6639_hw` 在赋值前被使用，导致中断映射选错，冷启动时驱动无法加载。
+v2.1 已修复以下问题：
+
+- ✅ **未初始化变量 bug 已修复。** `is_mt6639_hw` 在赋值前被使用，导致中断映射选错（`mt7925` IRQ map 而非 `mt6639` IRQ map），冷启动时"获取补丁信号量失败"。v2.1 已修正。
+- ✅ **电源管理已恢复（v2.1）。** CLR_OWN 恢复路径已修正以正确重建 MT6639 的 GLO_CFG 配置位，S3 挂起/唤醒已测试通过。
+- ✅ **320MHz 已修复（v2.1-3）。** 根因：`mt7925_mcu_bss_rlm_tlv()` 的 `switch(chandef->width)` 缺少 `NL80211_CHAN_WIDTH_320` 分支，固件始终收到 20MHz 指令，退回 802.11n。补加一行 `case NL80211_CHAN_WIDTH_320: req->bw = CMD_CBW_320MHZ;` 即可修复。该 bug 同时影响上游 mt7925 使用 320MHz 6GHz 网络的用户。
+- ✅ **6GHz 已工作。** 社区测试确认 6GHz 连接可用（802.11be，PSK/SAE/OWE 均通过）。
+
+**仍有的已知问题：**
+
+- TX 重传率略高（调查中，疑似 Efuse 发射功率校准由固件负责，与驱动无关）。
+- 320MHz 仍需配备 6GHz AP 的用户实测验证。
+- 不支持 AP 模式和完整 MLO（3 频段 MLO 会触发 4-way handshake 超时）。
 
 **长期风险：** 联发科有将手机端组合芯片（如 MT6639/Filogic 380）重封装为 PCIe 模块、以 mt76 风格命名推向 PC 市场的模式。当前补丁方案在 mt7925 代码中散布 `if (is_mt6639())` 分支，如果类似芯片继续出现，这种方式会导致代码越来越脆弱。正确做法是由熟悉 mt76 子系统的内核开发者创建独立的 `mt7927/` 子驱动，本项目的逆向文档（`docs/re/`）提供了这一工作所需的全部技术基础。
 
@@ -334,11 +343,20 @@ Completed in under two weeks across 45 development sessions, entirely using Clau
 
 **Market scale:** MT7927 is not a niche chip. It ships on nearly all flagship AMD AM5 motherboards — ASUS (Crosshair X870E Hero, full Strix X870E lineup), Gigabyte (X870E AORUS Master), MSI (MPG X870I Edge Ti Evo) — and on Lenovo Legion Pro 7/9 laptops. Conservative estimate: 200K-400K units in consumer hands, growing as B850 mid-range boards ship. Many of these users are migrating from Intel (post-13th/14th gen reliability issues) and have a high Linux adoption rate.
 
-**Known issues with the community patch (`mediatek-mt7927-dkms`):**
+**Community patch status (`mediatek-mt7927-dkms`)** (GitHub: [@jetm/mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms)):
 
-- **320MHz does not actually work.** The patch only populates the STA_REC TLV sent to firmware; wiphy/mac80211 capability registration is unchanged — `iw phy` shows no `BW = 320` MCS map. mt7925's driver has no 320MHz code path to patch onto. 320MHz is MT7927's primary advantage over MT7925.
-- **Power management is completely disabled.** CLR_OWN reinitializes WFDMA and destroys DMA ring configuration, so the patch disables PM entirely.
-- **Uninitialized variable bug.** `is_mt6639_hw` is used before assignment, selecting the wrong IRQ map and causing boot failure.
+v2.1 has fixed the following issues:
+
+- ✅ **Uninitialized variable bug fixed.** `is_mt6639_hw` was used before assignment, selecting the wrong IRQ map (`mt7925` instead of `mt6639`), causing "Failed to get patch semaphore" on every boot. Fixed in v2.1.
+- ✅ **Power management restored (v2.1).** The CLR_OWN resume path now correctly restores MT6639's GLO_CFG bits. S3 suspend/wake tested and working.
+- ✅ **320MHz fixed (v2.1-3).** Root cause: `mt7925_mcu_bss_rlm_tlv()` had no `NL80211_CHAN_WIDTH_320` case in its `switch(chandef->width)`, so firmware always received a 20MHz instruction and fell back to 802.11n. A single `case NL80211_CHAN_WIDTH_320: req->bw = CMD_CBW_320MHZ;` fixes it. This is also a pre-existing upstream bug affecting mt7925 users on 320MHz 6GHz networks.
+- ✅ **6GHz working.** Community testing confirms 6GHz connectivity (802.11be, PSK/SAE/OWE all passing).
+
+**Remaining known issues:**
+
+- TX retransmission rate is slightly elevated (under investigation; TX power calibration is handled entirely by firmware via `MCU_UNI_CMD(TXPOWER)`, not the driver).
+- 320MHz still needs testing with a real 6GHz AP.
+- AP mode not supported. MLO with 3 bands causes 4-way handshake timeout.
 
 **Long-term risk:** MediaTek repackages mobile combo chips (e.g. MT6639/Filogic 380) as PCIe modules with mt76-style naming for the PC market. The current patch approach scatters `if (is_mt6639())` branches across mt7925's codebase. If similar chips continue to appear, this pattern becomes increasingly fragile. The proper solution is a dedicated `mt7927/` sub-driver within the mt76 framework, written by a kernel developer familiar with the subsystem. The reverse engineering documentation in this project (`docs/re/`) provides the complete technical foundation for that work.
 
