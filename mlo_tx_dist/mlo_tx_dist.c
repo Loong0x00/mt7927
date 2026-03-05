@@ -82,6 +82,13 @@ module_param(bail_no_sta, ulong, 0444);
 module_param(bail_no_mld, ulong, 0444);
 module_param(bail_single, ulong, 0444);
 
+/*
+ * Per-CPU storage for txwi pointer and swap flag.
+ * pre_handler saves these, post_handler reads TXD content.
+ */
+static DEFINE_PER_CPU(void *, saved_txwi);
+static DEFINE_PER_CPU(int, was_swapped);
+
 static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	struct mt76_wcid *wcid = (struct mt76_wcid *)regs->cx;
@@ -92,6 +99,9 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 	struct mt792x_sta *msta;
 	unsigned long valid;
 	int cnt, target, i;
+
+	__this_cpu_write(saved_txwi, (void *)regs->si);
+	__this_cpu_write(was_swapped, 0);
 
 	total_calls++;
 
@@ -123,7 +133,6 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 	cnt = hweight16(msta->valid_links);
 	if (cnt <= 1) {
 		bail_single++;
-		/* Debug: check vif valid_links vs sta valid_links */
 		if (bail_single <= 3)
 			pr_info("mlo_tx_dist: bail_single sta_valid=0x%x vif_valid=0x%x vif_active=0x%x wcid_idx=%u link_id=%u\n",
 				msta->valid_links, vif->valid_links,
@@ -145,6 +154,7 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 		if (alt_link && alt_link != mlink && alt_link->wcid.idx) {
 			/* Swap WCID in RCX register */
 			regs->cx = (unsigned long)&alt_link->wcid;
+			__this_cpu_write(was_swapped, 1);
 			total_secondary++;
 			rcu_read_unlock();
 			return 0;
@@ -156,9 +166,38 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
+static void post_handler(struct kprobe *p, struct pt_regs *regs,
+			  unsigned long flags)
+{
+	__le32 *txwi = (__le32 *)__this_cpu_read(saved_txwi);
+	int swapped = __this_cpu_read(was_swapped);
+	static unsigned long pri_dump_cnt, sec_dump_cnt;
+
+	if (!txwi)
+		return;
+
+	/* Dump first few TXDs for both primary and secondary */
+	if (swapped && sec_dump_cnt < 3) {
+		sec_dump_cnt++;
+		pr_info("mlo_tx_dist: SEC TXD: [0]=%08x [1]=%08x [2]=%08x [3]=%08x [4]=%08x [5]=%08x [6]=%08x [7]=%08x\n",
+			le32_to_cpu(txwi[0]), le32_to_cpu(txwi[1]),
+			le32_to_cpu(txwi[2]), le32_to_cpu(txwi[3]),
+			le32_to_cpu(txwi[4]), le32_to_cpu(txwi[5]),
+			le32_to_cpu(txwi[6]), le32_to_cpu(txwi[7]));
+	} else if (!swapped && pri_dump_cnt < 3) {
+		pri_dump_cnt++;
+		pr_info("mlo_tx_dist: PRI TXD: [0]=%08x [1]=%08x [2]=%08x [3]=%08x [4]=%08x [5]=%08x [6]=%08x [7]=%08x\n",
+			le32_to_cpu(txwi[0]), le32_to_cpu(txwi[1]),
+			le32_to_cpu(txwi[2]), le32_to_cpu(txwi[3]),
+			le32_to_cpu(txwi[4]), le32_to_cpu(txwi[5]),
+			le32_to_cpu(txwi[6]), le32_to_cpu(txwi[7]));
+	}
+}
+
 static struct kprobe kp = {
 	.symbol_name = "mt7925_mac_write_txwi",
 	.pre_handler = pre_handler,
+	.post_handler = post_handler,
 };
 
 static int __init mlo_tx_dist_init(void)
