@@ -172,3 +172,4 @@ linux-mediatek-mt6639-bluetooth-kernel-module-main/
 !Makefile
 !Kbuild
 !tests/Kbuild
+*.conf.local
